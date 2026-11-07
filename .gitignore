@@ -1,0 +1,38 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# 运行期日志、取证快照与下载媒体缓存
+logs/
+parser/logs/
+app/ai_api/logs/
+media_downloads/
+forensics_logs/
+parser/forensics_logs/
+
+# Playwright 浏览器持久化会话目录
+browser_sessions/
+
+# 临时锁文件与原子写临时文件
+*.lock
+*.tmp
+reset_post_ids_backup.json
+
+# 向量数据库文件 (如需忽略本地 SQLite 向量库)
+vector_db/
+
+# IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+/config/config.json
+/temp1.json
+/temp2.json
+/temp3.json
+/temp4.json
+/temp5.json
