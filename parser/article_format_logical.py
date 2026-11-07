@@ -128,7 +128,8 @@ ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 # 流水线各模块独立启停控制面板
 TASK_SWITCHES = {
     "fetch_posts": True,              # 独立拉取各平台原始帖子数据
-    "fetch_and_screen": True,         # 初筛、多模态论据提取与高流量粗筛
+    "fetch_and_screen": True,         # 分析帖初筛与多模态论据精提
+    "viral_screen": True,             # 娱乐帖高流量一阶段粗筛（独立任务）
     "single_analysis_gen": True,      # 单币分析生成
     "single_analysis_pub": True,      # 单币分析发布
     "viral_gen": True,                # 娱乐帖生成
@@ -194,9 +195,9 @@ PUBLISH_RULES = {
 def _log(action, message, level="info", exc_info=False, **fields):
     details = " | ".join(f"{key}: [{value}]" for key, value in fields.items())
     prefix = "❌ " if level in ("error", "exception") else ""
+    suffix = f" | {details}" if details else ""
     getattr(logger, level)(
-        "%s[%s] %s%s", prefix, action, message,
-        f" | {details}" if details else "",
+        f"{prefix}[{action}] {message}{suffix}",
         exc_info=exc_info or level == "exception",
         stacklevel=2,
     )
@@ -322,13 +323,12 @@ def _generate_validated_info(action, prompt, validator, context, **model_kwargs)
             exhausted = attempt == LLM_MAX_RETRIES
             delay = 0 if exhausted else 2 ** attempt
             log = logger.error if exhausted else logger.warning
+            prefix = "❌ " if exhausted else ""
+            next_action = "返回空数据，等待下轮扫描" if exhausted else f"{delay} 秒后重试"
             log(
-                "%s[%s] 模型调用或数据校验失败 | 上下文: [%s] | 尝试: [%s/%s] "
-                "| 原因: [%s] | 响应摘要: [%s] | 后续: [%s] "
-                "| 排查: [检查模型服务、提示词字段及媒体读取]",
-                "❌ " if exhausted else "", action, context, attempt, LLM_MAX_RETRIES,
-                exc, repr(raw_response)[:500],
-                "返回空数据，等待下轮扫描" if exhausted else f"{delay} 秒后重试",
+                f"{prefix}[{action}] 模型调用或数据校验失败 | 上下文: [{context}] | 尝试: [{attempt}/{LLM_MAX_RETRIES}] "
+                f"| 原因: [{exc}] | 响应摘要: [{repr(raw_response)[:500]}] | 后续: [{next_action}] "
+                f"| 排查: [检查模型服务、提示词字段及媒体读取]",
                 exc_info=exhausted,
             )
             if exhausted:
@@ -562,8 +562,7 @@ def process_and_save_pre_screen_batch(batch_posts, post_manager, prompt_template
         post_manager.upsert_posts(updates)
     passed = len(updates) - filtered
     logger.info(
-        "[初筛/回写] 批次已落库 | 处理: [%s] | 通过: [%s] | 淘汰: [%s] | 耗时: [%.2f 秒]",
-        len(updates), passed, filtered, time.monotonic() - started,
+        f"[初筛/回写] 批次已落库 | 处理: [{len(updates)}] | 通过: [{passed}] | 淘汰: [{filtered}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
     )
     return passed, filtered
 
@@ -654,13 +653,12 @@ def process_and_save_single_post(post, post_manager):
         post["logic_mul"] = info
         post_manager.upsert_posts([post])
         logger.info(
-            "[帖子/回写] 论据已保存 | 帖子: [%s] | 论据: [%s 条] | 耗时: [%.2f 秒]",
-            post_id, len(info["evidences"]), time.monotonic() - started,
+            f"[帖子/回写] 论据已保存 | 帖子: [{post_id}] | 论据: [{len(info['evidences'])} 条] | 耗时: [{time.monotonic() - started:.2f} 秒]"
         )
     except Exception:
         logger.exception(
-            "❌ [帖子/处理] 当前帖子失败 | 帖子: [%s] | 后续: [继续其他任务] "
-            "| 排查: [检查帖子字段、提示词、媒体路径及数据库]", post_id,
+            f"❌ [帖子/处理] 当前帖子失败 | 帖子: [{post_id}] | 后续: [继续其他任务] "
+            f"| 排查: [检查帖子字段、提示词、媒体路径及数据库]"
         )
 
 
@@ -743,8 +741,7 @@ def process_and_save_single_viral_post(batch_posts, post_manager, prompt_templat
         post_manager.upsert_posts(updates)
     rejected_count = len(updates) - kept_count
     logger.info(
-        "[高流量/粗筛回写] 批次已保存 | 处理: [%s] | 放行(keep=True): [%s] | 淘汰: [%s] | 耗时: [%.2f 秒]",
-        len(updates), kept_count, rejected_count, time.monotonic() - started,
+        f"[高流量/粗筛回写] 批次已保存 | 处理: [{len(updates)}] | 放行(keep=True): [{kept_count}] | 淘汰: [{rejected_count}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
     )
     return kept_count, rejected_count
 
@@ -753,7 +750,7 @@ def process_and_save_single_viral_post(batch_posts, post_manager, prompt_templat
 def _screen_posts(posts, post_manager, predicate, processor, prompt_path, batch_size, action):
     pending = [post for post in posts if predicate(post)]
     if not pending:
-        logger.debug("[%s/计划] 当前无待筛新帖 | 扫描: [%s]", action, len(posts))
+        logger.debug(f"[{action}/计划] 当前无待筛新帖 | 扫描: [{len(posts)}]")
         return 0, 0, 0, 0
     prompt = read_file_to_str(prompt_path)
     if not isinstance(prompt, str) or not prompt.strip():
@@ -820,7 +817,7 @@ def get_hot_coin():
     with _HOT_COIN_LOCK:
         _HOT_COIN_CACHE["ts"] = time.monotonic()
         _HOT_COIN_CACHE["coins"] = list(coins)
-    logger.info("[行情热榜/币安] 热门与异动币种合并完成 | 币种数: [%s] | 列表: [%s]", len(coins), ", ".join(coins))
+    logger.info(f"[行情热榜/币安] 热门与异动币种合并完成 | 币种数: [{len(coins)}] | 列表: [{', '.join(coins)}]")
     return coins
 
 
@@ -862,7 +859,7 @@ def fetch_all_hot_posts_once(post_manager=None):
         try:
             fetcher(post_manager, PLATFORMS[platform].hot_coins())
         except Exception:
-            logger.exception("❌ [采集/单平台] %s 采集任务异常，继续下一平台 | 排查方向: [检查该平台接口、代理与网络]", platform)
+            logger.exception(f"❌ [采集/单平台] {platform} 采集任务异常，继续下一平台 | 排查方向: [检查该平台接口、代理与网络]")
 
 
 def fetch_all_hot_posts():
@@ -874,8 +871,7 @@ def fetch_all_hot_posts():
             fetch_all_hot_posts_once(post_manager)
             delay = 3600
             logger.info(
-                "[采集/轮询] 本轮双平台采集全部结束 | 总耗时: [%.2fs] | 下次采集: [%ss后]",
-                time.monotonic() - started, delay,
+                f"[采集/轮询] 本轮双平台采集全部结束 | 总耗时: [{time.monotonic() - started:.2f}s] | 下次采集: [{delay}s后]"
             )
             time.sleep(delay)
         except Exception:
@@ -886,7 +882,7 @@ def fetch_all_hot_posts():
             time.sleep(60)
 
 
-# 独立筛查与精提任务：直接扫描数据库原帖 → 批量初筛原地回写 → 并发精提 → 高流量第一阶段筛查（无需等待拉取完成）。
+# 独立分析帖筛查与精提任务：直接扫描数据库原帖 → 批量初筛原地回写 → 并发精提（无需等待拉取完成）。
 def format_image_article():
     while True:
         try:
@@ -903,40 +899,82 @@ def format_image_article():
             ]
             posts = [post for batch in source_batches for post in batch]
             if not posts:
-                logger.info("[原帖筛查/轮询] 库内暂无近50h原帖 | 下次扫描: [60s后]")
+                logger.info("[分析筛查/轮询] 库内暂无近50h原帖 | 下次扫描: [60s后]")
                 time.sleep(60)
                 continue
             pre_pending, pre_pass, pre_rej, _ = batch_pre_screen_posts(posts, post_manager) or (0, 0, 0, 0)
             valid_posts = [post for post in posts if is_need_formatting(post)]
             if valid_posts:
                 logger.info(
-                    "[论据提取/计划] 启动多模态论据精提 | 扫描原帖: [%s] | 待精提: [%s] | 并发上限: [%s]",
-                    len(posts), len(valid_posts), MAX_CONCURRENCY,
+                    f"[论据提取/计划] 启动多模态论据精提 | 扫描原帖: [{len(posts)}] | 待精提: [{len(valid_posts)}] | 并发上限: [{MAX_CONCURRENCY}]"
                 )
                 with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
                     futures = [executor.submit(process_and_save_single_post, post, post_manager)
                                for post in valid_posts]
                     for future in as_completed(futures):
                         future.result()
-            viral_pending, viral_pass, viral_rej, _ = batch_screen_viral_posts(posts, post_manager) or (0, 0, 0, 0)
             delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 60
-            if pre_pending == 0 and not valid_posts and viral_pending == 0:
+            if pre_pending == 0 and not valid_posts:
                 logger.info(
-                    "[原帖筛查/轮询] 本轮无新增待处理原帖 | 库内近50h原帖: [%s] | 耗时: [%.2fs] | 下次扫描: [%ss后]",
-                    len(posts), time.monotonic() - started, delay,
+                    f"[分析筛查/轮询] 本轮无新增待处理分析原帖 | 库内近50h原帖: [{len(posts)}] | 耗时: [{time.monotonic() - started:.2f}s] | 下次扫描: [{delay}s后]"
                 )
             else:
                 logger.info(
-                    "[原帖筛查/汇总] 本轮筛查与精提完成 | 扫描原帖: [%s] | 初筛(通过/淘汰): [%s/%s] "
-                    "| 论据精提: [%s帖] | 高流量粗筛(放行/淘汰): [%s/%s] | 耗时: [%.2fs] | 下次扫描: [%ss后]",
-                    len(posts), pre_pass, pre_rej, len(valid_posts), viral_pass, viral_rej,
-                    time.monotonic() - started, delay,
+                    f"[分析筛查/汇总] 本轮分析初筛与精提完成 | 扫描原帖: [{len(posts)}] | 初筛(通过/淘汰): [{pre_pass}/{pre_rej}] "
+                    f"| 论据精提: [{len(valid_posts)}帖] | 耗时: [{time.monotonic() - started:.2f}s] | 下次扫描: [{delay}s后]"
                 )
             time.sleep(delay)
         except Exception:
             logger.exception(
-                "❌ [原帖筛查/轮询] 本轮筛查异常中断 | 后续: [60s后重新初始化] "
+                "❌ [分析筛查/轮询] 本轮分析筛查异常中断 | 后续: [60s后重新初始化] "
                 "| 排查方向: [检查提示词、代理、帖子字段及数据库]"
+            )
+            time.sleep(60)
+
+
+# 单轮娱乐帖高流量一阶段粗筛任务：独立扫描近期原帖并执行批量文本粗筛。
+def screen_viral_posts_once(post_manager=None):
+    started = time.monotonic()
+    if post_manager is None:
+        post_manager = UniversalPostManager(gen_db_object())
+    lookback_hours = VIRAL_POST_MAX_AGE_HOURS + 2
+    min_publish_ts = time.time() - lookback_hours * 3600
+    source_batches = [
+        post_manager.find_posts_by_source(
+            source,
+            limit=POST_QUERY_LIMIT,
+            extra_query={"publish_time": {"$gte": min_publish_ts}},
+        ) or []
+        for source in POST_SOURCES
+    ]
+    posts = [post for batch in source_batches for post in batch]
+    if not posts:
+        logger.info(f"[高流量粗筛/轮询] 库内暂无近{lookback_hours}h原帖 | 下次扫描: [60s后]")
+        return 0, 0, 0, 60
+    viral_pending, viral_pass, viral_rej, _ = batch_screen_viral_posts(posts, post_manager) or (0, 0, 0, 0)
+    delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 60
+    if viral_pending == 0:
+        logger.info(
+            f"[高流量粗筛/轮询] 本轮无新增待粗筛娱乐原帖 | 库内近{lookback_hours}h原帖: [{len(posts)}] | 耗时: [{time.monotonic() - started:.2f}s] | 下次扫描: [{delay}s后]"
+        )
+    else:
+        logger.info(
+            f"[高流量粗筛/汇总] 本轮娱乐帖粗筛完成 | 扫描原帖: [{len(posts)}] | 待筛: [{viral_pending}] "
+            f"| 放行(keep=True): [{viral_pass}] | 淘汰: [{viral_rej}] | 耗时: [{time.monotonic() - started:.2f}s] | 下次扫描: [{delay}s后]"
+        )
+    return viral_pending, viral_pass, viral_rej, delay
+
+
+# 独立娱乐帖高流量一阶段粗筛常驻任务：脱离多模态论据精提阻塞，保证高时效性。
+def screen_viral_posts():
+    while True:
+        try:
+            _, _, _, delay = screen_viral_posts_once()
+            time.sleep(delay)
+        except Exception:
+            logger.exception(
+                "❌ [高流量粗筛/轮询] 本轮娱乐帖粗筛异常中断 | 后续: [60s后重新初始化] "
+                "| 排查方向: [检查粗筛提示词、模型服务及数据库连接]"
             )
             time.sleep(60)
 
@@ -950,7 +988,7 @@ def clear_all_media_format_batch():
         post["logic_mul"] = post["pre_screen"] = None
     if updates:
         manager.upsert_posts(updates)
-    logger.info("[数据/清理] 提取与初筛字段已清空 | 扫描: [%s] | 更新: [%s]", len(posts), len(updates))
+    logger.info(f"[数据/清理] 提取与初筛字段已清空 | 扫描: [{len(posts)}] | 更新: [{len(updates)}]")
 
 
 # 五、选材、生成与落库：共享重试机制，保留两类文章各自的业务契约
@@ -1003,9 +1041,8 @@ def transform_mlus(mlu_list):
         if not all(image.get("image_id") in source_mapping
                    and isinstance(image.get("context"), str) and image["context"].strip() for image in images):
             logger.warning(
-                "[文章/配图] 当前论据保留文字、取消整组配图 | 帖子: [%s] "
-                "| 原因: [至少一图缺少来源或描述] | 排查: [核对原文编号、映射与context]",
-                evidence.get("source_post_id"),
+                f"[文章/配图] 当前论据保留文字、取消整组配图 | 帖子: [{evidence.get('source_post_id')}] "
+                f"| 原因: [至少一图缺少来源或描述] | 排查: [核对原文编号、映射与context]"
             )
             continue
         visual_items, seen_ids = [], set()
@@ -1096,11 +1133,10 @@ def extract_and_group_valid_evidences(article_manager=None):
             evidences.sort(key=lambda item: item.get("impact_weight", 0), reverse=True)
     result = json.loads(json.dumps(grouped))
     log = logger.warning if invalid_times else logger.info
+    total_evidences = sum(len(items) for stances in result.values() for items in stances.values())
     log(
-        "[论据/筛选] 已分组并按权重排序 | 扫描: [%s] | 币种: [%s] | 论据: [%s，含跨组重复] "
-        "| 自家帖拦截: [%s] | 无效时间跳过: [%s] | 耗时: [%.2f 秒]",
-        len(posts), len(result), sum(len(items) for stances in result.values() for items in stances.values()),
-        self_skipped, invalid_times, time.monotonic() - started,
+        f"[论据/筛选] 已分组并按权重排序 | 扫描: [{len(posts)}] | 币种: [{len(result)}] | 论据: [{total_evidences}，含跨组重复] "
+        f"| 自家帖拦截: [{self_skipped}] | 无效时间跳过: [{invalid_times}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
     )
     return result
 
@@ -1432,10 +1468,9 @@ def extract_valid_viral_posts(article_manager):
         result.append(post)
 
     logger.info(
-        "[高流量/选材] 已筛选待重塑候选帖 | 扫描: [%s] | 粗筛达标: [%s] | 已处理跳过: [%s] "
-        "| 同源热点冷却跳过: [%s] | 本轮待精改: [%s] | 耗时: [%.2f 秒]",
-        len(posts), len(candidates), len(candidates) - len(unprocessed),
-        event_skipped, len(result), time.monotonic() - started,
+        f"[高流量/选材] 已筛选待重塑候选帖 | 扫描: [{len(posts)}] | 粗筛达标: [{len(candidates)}] "
+        f"| 已处理跳过: [{len(candidates) - len(unprocessed)}] | 同源热点冷却跳过: [{event_skipped}] "
+        f"| 本轮待精改: [{len(result)}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
     )
     return result
 
@@ -1647,7 +1682,7 @@ def _generate_article_record(task, validator, convert, action, context, **model_
 def execute_article_task(task_data, article_manager):
     coin, stance = task_data["coin"], task_data["stance"]
     if task_data.get("is_skip"):
-        logger.debug("[单币分析/跳过] 选材不足 | 币种: [%s] | 立场: [%s] | 原因: [%s]", coin, stance, task_data["reason"])
+        logger.debug(f"[单币分析/跳过] 选材不足 | 币种: [{coin}] | 立场: [{stance}] | 原因: [{task_data['reason']}]")
         return task_data["record"]
     started = time.monotonic()
     mapping = task_data["image_mapping"]
@@ -1840,7 +1875,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     if hot_coins:
         symbol = hot_coins[0]["symbol"].replace("USDT", "").replace("USDC", "")
         tags.extend([f"#{symbol}", f"${symbol} "])
-    logger.info("[文章/标签] 标签已准备 | 主题: [%s] | 标签: [%s]", topic, tags)
+    logger.info(f"[文章/标签] 标签已准备 | 主题: [{topic}] | 标签: [{tags}]")
     return text + "\n\n\n" + "\n".join(tags)
 
 
@@ -1970,8 +2005,7 @@ def _safe_get_latest_price(platform, topic):
         return get_latest_crypto_price(topic)
     except Exception as exc:
         logger.warning(
-            "[发布/行情] 获取发布时刻价格失败 | 平台: [%s] | 主题: [%s] | 异常: [%s] | 后续: [价格记为 None 继续落库]",
-            platform, topic, exc,
+            f"[发布/行情] 获取发布时刻价格失败 | 平台: [{platform}] | 主题: [{topic}] | 异常: [{exc}] | 后续: [价格记为 None 继续落库]"
         )
         return None
 
@@ -2303,9 +2337,8 @@ def _poll_task(task, manager, interval, action):
             task(manager)
         except Exception:
             logger.exception(
-                "❌ [%s/轮询] 本轮中断 | 后续: [%s 秒后重新扫描] "
-                "| 排查: [检查账号配置、外部接口与数据库；远端操作成功时先核对回写结果]",
-                action, interval,
+                f"❌ [{action}/轮询] 本轮中断 | 后续: [{interval} 秒后重新扫描] "
+                f"| 排查: [检查账号配置、外部接口与数据库；远端操作成功时先核对回写结果]"
             )
         finally:
             time.sleep(interval)
@@ -2343,8 +2376,8 @@ def _load_account_credentials(action, with_user_info=False):
             cookies, token, user_info = get_auth_tokens_robust(session_dir, debug=False)
             if not cookies or not token:
                 logger.warning(
-                    "[%s/账号] 凭证不完整 | 账号: [%s] | 后续: [跳过当前账号] "
-                    "| 排查: [检查登录状态与浏览器会话]", action, account,
+                    f"[{action}/账号] 凭证不完整 | 账号: [{account}] | 后续: [跳过当前账号] "
+                    f"| 排查: [检查登录状态与浏览器会话]"
                 )
                 continue
             credentials[account] = {"cookies": cookies, "csrf_token": token}
@@ -2353,8 +2386,8 @@ def _load_account_credentials(action, with_user_info=False):
         except Exception:
             errors += 1
             logger.exception(
-                "❌ [%s/账号] 获取凭证失败 | 账号: [%s] | 后续: [继续其他账号] "
-                "| 排查: [检查会话目录、浏览器启动与登录状态]", action, account,
+                f"❌ [{action}/账号] 获取凭证失败 | 账号: [{account}] | 后续: [继续其他账号] "
+                f"| 排查: [检查会话目录、浏览器启动与登录状态]"
             )
     return credentials, errors
 
@@ -2821,9 +2854,9 @@ def _article_delete_reason(article, now, prices):
             return f"超时 (已发布 {elapsed / (24 * 3600):.2f} 天, 基准: {MAX_REPLAY_DAYS} 天)", price_updated
     except Exception:
         logger.warning(
-            "[历史清理/时间] 无法判断帖子是否超时 | 帖子: [%s] | 发布时间: [%s] "
-            "| 后续: [保留当前时效状态] | 排查: [核对秒/毫秒时间戳]",
-            b_rec.get("post_id"), publish_time, exc_info=True,
+            f"[历史清理/时间] 无法判断帖子是否超时 | 帖子: [{b_rec.get('post_id')}] | 发布时间: [{publish_time}] "
+            f"| 后续: [保留当前时效状态] | 排查: [核对秒/毫秒时间戳]",
+            exc_info=True,
         )
     return None, price_updated
 
@@ -2840,7 +2873,7 @@ def _delete_old_posts_once(article_manager):
             f"publish_records.{PLATFORM_BINANCE}.post_id": {"$exists": True, "$ne": None},
             f"publish_records.{PLATFORM_BINANCE}.delete_time": {"$in": [None, False]},
         }) or []
-        logger.info("[历史清理/巡检] 已查询待检测文章 | 文章: [%s] | 可用账号: [%s]", len(articles), len(credentials))
+        logger.info(f"[历史清理/巡检] 已查询待检测文章 | 文章: [{len(articles)}] | 可用账号: [{len(credentials)}]")
         for article in articles:
             b_rec = ((article.get("publish_records") or {}).get(PLATFORM_BINANCE)) or {}
             if b_rec.get("delete_time"):
@@ -2859,17 +2892,17 @@ def _delete_old_posts_once(article_manager):
                             prices = base_price, float(latest)
             except Exception:
                 logger.warning(
-                    "[历史清理/行情] 读取或转换价格失败 | 帖子: [%s] | 币种: [%s] "
-                    "| 后续: [继续时效检查] | 排查: [检查价格字段、行情接口与网络]",
-                    post_id, topic, exc_info=True,
+                    f"[历史清理/行情] 读取或转换价格失败 | 帖子: [{post_id}] | 币种: [{topic}] "
+                    f"| 后续: [继续时效检查] | 排查: [检查价格字段、行情接口与网络]",
+                    exc_info=True,
                 )
             reason, price_updated = _article_delete_reason(article, now, prices)
             deleted = False
             credential = credentials.get(account)
             if reason and not credential:
                 logger.warning(
-                    "[历史清理/无法删除] 已触发删除条件，但账号凭证不可用 | 账号: [%s] | 帖子: [%s] "
-                    "| 原因: [%s] | 排查: [恢复对应账号登录与会话]", account, post_id, reason,
+                    f"[历史清理/无法删除] 已触发删除条件，但账号凭证不可用 | 账号: [{account}] | 帖子: [{post_id}] "
+                    f"| 原因: [{reason}] | 排查: [恢复对应账号登录与会话]"
                 )
             if reason and credential:
                 stage = "请求远端删除"
@@ -2889,21 +2922,20 @@ def _delete_old_posts_once(article_manager):
                         reverse_count += reason.startswith("逆向")
                         timeout_count += not reason.startswith("逆向")
                         logger.info(
-                            "[历史清理/删除] 远端删除并回写成功 | 帖子: [%s] | 账号: [%s] | 原因: [%s]",
-                            post_id, account, reason,
+                            f"[历史清理/删除] 远端删除并回写成功 | 帖子: [{post_id}] | 账号: [{account}] | 原因: [{reason}]"
                         )
                     else:
                         failed += 1
                         logger.warning(
-                            "[历史清理/删除] 接口未确认成功 | 帖子: [%s] | 账号: [%s] "
-                            "| 后续: [下轮再检查] | 排查: [检查凭证、限流与远端帖子是否存在]", post_id, account,
+                            f"[历史清理/删除] 接口未确认成功 | 帖子: [{post_id}] | 账号: [{account}] "
+                            f"| 后续: [下轮再检查] | 排查: [检查凭证、限流与远端帖子是否存在]"
                         )
                 except Exception:
                     failed += 1
                     logger.exception(
-                        "❌ [历史清理/删除] 帖子处理失败 | 阶段: [%s] | 帖子: [%s] | 账号: [%s] "
-                        "| 远端已确认删除: [%s] | 后续: [继续其他帖子] "
-                        "| 排查: [检查删除接口或数据库，先核对远端结果]", stage, post_id, account, deleted,
+                        f"❌ [历史清理/删除] 帖子处理失败 | 阶段: [{stage}] | 帖子: [{post_id}] | 账号: [{account}] "
+                        f"| 远端已确认删除: [{deleted}] | 后续: [继续其他帖子] "
+                        f"| 排查: [检查删除接口或数据库，先核对远端结果]"
                     )
             if not deleted and price_updated:
                 try:
@@ -2911,8 +2943,9 @@ def _delete_old_posts_once(article_manager):
                     article_manager.upsert_articles([article])
                 except Exception:
                     logger.warning(
-                        "[历史清理/行情回写] 涨跌幅保存失败 | 帖子: [%s] | 后续: [继续其他帖子] "
-                        "| 排查: [检查数据库连接与写入权限]", post_id, exc_info=True,
+                        f"[历史清理/行情回写] 涨跌幅保存失败 | 帖子: [{post_id}] | 后续: [继续其他帖子] "
+                        f"| 排查: [检查数据库连接与写入权限]",
+                        exc_info=True,
                     )
     except Exception:
         logger.exception(
@@ -2951,15 +2984,15 @@ def _delete_old_posts_once(article_manager):
                     except Exception:
                         failed += 1
                         logger.exception(
-                            "❌ [历史清理/远端删除] 删除请求异常 | 账号: [%s] | 帖子: [%s] "
-                            "| 后续: [继续其他记录] | 排查: [检查凭证、网络与限流，核对远端结果]", account, post_id,
+                            f"❌ [历史清理/远端删除] 删除请求异常 | 账号: [{account}] | 帖子: [{post_id}] "
+                            f"| 后续: [继续其他记录] | 排查: [检查凭证、网络与限流，核对远端结果]"
                         )
                         continue
                     if not success:
                         failed += 1
                         logger.warning(
-                            "[历史清理/远端删除] 接口未确认成功 | 账号: [%s] | 帖子: [%s] "
-                            "| 排查: [检查帖子是否存在、登录与接口响应]", account, post_id,
+                            f"[历史清理/远端删除] 接口未确认成功 | 账号: [{account}] | 帖子: [{post_id}] "
+                            f"| 排查: [检查帖子是否存在、登录与接口响应]"
                         )
                         continue
                     timeout_count += 1
@@ -2980,12 +3013,12 @@ def _delete_old_posts_once(article_manager):
                             check_time=checked_at,
                         )
                     article_manager.upsert_articles(matched)
-                    logger.info("[历史清理/远端回写] 已保存删除状态 | 帖子: [%s] | 记录: [%s]", post_id, len(matched))
+                    logger.info(f"[历史清理/远端回写] 已保存删除状态 | 帖子: [{post_id}] | 记录: [{len(matched)}]")
             except Exception:
                 account_errors += 1
                 logger.exception(
-                    "❌ [历史清理/远端账号] 当前账号处理失败 | 账号: [%s] | 阶段: [%s] "
-                    "| 后续: [继续其他账号] | 排查: [检查历史接口、用户信息及数据库；核对已完成的删除]", account, stage,
+                    f"❌ [历史清理/远端账号] 当前账号处理失败 | 账号: [{account}] | 阶段: [{stage}] "
+                    f"| 后续: [继续其他账号] | 排查: [检查历史接口、用户信息及数据库；核对已完成的删除]"
                 )
     except Exception:
         logger.exception(
@@ -2993,9 +3026,8 @@ def _delete_old_posts_once(article_manager):
             "| 排查: [检查账号用户信息、历史列表与数据库]"
         )
     logger.info(
-        "[历史清理/汇总] 本轮结束 | 逆向删除: [%s] | 超时删除: [%s] | 失败: [%s] "
-        "| 账号异常: [%s] | 耗时: [%.2f 秒] | 下次检查: [%s 秒后]",
-        reverse_count, timeout_count, failed, account_errors, time.monotonic() - started, DELETE_INTERVAL_SEC,
+        f"[历史清理/汇总] 本轮结束 | 逆向删除: [{reverse_count}] | 超时删除: [{timeout_count}] | 失败: [{failed}] "
+        f"| 账号异常: [{account_errors}] | 耗时: [{time.monotonic() - started:.2f} 秒] | 下次检查: [{DELETE_INTERVAL_SEC} 秒后]"
     )
 
 
@@ -3049,8 +3081,7 @@ def get_need_check_article_info():
         source_posts = [{"origin_content": (post.get("content") or {}).get("text_content", ""),
                          "logic_mul": post.get("logic_mul")} for post in raw_posts if isinstance(post, dict)]
     logger.info(
-        "[文章/待审查] 审查数据已组装 | 候选: [%s] | 随机抽取: [%s] | 关联原帖: [%s]",
-        len(candidates), len(data), len(source_posts),
+        f"[文章/待审查] 审查数据已组装 | 候选: [{len(candidates)}] | 随机抽取: [{len(data)}] | 关联原帖: [{len(source_posts)}]"
     )
     return data, source_posts
 
@@ -3074,8 +3105,7 @@ def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
             "engagement": {key: engagement.get(key, 0) for key in ("view_count", "like_count", "comment_count")},
         })
     logger.info(
-        "[数据/查询] 热门帖查询完成 | 关键字: [%s] | 时长: [%s 小时] | 匹配: [%s]",
-        target_key, hours, len(results),
+        f"[数据/查询] 热门帖查询完成 | 关键字: [{target_key}] | 时长: [{hours} 小时] | 匹配: [{len(results)}]"
     )
     return results
 
@@ -3125,10 +3155,8 @@ def get_need_check_pre_screen_info(
         save_json(save_path, review_list)
 
     logger.info(
-        "[初筛/审查] 已导出初筛复盘数据 | 匹配总数: [%s (淘汰: %s / 保留: %s)] "
-        "| 本次抽取: [%s] | 过滤条件(no_evidence): [%s] | 导出文件: [%s]",
-        total_matched, total_no_ev, total_has_ev,
-        len(review_list), no_evidence_filter, save_path or "未落盘",
+        f"[初筛/审查] 已导出初筛复盘数据 | 匹配总数: [{total_matched} (淘汰: {total_no_ev} / 保留: {total_has_ev})] "
+        f"| 本次抽取: [{len(review_list)}] | 过滤条件(no_evidence): [{no_evidence_filter}] | 导出文件: [{save_path or '未落盘'}]"
     )
     return review_list
 
@@ -3154,7 +3182,7 @@ def get_need_check_viral_article_info(
 
     candidates = article_manager.find_articles(query=query, sort=[("created_at", -1)]) or []
     if not candidates:
-        logger.info("[高流量/审查] 未找到待审查文章 | 筛选时间: [近 %s 小时]", hours)
+        logger.info(f"[高流量/审查] 未找到待审查文章 | 筛选时间: [近 {hours} 小时]")
         return []
 
     if random_sample:
@@ -3236,8 +3264,7 @@ def get_need_check_viral_article_info(
         save_json(save_path, review_list)
 
     logger.info(
-        "[高流量/审查] 精简复盘数据组装完成 | 候选: [%s] | 抽样返回: [%s] | 导出文件: [%s]",
-        len(candidates), len(review_list), save_path or "未落盘",
+        f"[高流量/审查] 精简复盘数据组装完成 | 候选: [{len(candidates)}] | 抽样返回: [{len(review_list)}] | 导出文件: [{save_path or '未落盘'}]"
     )
     return review_list
 
@@ -3251,8 +3278,8 @@ def _run_task(task):
         task()
     except Exception:
         logger.exception(
-            "❌ [任务/退出] 后台任务异常结束 | 任务: [%s] | 结果: [当前线程停止] "
-            "| 排查: [检查对应链路的数据、文件权限与外部服务]", task.__name__,
+            f"❌ [任务/退出] 后台任务异常结束 | 任务: [{task.__name__}] | 结果: [当前线程停止] "
+            f"| 排查: [检查对应链路的数据、文件权限与外部服务]"
         )
         raise
 
@@ -3264,6 +3291,7 @@ def main():
     task_map = {
         "fetch_posts": fetch_all_hot_posts,
         "fetch_and_screen": format_image_article,
+        "viral_screen": screen_viral_posts,
         "single_analysis_gen": generate_analysis_articles,
         # "single_analysis_pub": auto_publish_articles,
         "viral_gen": generate_viral_articles,
@@ -3274,8 +3302,7 @@ def main():
 
     tasks = [task_func for key, task_func in task_map.items() if TASK_SWITCHES.get(key, False)]
     logger.info(
-        "[主控/启动] 正在根据 TASK_SWITCHES 启动流水线线程 | 激活任务数: [%s] | 任务清单: %s",
-        len(tasks), [t.__name__ for t in tasks],
+        f"[主控/启动] 正在根据 TASK_SWITCHES 启动流水线线程 | 激活任务数: [{len(tasks)}] | 任务清单: {[t.__name__ for t in tasks]}"
     )
 
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]

@@ -64,9 +64,7 @@ class UniversalPostManager:
             self.db.create_index(self.collection_name, [("post_id", 1)], unique=False)
             _INDEXED_COLLECTIONS.add(self.collection_name)
             logger.info(
-                "[数据库/索引] 原帖集合索引就绪 | 集合: [%s] | 唯一键: [%s]",
-                self.collection_name,
-                self.UNIQUE_KEYS,
+                f"[数据库/索引] 原帖集合索引就绪 | 集合: [{self.collection_name}] | 唯一键: [{self.UNIQUE_KEYS}]"
             )
 
     def upsert_posts(self, data_list):
@@ -85,12 +83,8 @@ class UniversalPostManager:
             source = item.get("source")
             if not post_id or not source:
                 logger.error(
-                    "❌ [数据库/校验] 帖子入库缺少必填唯一键 | 集合: [%s] | 索引位置: [%s] "
-                    "| post_id: [%r] | source: [%r] | 排查方向: [检查上游采集清洗逻辑是否漏填主键]",
-                    self.collection_name,
-                    i,
-                    post_id,
-                    source,
+                    f"❌ [数据库/校验] 帖子入库缺少必填唯一键 | 集合: [{self.collection_name}] | 索引位置: [{i}] "
+                    f"| post_id: [{post_id!r}] | source: [{source!r}] | 排查方向: [检查上游采集清洗逻辑是否漏填主键]"
                 )
                 raise ValueError(f"索引 {i} 数据错误: 必须包含完整的 'post_id' 和 'source'")
             source_counter[source] = source_counter.get(source, 0) + 1
@@ -103,10 +97,7 @@ class UniversalPostManager:
         self.db.bulk_upsert(self.collection_name, data_list, self.UNIQUE_KEYS)
         cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
         logger.debug(
-            "[数据库/入库] 原帖批量写入完成 | 数量: [%s] | 平台分布: [%s] | 耗时: [%.1fms]",
-            len(data_list),
-            source_counter,
-            cost_ms,
+            f"[数据库/入库] 原帖批量写入完成 | 数量: [{len(data_list)}] | 平台分布: [{source_counter}] | 耗时: [{cost_ms:.1f}ms]"
         )
 
     def find_posts(self, query=None, sort=None, limit=0, projection=None):
@@ -135,10 +126,7 @@ class UniversalPostManager:
         )
 
         logger.debug(
-            "[数据库/查询] 按平台查询完成 | 平台: [%s] | 上限: [%s] | 命中: [%s]",
-            source,
-            limit,
-            len(posts) if posts else 0,
+            f"[数据库/查询] 按平台查询完成 | 平台: [{source}] | 上限: [{limit}] | 命中: [{len(posts) if posts else 0}]"
         )
         return posts
 
@@ -156,11 +144,8 @@ class UniversalPostManager:
         cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
 
         logger.debug(
-            "[数据库/查询] 按ID列表查询完成 | 平台: [%s] | 目标ID数: [%s] | 命中: [%s] | 耗时: [%.1fms]",
-            source or "ALL",
-            len(post_ids),
-            len(posts) if posts else 0,
-            cost_ms,
+            f"[数据库/查询] 按ID列表查询完成 | 平台: [{source or 'ALL'}] | 目标ID数: [{len(post_ids)}] "
+            f"| 命中: [{len(posts) if posts else 0}] | 耗时: [{cost_ms:.1f}ms]"
         )
         return posts
 
@@ -214,9 +199,7 @@ class GeneratedArticleManager:
             self.db.create_index(self.collection_name, [("updated_at", -1)], unique=False)
             _INDEXED_COLLECTIONS.add(self.collection_name)
             logger.info(
-                "[数据库/索引] 生成文章集合索引就绪 | 集合: [%s] | 唯一键: [%s]",
-                self.collection_name,
-                self.UNIQUE_KEYS,
+                f"[数据库/索引] 生成文章集合索引就绪 | 集合: [{self.collection_name}] | 唯一键: [{self.UNIQUE_KEYS}]"
             )
 
     def upsert_articles(self, data_list):
@@ -291,4 +274,4 @@ if __name__ == "__main__":
 
     # 4. 验证查询
     binance_posts = post_manager.find_posts_by_source("binance", limit=5)
-    logger.info("样例验证 | binance 帖子数=%s", len(binance_posts) if binance_posts else 0)
+    logger.info(f"样例验证 | binance 帖子数={len(binance_posts) if binance_posts else 0}")
