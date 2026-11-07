@@ -127,7 +127,8 @@ ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 
 # 流水线各模块独立启停控制面板
 TASK_SWITCHES = {
-    "fetch_and_screen": True,         # 采集与初筛/提取
+    "fetch_posts": True,              # 独立拉取各平台原始帖子数据
+    "fetch_and_screen": True,         # 初筛、多模态论据提取与高流量粗筛
     "single_analysis_gen": True,      # 单币分析生成
     "single_analysis_pub": True,      # 单币分析发布
     "viral_gen": True,                # 娱乐帖生成
@@ -807,19 +808,23 @@ def get_hot_coin():
     return coins
 
 
-# 币种序列、平台feed函数 → 按热门/最新及综合流采集，原样批量upsert，保留重复项。
+# 币种序列、平台feed函数 → 按热门/最新及综合流分批采集并实时入库，使筛选线程无需等待全量拉取结束。
 def _fetch_hot_posts(post_manager, token_list, fetch_feed, platform):
     started = time.monotonic()
-    posts, token_count = [], 0
+    total_posts, token_count = 0, 0
     for token in token_list:
         token_count += 1
         for order in (1, 2):
-            posts.extend(fetch_feed(token=token, count=100, orderBy=order))
-    posts.extend(fetch_feed(count=200))
-    if posts:
-        post_manager.upsert_posts(posts)
+            batch = fetch_feed(token=token, count=100, orderBy=order)
+            if batch:
+                post_manager.upsert_posts(batch)
+                total_posts += len(batch)
+    rec_batch = fetch_feed(count=200)
+    if rec_batch:
+        post_manager.upsert_posts(rec_batch)
+        total_posts += len(rec_batch)
     _log("采集/完成", "推荐流已入库", 平台=platform, 币种数=token_count,
-         帖数=f"{len(posts)}，含重复", 耗时=f"{time.monotonic() - started:.2f}秒")
+         帖数=f"{total_posts}，含重复", 耗时=f"{time.monotonic() - started:.2f}秒")
 
 
 def fetch_binance_hot_post(post_manager, token_list):
@@ -830,14 +835,47 @@ def fetch_okx_hot_post(post_manager, token_list):
     _fetch_hot_posts(post_manager, token_list, fetch_okx_feed, PLATFORM_OKX)
 
 
-# 采集 → 批量初筛原地回写 → 并发精提 → 高流量第一阶段筛查；保留无帖60秒、满批5秒、普通批次1小时的轮询节奏。
+def fetch_all_hot_posts_once(post_manager=None):
+    """单轮执行双平台热门币种流与推荐流数据拉取（单平台异常互不阻塞）"""
+    if post_manager is None:
+        post_manager = UniversalPostManager(gen_db_object())
+    for platform, fetcher in (
+        (PLATFORM_BINANCE, fetch_binance_hot_post),
+        (PLATFORM_OKX, fetch_okx_hot_post),
+    ):
+        try:
+            fetcher(post_manager, PLATFORMS[platform].hot_coins())
+        except Exception:
+            logger.exception("❌ [采集/单平台] %s 采集任务异常，继续下一平台", platform)
+
+
+def fetch_all_hot_posts():
+    """独立的持续拉取数据任务：分批实时入库，每轮完成后休眠 1 小时"""
+    while True:
+        try:
+            started = time.monotonic()
+            post_manager = UniversalPostManager(gen_db_object())
+            fetch_all_hot_posts_once(post_manager)
+            delay = 3600
+            logger.info(
+                "[采集/轮询] 本轮双平台采集结束 | 耗时: [%.2f 秒] | 下次采集: [%s 秒后]",
+                time.monotonic() - started, delay,
+            )
+            time.sleep(delay)
+        except Exception:
+            logger.exception(
+                "❌ [采集/轮询] 本轮采集异常中断 | 后续: [60 秒后重新初始化] "
+                "| 排查: [检查热榜、采集服务、代理及数据库连接]"
+            )
+            time.sleep(60)
+
+
+# 独立筛查与精提任务：直接扫描数据库原帖 → 批量初筛原地回写 → 并发精提 → 高流量第一阶段筛查（无需等待拉取完成）。
 def format_image_article():
     while True:
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_binance_hot_post(post_manager, PLATFORMS[PLATFORM_BINANCE].hot_coins())
-            fetch_okx_hot_post(post_manager, PLATFORMS[PLATFORM_OKX].hot_coins())
             min_publish_ts = time.time() - (POST_MAX_AGE_HOURS + 2) * 3600
             source_batches = [
                 post_manager.find_posts_by_source(
@@ -865,7 +903,7 @@ def format_image_article():
                     for future in as_completed(futures):
                         future.result()
             batch_screen_viral_posts(posts, post_manager)
-            delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 3600
+            delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 60
             logger.info(
                 "[帖子/完成] 本轮线程结束 | 扫描: [%s] | 已提交: [%s] | 耗时: [%.2f 秒] "
                 "| 下次扫描: [%s 秒后] | 单帖结果: [见帖子回写/失败日志]",
@@ -875,7 +913,7 @@ def format_image_article():
         except Exception:
             logger.exception(
                 "❌ [帖子/轮询] 本轮中断 | 后续: [60 秒后重新初始化] "
-                "| 排查: [检查热榜、采集服务、提示词、代理、帖子字段及数据库]"
+                "| 排查: [检查提示词、代理、帖子字段及数据库]"
             )
             time.sleep(60)
 
@@ -3154,6 +3192,7 @@ def main():
     # delete_posts_by_account_and_time(platform=PLATFORM_OKX, days=3)
 
     task_map = {
+        "fetch_posts": fetch_all_hot_posts,
         "fetch_and_screen": format_image_article,
         "single_analysis_gen": generate_analysis_articles,
         # "single_analysis_pub": auto_publish_articles,
