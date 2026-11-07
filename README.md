@@ -26,7 +26,8 @@ ai_content_pipeline/
 │   ├── binance_playwright.py       # 币安广场 Playwright 自动发帖、评论、鉴权提取
 │   ├── okx_api.py                  # 欧易 Orbit 推荐流/热榜/用户主页时间线拉取与清洗
 │   ├── okx_playwright.py           # 欧易 Orbit Playwright 自动发帖、评论、WebCrypto签名批量删帖
-│   └── x_api.py                    # X (Twitter) GraphQL 监控采集、精选筛选与标准Schema转换
+│   ├── x_api.py                    # X (Twitter) GraphQL 监控采集、精选筛选与标准Schema转换
+│   └── x_playwright.py             # X (Twitter) Playwright 自动发帖（图文/纯文本）、评论回复与点赞互动
 ├── parser/
 │   └── article_format_logical.py   # 主控调度流水线（支持独立启停采集、生成、发布、互动、清理任务）
 └── logs/

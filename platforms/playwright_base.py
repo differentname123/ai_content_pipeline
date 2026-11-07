@@ -1050,12 +1050,13 @@ def _alert_failure_scene(error_msg):
     )
 
 
-def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True, debug=True):
+def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True, debug=True, proxy=None):
     """
     统一的持久化浏览器上下文启动口：
     - 自动绑定可重入目录锁并在 context.close() 时精确释放
     - 自动兼容系统 Chrome 与内置 Chromium 回退
     - 自动授予剪贴板读写权限并恢复原生快捷键
+    - 支持可选代理配置 proxy (str 或 dict)
     """
     fallback_name = Path(str(user_data_dir).replace("\\", "/")).name or "browser_default"
     user_data_dir = resolve_cross_platform_path(user_data_dir, DEFAULT_SESSION_ROOT / fallback_name)
@@ -1073,6 +1074,12 @@ def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=Tr
         }
         if browser_channel and str(browser_channel).strip().lower() not in ("", "chromium", "none"):
             kwargs["channel"] = str(browser_channel).strip()
+
+        if proxy:
+            if isinstance(proxy, str) and proxy.strip():
+                kwargs["proxy"] = {"server": proxy.strip()}
+            elif isinstance(proxy, dict) and proxy.get("server"):
+                kwargs["proxy"] = proxy
 
         if viewport:
             kwargs["viewport"] = viewport
@@ -1135,7 +1142,7 @@ def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=Tr
     return context
 
 
-def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN"):
+def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN", proxy=None):
     """启动可见浏览器交由人工自由操作（关闭浏览器窗口后自动保存会话并退出）。"""
     logger.info(f"\n{'=' * 60}\n[人工/Manual] 启动本地浏览器交接控制权 | 目录: <{user_data_dir}>\n{'=' * 60}")
     with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
@@ -1147,6 +1154,7 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
                     user_data_dir,
                     args=["--disable-blink-features=AutomationControlled", "--start-maximized", "--window-position=0,0"],
                     debug=True,
+                    proxy=proxy,
                 )
                 page = context.pages[0] if context.pages else context.new_page()
                 page.bring_to_front()
