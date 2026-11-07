@@ -196,7 +196,9 @@ def _log(action, message, level="info", exc_info=False, **fields):
     prefix = "❌ " if level in ("error", "exception") else ""
     getattr(logger, level)(
         "%s[%s] %s%s", prefix, action, message,
-        f" | {details}" if details else "", exc_info=exc_info or level == "exception",
+        f" | {details}" if details else "",
+        exc_info=exc_info or level == "exception",
+        stacklevel=2,
     )
 
 
@@ -747,12 +749,12 @@ def process_and_save_single_viral_post(batch_posts, post_manager, prompt_templat
     return kept_count, rejected_count
 
 
-# posts:[原帖]、筛选/处理回调 → 并发回写筛查字段；各批次失败独立处理，返回None。
+# posts:[原帖]、筛选/处理回调 → 并发回写筛查字段；各批次失败独立处理，返回 (待筛数, 通过数, 淘汰数, 失败批次数)。
 def _screen_posts(posts, post_manager, predicate, processor, prompt_path, batch_size, action):
     pending = [post for post in posts if predicate(post)]
     if not pending:
-        _log(f"{action}/计划", "当前无待筛新帖", 扫描=len(posts))
-        return
+        logger.debug("[%s/计划] 当前无待筛新帖 | 扫描: [%s]", action, len(posts))
+        return 0, 0, 0, 0
     prompt = read_file_to_str(prompt_path)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError(f"{action}提示词为空或读取失败: {prompt_path}")
@@ -778,33 +780,47 @@ def _screen_posts(posts, post_manager, predicate, processor, prompt_path, batch_
                      排查="检查模型、帖子字段与数据库；核对是否已部分写入")
     _log(f"{action}/汇总", "本轮筛查结束", 待筛=len(pending), 通过=passed,
          淘汰=rejected, 失败批次=failed, 耗时=f"{time.monotonic() - started:.2f}秒")
+    return len(pending), passed, rejected, failed
 
 
 # 原帖列表 → 每批50帖初筛；成功结果原地更新，供本轮精提直接读取。
 def batch_pre_screen_posts(posts, post_manager):
-    _screen_posts(posts, post_manager, is_need_pre_screening, process_and_save_pre_screen_batch,
-                  PRE_SCREEN_PROMPT_FILE_PATH, PRE_SCREEN_BATCH_SIZE, "初筛")
+    return _screen_posts(
+        posts, post_manager, is_need_pre_screening, process_and_save_pre_screen_batch,
+        PRE_SCREEN_PROMPT_FILE_PATH, PRE_SCREEN_BATCH_SIZE, "初筛",
+    )
 
 
 # 原帖列表 → 24h且浏览>1000的文本粗筛；保持单批失败隔离。
 def batch_screen_viral_posts(posts, post_manager):
-    _screen_posts(posts, post_manager, is_need_viral_screening, process_and_save_single_viral_post,
-                  VIRAL_STAGE1_PROMPT_FILE_PATH, VIRAL_STAGE1_BATCH_SIZE, "高流量粗筛")
+    return _screen_posts(
+        posts, post_manager, is_need_viral_screening, process_and_save_single_viral_post,
+        VIRAL_STAGE1_PROMPT_FILE_PATH, VIRAL_STAGE1_BATCH_SIZE, "高流量粗筛",
+    )
 
 
 # 四、采集与论据提取调度
 
+_HOT_COIN_CACHE = {"ts": 0.0, "coins": []}
+_HOT_COIN_LOCK = threading.Lock()
 
-# 合约/现货热榜与涨跌榜各前2项 → 去重币种列表；沿用集合的无序返回。
+
+# 合约/现货热榜与涨跌榜各前2项 → 去重币种列表；20秒内复用同轮缓存避免多线程启动重复请求与刷屏。
 def get_hot_coin():
+    with _HOT_COIN_LOCK:
+        if _HOT_COIN_CACHE["coins"] and (time.monotonic() - _HOT_COIN_CACHE["ts"]) < 20.0:
+            return list(_HOT_COIN_CACHE["coins"])
     top_k, coins = 2, []
     for fetch in (fetch_binance_future_hot_coins, fetch_binance_spot_hot_coins):
         coins.extend(item.get("symbol").replace("USDT", "").replace("USDC", "")
                      for item in fetch()[:top_k])
     movers = get_top_k_movers(top_k)
     coins.extend(item["symbol"].split("/")[0] for item in movers["top_gainers"] + movers["top_losers"])
-    coins = list(set(coins))
-    logger.info("[币种/热榜] 已合并热门币种 | 数量: [%s] | 币种: [%s]", len(coins), coins)
+    coins = list(dict.fromkeys(coins))
+    with _HOT_COIN_LOCK:
+        _HOT_COIN_CACHE["ts"] = time.monotonic()
+        _HOT_COIN_CACHE["coins"] = list(coins)
+    logger.info("[行情热榜/币安] 热门与异动币种合并完成 | 币种数: [%s] | 列表: [%s]", len(coins), ", ".join(coins))
     return coins
 
 
@@ -823,8 +839,8 @@ def _fetch_hot_posts(post_manager, token_list, fetch_feed, platform):
     if rec_batch:
         post_manager.upsert_posts(rec_batch)
         total_posts += len(rec_batch)
-    _log("采集/完成", "推荐流已入库", 平台=platform, 币种数=token_count,
-         帖数=f"{total_posts}，含重复", 耗时=f"{time.monotonic() - started:.2f}秒")
+    _log("采集/完成", "单平台全流采集入库完成", 平台=platform, 扫描币种数=token_count,
+         累计入库帖数=total_posts, 耗时=f"{time.monotonic() - started:.2f}s")
 
 
 def fetch_binance_hot_post(post_manager, token_list):
@@ -846,7 +862,7 @@ def fetch_all_hot_posts_once(post_manager=None):
         try:
             fetcher(post_manager, PLATFORMS[platform].hot_coins())
         except Exception:
-            logger.exception("❌ [采集/单平台] %s 采集任务异常，继续下一平台", platform)
+            logger.exception("❌ [采集/单平台] %s 采集任务异常，继续下一平台 | 排查方向: [检查该平台接口、代理与网络]", platform)
 
 
 def fetch_all_hot_posts():
@@ -858,14 +874,14 @@ def fetch_all_hot_posts():
             fetch_all_hot_posts_once(post_manager)
             delay = 3600
             logger.info(
-                "[采集/轮询] 本轮双平台采集结束 | 耗时: [%.2f 秒] | 下次采集: [%s 秒后]",
+                "[采集/轮询] 本轮双平台采集全部结束 | 总耗时: [%.2fs] | 下次采集: [%ss后]",
                 time.monotonic() - started, delay,
             )
             time.sleep(delay)
         except Exception:
             logger.exception(
-                "❌ [采集/轮询] 本轮采集异常中断 | 后续: [60 秒后重新初始化] "
-                "| 排查: [检查热榜、采集服务、代理及数据库连接]"
+                "❌ [采集/轮询] 本轮采集异常中断 | 后续: [60s后重新初始化] "
+                "| 排查方向: [检查热榜、采集服务、代理及数据库连接]"
             )
             time.sleep(60)
 
@@ -887,33 +903,40 @@ def format_image_article():
             ]
             posts = [post for batch in source_batches for post in batch]
             if not posts:
-                logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
+                logger.info("[原帖筛查/轮询] 库内暂无近50h原帖 | 下次扫描: [60s后]")
                 time.sleep(60)
                 continue
-            batch_pre_screen_posts(posts, post_manager)
+            pre_pending, pre_pass, pre_rej, _ = batch_pre_screen_posts(posts, post_manager) or (0, 0, 0, 0)
             valid_posts = [post for post in posts if is_need_formatting(post)]
-            logger.info(
-                "[帖子/计划] 初筛后精提 | 扫描: [%s] | 待精提: [%s] | 跳过: [%s] | 并发上限: [%s]",
-                len(posts), len(valid_posts), len(posts) - len(valid_posts), MAX_CONCURRENCY,
-            )
             if valid_posts:
+                logger.info(
+                    "[论据提取/计划] 启动多模态论据精提 | 扫描原帖: [%s] | 待精提: [%s] | 并发上限: [%s]",
+                    len(posts), len(valid_posts), MAX_CONCURRENCY,
+                )
                 with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
                     futures = [executor.submit(process_and_save_single_post, post, post_manager)
                                for post in valid_posts]
                     for future in as_completed(futures):
                         future.result()
-            batch_screen_viral_posts(posts, post_manager)
+            viral_pending, viral_pass, viral_rej, _ = batch_screen_viral_posts(posts, post_manager) or (0, 0, 0, 0)
             delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 60
-            logger.info(
-                "[帖子/完成] 本轮线程结束 | 扫描: [%s] | 已提交: [%s] | 耗时: [%.2f 秒] "
-                "| 下次扫描: [%s 秒后] | 单帖结果: [见帖子回写/失败日志]",
-                len(posts), len(valid_posts), time.monotonic() - started, delay,
-            )
+            if pre_pending == 0 and not valid_posts and viral_pending == 0:
+                logger.info(
+                    "[原帖筛查/轮询] 本轮无新增待处理原帖 | 库内近50h原帖: [%s] | 耗时: [%.2fs] | 下次扫描: [%ss后]",
+                    len(posts), time.monotonic() - started, delay,
+                )
+            else:
+                logger.info(
+                    "[原帖筛查/汇总] 本轮筛查与精提完成 | 扫描原帖: [%s] | 初筛(通过/淘汰): [%s/%s] "
+                    "| 论据精提: [%s帖] | 高流量粗筛(放行/淘汰): [%s/%s] | 耗时: [%.2fs] | 下次扫描: [%ss后]",
+                    len(posts), pre_pass, pre_rej, len(valid_posts), viral_pass, viral_rej,
+                    time.monotonic() - started, delay,
+                )
             time.sleep(delay)
         except Exception:
             logger.exception(
-                "❌ [帖子/轮询] 本轮中断 | 后续: [60 秒后重新初始化] "
-                "| 排查: [检查提示词、代理、帖子字段及数据库]"
+                "❌ [原帖筛查/轮询] 本轮筛查异常中断 | 后续: [60s后重新初始化] "
+                "| 排查方向: [检查提示词、代理、帖子字段及数据库]"
             )
             time.sleep(60)
 
@@ -1273,7 +1296,10 @@ def build_article_task(coin, stance, ev_list, article_manager):
             "status": "skip", "text": "", "god_comments": [], "image_placeholders": [], "used_material_ids": [],
             "score": None, "reason": reason, "image_mapping": {},
         }
-        return {"is_skip": True, "record": record, "coin": coin, "stance": stance, "reason": reason}
+        return {
+            "is_skip": True, "record": record, "coin": coin, "stance": stance,
+            "reason": reason, "selected_count": len(selected),
+        }
     materials, image_mapping = transform_mlus(selected)
     brief["materials"] = materials
     record["material_post_mapping"] = {
@@ -1621,7 +1647,7 @@ def _generate_article_record(task, validator, convert, action, context, **model_
 def execute_article_task(task_data, article_manager):
     coin, stance = task_data["coin"], task_data["stance"]
     if task_data.get("is_skip"):
-        _log("文章/跳过", "选材不足", 币种=coin, 立场=stance, 原因=task_data["reason"])
+        logger.debug("[单币分析/跳过] 选材不足 | 币种: [%s] | 立场: [%s] | 原因: [%s]", coin, stance, task_data["reason"])
         return task_data["record"]
     started = time.monotonic()
     mapping = task_data["image_mapping"]
@@ -1632,17 +1658,18 @@ def execute_article_task(task_data, article_manager):
 
     record = _generate_article_record(
         task_data, lambda info: check_article_info(info, task_data["materials"], mapping, ARTICLE_MAX_CHARS),
-        convert, "文章/生成", f"币种={coin},立场={stance}", preset_model_group="medium",
+        convert, "单币分析/生成", f"币种={coin},立场={stance}", preset_model_group="medium",
     )
     if record["status"] != "ok":
         if record["status"] == "skip":
-            _log("文章/跳过", "模型决定不生成文章", 币种=coin, 立场=stance,
+            _log("单币分析/跳过", "模型决定不生成文章", 币种=coin, 立场=stance,
                  原因=(record.get("article_info") or {}).get("reason", "未说明"))
         return record
     saved = prepare_article_record_for_db(record)
     article_manager.upsert_articles([saved])
-    _log("文章/完成", "已校验并入库", 币种=coin, 立场=stance,
-         尝试=record["attempt_count"], 耗时=f"{time.monotonic() - started:.2f}秒")
+    _log("单币分析/入库", "文章已校验并入库", 币种=coin, 立场=stance,
+         评分=(saved.get("article_info") or {}).get("score"),
+         尝试=record["attempt_count"], 耗时=f"{time.monotonic() - started:.2f}s")
     return saved
 
 
@@ -1689,7 +1716,7 @@ def execute_viral_article_task(task_data, article_manager):
     _log("高流量/完成", "原图验货与重塑结果已入库", 原帖=post_id,
          状态=saved["status"], 赛道=saved["topic"], 评分=info["viral_score"],
          选图=len(info["selected_images"]), 原因=info["decision_reason"],
-         尝试=record["attempt_count"], 耗时=f"{time.monotonic() - started:.2f}秒")
+         尝试=record["attempt_count"], 耗时=f"{time.monotonic() - started:.2f}s")
     return saved
 
 
@@ -1723,14 +1750,45 @@ def generate_analysis_articles_once():
     tasks = [build_article_task(coin, stance, items, manager) for coin, stance, items in groups
              for _ in range(ARTICLE_VARIANTS)]
     local_skips = sum(bool(task.get("is_skip")) for task in tasks)
-    _log("文章/计划", "选材完成", 币种=len(grouped), 分组=len(groups), 任务=len(tasks),
-         本地跳过=local_skips, 模型调用上限=(len(tasks) - local_skips) * LLM_MAX_RETRIES,
-         选材=f"引用次数<{ARTICLE_POST_USAGE_LIMIT}，素材{ARTICLE_MIN_MATERIALS}—{ARTICLE_MATERIAL_LIMIT}条")
-    results, raised, model_skips = _execute_article_tasks(tasks, execute_article_task, manager, "文章")
+    skipped_groups = {}
+    for task in tasks:
+        if task.get("is_skip"):
+            key = f"{task['coin']}/{task['stance']}"
+            if key not in skipped_groups:
+                skipped_groups[key] = task.get("selected_count", 0)
+    skip_summary_str = ", ".join(f"{k}({v}条)" for k, v in skipped_groups.items()) or "无"
+
+    if len(tasks) == local_skips:
+        _log(
+            "单币分析/选材",
+            f"本轮各币种有效论据均不足(<{ARTICLE_MIN_MATERIALS}条)，跳过生成",
+            扫描币种=len(grouped),
+            方向分组=len(groups),
+            各组有效论据=skip_summary_str,
+            耗时=f"{time.monotonic() - started:.2f}s",
+        )
+        return [task["record"] for task in tasks]
+
+    _log(
+        "单币分析/计划",
+        "选材完成，启动单币分析文章生成",
+        扫描币种=len(grouped),
+        方向分组=len(groups),
+        待生成任务=len(tasks) - local_skips,
+        跳过分组=skip_summary_str,
+    )
+    results, raised, model_skips = _execute_article_tasks(tasks, execute_article_task, manager, "单币分析")
     counts = Counter(item.get("status") for item in results)
-    _log("文章/完成", "本轮任务结束", 任务=len(tasks), 成功=counts["ok"],
-         失败=counts["error"] + raised, 跳过=counts["skip"], 本地跳过=local_skips,
-         模型跳过=model_skips, 耗时=f"{time.monotonic() - started:.2f}秒")
+    _log(
+        "单币分析/汇总",
+        "本轮单币分析生成结束",
+        可执行任务=len(tasks) - local_skips,
+        成功入库=counts["ok"],
+        模型跳过=model_skips,
+        论据不足跳过=local_skips,
+        失败=counts["error"] + raised,
+        耗时=f"{time.monotonic() - started:.2f}s",
+    )
     return results
 
 
@@ -1739,13 +1797,15 @@ def generate_viral_articles_once():
     started = time.monotonic()
     manager = GeneratedArticleManager(gen_db_object())
     tasks = [build_viral_article_task(post) for post in extract_valid_viral_posts(manager)]
-    _log("高流量/计划", "第二阶段多模态精改就绪", 任务=len(tasks), 并发=ARTICLE_CONCURRENCY,
+    if not tasks:
+        return []
+    _log("高流量/计划", "第二阶段多模态精改就绪", 待精改任务=len(tasks), 并发=ARTICLE_CONCURRENCY,
          模型调用上限=len(tasks) * LLM_MAX_RETRIES)
     results, raised, _ = _execute_article_tasks(tasks, execute_viral_article_task, manager, "高流量")
     counts = Counter(item.get("status") for item in results)
     _log("高流量/汇总", "本轮精改结束", 任务=len(tasks), 成功=counts["ok"],
          二阶段淘汰=counts["skip"], 失败=counts["error"] + raised,
-         耗时=f"{time.monotonic() - started:.2f}秒")
+         耗时=f"{time.monotonic() - started:.2f}s")
     return results
 
 
@@ -2135,12 +2195,22 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
         article_manager, platform, hot_coins, used_addresses, article_type,
     )
 
-    _log(f"{rule['action']}/计划", "候选已按评分降序排列", 平台=platform, 窗口=f"{rule['hours']}小时",
-         图片去重窗口=f"{dedup_hours}小时", 查询=raw_count, 候选=len(candidates),
-         过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/来源冲突{stats['source_conflict']}/竞品词{stats['rival_keyword']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
-         已发=recent_count, 占用图片=len(set(used_primary)),
-         账号数=len(accounts), 冷却=f"{cooldown}秒，按文章类型独立计算",
-         主题冷却="无" if viral else f"{ACCOUNT_TOPIC_COOLDOWN_SECONDS}秒")
+    filter_labels = (
+        ("版本不符", stats["version"]),
+        ("结构无效", stats["structure"]),
+        ("尝试超限", stats["attempts"]),
+        ("同源冲突", stats["source_conflict"]),
+        ("含竞品词", stats["rival_keyword"]),
+        ("非热币", stats["no_hot_coin"]),
+        ("图片缺失", stats["invalid_image"]),
+        ("图片重复", stats["image_dup"]),
+    )
+    filter_summary = "/".join(f"{name}:{cnt}" for name, cnt in filter_labels if cnt > 0) or "无"
+    _log(f"{rule['action']}/计划", "候选已按评分降序排列", 平台=platform, 窗口=f"{rule['hours']}h",
+         图片去重窗口=f"{dedup_hours}h", 查询=raw_count, 候选=len(candidates),
+         过滤原因=filter_summary,
+         近7d已发=recent_count, 占用图片=len(set(used_primary)),
+         账号数=len(accounts), 账号冷却=f"{cooldown}s")
 
     for account in accounts:
         if not candidates:

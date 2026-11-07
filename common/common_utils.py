@@ -95,6 +95,34 @@ _LOG_FORMATTER = logging.Formatter(
     "%(asctime)s,%(msecs)03d | %(levelname)s | [%(name)s:%(funcName)s] | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+_NOISY_LOGGER_PREFIXES = (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "urllib3",
+    "openai",
+    "charset_normalizer",
+    "filelock",
+    "asyncio",
+)
+_NOISY_FUNC_NAMES = (
+    "_send_single_request",
+    "_send_handling_auth",
+    "_send_handling_redirects",
+)
+
+
+class _ThirdPartyNoiseFilter(logging.Filter):
+    """全局拦截底层 HTTP 客户端（如 httpx/httpx2/httpcore/openai）的请求流水噪音日志。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING:
+            if record.name.startswith(_NOISY_LOGGER_PREFIXES) or record.funcName in _NOISY_FUNC_NAMES:
+                return False
+        return True
+
+
+_NOISE_FILTER = _ThirdPartyNoiseFilter()
 
 
 def _attach_handlers(target_logger: logging.Logger, log_dir: str, app_name: str):
@@ -107,10 +135,13 @@ def _attach_handlers(target_logger: logging.Logger, log_dir: str, app_name: str)
         encoding="utf-8",
     )
     file_handler.setFormatter(_LOG_FORMATTER)
+    file_handler.addFilter(_NOISE_FILTER)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(_LOG_FORMATTER)
+    console_handler.addFilter(_NOISE_FILTER)
 
+    target_logger.addFilter(_NOISE_FILTER)
     target_logger.addHandler(file_handler)
     target_logger.addHandler(console_handler)
 
@@ -125,24 +156,32 @@ def setup_logger(log_dir: Optional[str] = None, app_name: str = "BinanceBot") ->
     resolved_dir = resolve_cross_platform_path(log_dir, DEFAULT_LOG_DIR)
     os.makedirs(resolved_dir, exist_ok=True)
 
-    for noisy in ("httpx", "httpcore", "urllib3"):
+    for noisy in _NOISY_LOGGER_PREFIXES:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     with _LOGGER_LOCK:
         root_logger = logging.getLogger()
+        root_logger.addFilter(_NOISE_FILTER)
         if not root_logger.handlers:
             root_logger.setLevel(logging.INFO)
             _attach_handlers(root_logger, resolved_dir, "BinanceBot")
             root_logger.propagate = False
+        else:
+            for h in root_logger.handlers:
+                h.addFilter(_NOISE_FILTER)
 
         if not app_name or app_name == "BinanceBot":
             return root_logger
 
         named_logger = logging.getLogger(app_name)
+        named_logger.addFilter(_NOISE_FILTER)
         if not named_logger.handlers:
             named_logger.setLevel(logging.INFO)
             _attach_handlers(named_logger, resolved_dir, app_name)
             named_logger.propagate = False
+        else:
+            for h in named_logger.handlers:
+                h.addFilter(_NOISE_FILTER)
         return named_logger
 
 

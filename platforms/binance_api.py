@@ -115,23 +115,31 @@ def publish_to_binance_square(api_key, text_content):
     text_summary = text_content[:20].replace("\n", " ") + ("..." if len(text_content) > 20 else "")
 
     try:
-        logger.info(f"⏳ 开始向币安广场发帖 | Key: {masked_key} | 内容摘要: {text_summary}")
         response = requests.post(url, headers=headers, json=payload, proxies=PROXIES, timeout=REQUEST_TIMEOUT)
         result = response.json()
 
         if result.get("success") or str(result.get("code")) == "000000":
             post_id = result.get("data", {}).get("id")
             post_url = f"https://www.binance.com/square/post/{post_id}" if post_id else "未知链接"
-            logger.info(f"✅ 发帖成功 | 帖子ID: {post_id} | 直达链接: {post_url}")
+            logger.info(
+                f"[币安接口/发帖] OpenAPI 发帖成功 | Key: [{masked_key}] | 帖子ID: [{post_id}] "
+                f"| 摘要: [{text_summary}] | 链接: <{post_url}>"
+            )
             return True
         else:
             error_code = str(result.get("code"))
-            hint = " (💡提示: 已达每日发帖上限 Daily limit)" if error_code == "220009" else ""
-            logger.error(f"❌ 发帖失败 | 错误码: {error_code}{hint} | 完整响应: {result}")
+            hint = "已触发每日发帖上限(Daily limit)" if error_code == "220009" else "检查API Key权限或正文合规性"
+            logger.error(
+                f"❌ [币安接口/发帖] OpenAPI 发帖被拒 | Key: [{masked_key}] | 错误码: [{error_code}] "
+                f"| 响应: [{result.get('message') or result}] | 排查方向: [{hint}]"
+            )
             return False
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"🚨 发帖网络请求异常 | Key: {masked_key} | 异常信息: {e}")
+        logger.error(
+            f"❌ [币安接口/发帖] 发帖网络请求异常 | Key: [{masked_key}] | 原因: [{e}] "
+            f"| 排查方向: [检查本地代理配置与币安接口连通性]"
+        )
         return False
 
 
@@ -146,27 +154,31 @@ def _post_private_action(url: str, label: str, headers: dict, payload: dict, ses
         response.raise_for_status()
         json_resp = response.json()
         if json_resp.get("success"):
-            logger.info(f"✅ [{label}] 操作成功！")
+            logger.debug(f"[币安互动/{label}] 操作成功")
             return True
         code = json_resp.get("code")
         msg = json_resp.get("message", "未知错误")
-        logger.error(f"❌ [{label}] API 业务错误 | Code: {code} | Msg: {msg}")
+        logger.warning(
+            f"[币安互动/{label}] 接口业务返回未成功 | 错误码: [{code}] | 原因: [{msg}] "
+            f"| 排查方向: [检查账号 Cookie/CSRF 是否过期或操作过于频繁]"
+        )
         return False
     except Exception as e:
-        detail = ""
-        if response is not None:
-            detail = f" | HTTP {response.status_code} | 返回数据: {response.text[:200]}"
-        logger.error(f"🚨 [{label}] 网络或请求异常{detail} | 报错: {e}")
+        detail = f"HTTP {response.status_code}" if response is not None else "无HTTP响应"
+        logger.warning(
+            f"[币安互动/{label}] 请求异常 | 状态: [{detail}] | 原因: [{e}] "
+            f"| 排查方向: [检查代理网络或会话登录状态]"
+        )
         return False
 
 
 def toggle_binance_follow(target_uid, action, cookies, csrf_token, session=None):
     """操作币安广场用户的关注状态 ('follow' 或 'unfollow')"""
     if action not in ["follow", "unfollow"]:
-        logger.error("❌ 无效的操作类型，只能是 'follow' 或 'unfollow'")
+        logger.error(f"❌ [币安互动/关注] 参数错误 | action: [{action}] | 说明: [仅支持 follow 或 unfollow]")
         return False
     url = f"https://www.binance.com/bapi/composite/v2/private/pgc/user/{action}"
-    label = f"{'关注' if action == 'follow' else '取消关注'}: {target_uid}"
+    label = f"{'关注' if action == 'follow' else '取消关注'}:{target_uid}"
     headers = _build_private_headers(cookies, csrf_token)
     return _post_private_action(url, label, headers, {"targetSquareUid": target_uid}, session=session)
 
@@ -174,10 +186,10 @@ def toggle_binance_follow(target_uid, action, cookies, csrf_token, session=None)
 def toggle_binance_like(post_id, action, cookies, csrf_token, card_type="BUZZ_SHORT", session=None):
     """操作币安广场帖子的点赞状态 ('like' 或 'unlike')"""
     if action not in ["like", "unlike"]:
-        logger.error("❌ 无效的操作类型，只能是 'like' 或 'unlike'")
+        logger.error(f"❌ [币安互动/点赞] 参数错误 | action: [{action}] | 说明: [仅支持 like 或 unlike]")
         return False
     url = f"https://www.binance.com/bapi/composite/v1/private/pgc/content/{action}"
-    label = f"{'点赞' if action == 'like' else '取消点赞'}帖子: {post_id}"
+    label = f"{'点赞' if action == 'like' else '取消点赞'}:{post_id}"
     headers = _build_private_headers(
         cookies, csrf_token, referer=f"https://www.binance.com/zh-CN/square/post/{post_id}"
     )
@@ -187,10 +199,10 @@ def toggle_binance_like(post_id, action, cookies, csrf_token, card_type="BUZZ_SH
 def toggle_binance_bookmark(post_id, action, cookies, csrf_token, session=None):
     """操作币安广场帖子的收藏状态 ('add' 或 'cancel')"""
     if action not in ["add", "cancel"]:
-        logger.error("❌ 无效的操作类型，只能是 'add' 或 'cancel'")
+        logger.error(f"❌ [币安互动/收藏] 参数错误 | action: [{action}] | 说明: [仅支持 add 或 cancel]")
         return False
     url = f"https://www.binance.com/bapi/composite/v1/private/pgc/content/{action}/bookmark"
-    label = f"{'收藏' if action == 'add' else '取消收藏'}帖子: {post_id}"
+    label = f"{'收藏' if action == 'add' else '取消收藏'}:{post_id}"
     headers = _build_private_headers(
         cookies, csrf_token, referer=f"https://www.binance.com/zh-CN/square/post/{post_id}"
     )
@@ -527,8 +539,8 @@ def clean_universal_posts(final_clean_list):
             if result_list:
                 all_clean_list.extend(result_list)
 
-    logger.info(
-        f"🗂️ [清洗分发] 完成 | 共处理:{unique_count}条 | 分布:{card_type_counts} | 有效产出:{len(all_clean_list)}条"
+    logger.debug(
+        f"[币安清洗/分发] 完成 | 去重后:[{unique_count}] | 分布:[{card_type_counts}] | 有效产出:[{len(all_clean_list)}]"
     )
     return all_clean_list
 
@@ -603,8 +615,8 @@ def _enrich_single_post(item, session):
             if video_duration < 300:
                 urls_to_download.add(media_info["video_url"])
             else:
-                logger.warning(
-                    f"[DOWNLOAD] 视频过长，跳过下载 | post_id={post_id} | duration={video_duration}s | url={media_info['video_url']}"
+                logger.debug(
+                    f"[币安富化/视频] 视频超长跳过下载 | 帖子ID: [{post_id}] | 时长: [{video_duration}s]"
                 )
         for img_url in media_info.get("images", []):
             if img_url:
@@ -623,7 +635,7 @@ def _enrich_single_post(item, session):
                     media_info["local_mapping"][url] = local_path
                     stats["total_download_success"] += 1
             except Exception as dl_e:
-                logger.error(f"[DOWNLOAD] 媒体资源下载失败 | post_id={post_id} | url={url} | error={dl_e}")
+                logger.debug(f"[币安富化/媒体下载] 下载异常 | 帖子ID: [{post_id}] | URL: <{url}> | 原因: [{dl_e}]")
 
         try:
             comment_count = item.get("engagement", {}).get("comment_count", 0)
@@ -635,16 +647,16 @@ def _enrich_single_post(item, session):
                 if replies:
                     stats["comments_fetched"] = 1
         except Exception as reply_e:
-            logger.error(f"[COMMENTS] 评论拉取失败 | post_id={post_id} | error={reply_e}")
+            logger.debug(f"[币安富化/评论] 评论拉取异常 | 帖子ID: [{post_id}] | 原因: [{reply_e}]")
 
     except Exception as e:
         stats["failed"] = 1
-        logger.error(f"[UPDATE] 就地更新多模态信息失败 | post_id={post_id} | error={e}", exc_info=True)
+        logger.warning(f"[币安富化/单帖] 多模态富化异常 | 帖子ID: [{post_id}] | 原因: [{e}]")
 
     return item, stats
 
 
-def update_posts_in_place(final_clean_list):
+def update_posts_in_place(final_clean_list, _stats_out=None):
     """就地并发更新帖子内容、下载媒体与拉取评论"""
     if not final_clean_list:
         return []
@@ -658,7 +670,6 @@ def update_posts_in_place(final_clean_list):
         "failed": 0,
     }
     max_workers = min(10, len(final_clean_list))
-    logger.debug(f"⏳ 开始并发执行 {len(final_clean_list)} 条数据的多模态详情更新、媒体下载与评论拉取...")
 
     with requests.Session() as session:
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
@@ -676,15 +687,16 @@ def update_posts_in_place(final_clean_list):
                     for key in total_stats:
                         total_stats[key] += task_stats.get(key, 0)
                 except Exception as exc:
-                    logger.error(f"🚨 线程执行发生严重异常: {exc}", exc_info=True)
+                    logger.warning(f"[币安富化/并发] 线程执行异常 | 原因: [{exc}]")
                     total_stats["failed"] += 1
 
-    logger.info(
-        f"✅ [并发拉取] 融合完毕 | 长文更新:{total_stats['long_updated']} | "
-        f"媒体拼接:{total_stats['other_updated']} | "
-        f"下载成功:{total_stats['total_download_success']}/{total_stats['total_download_urls']} | "
-        f"评论拉取:{total_stats['comments_fetched']} | "
-        f"失败:{total_stats['failed']}"
+    if isinstance(_stats_out, dict):
+        _stats_out.update(total_stats)
+
+    logger.debug(
+        f"[币安富化/汇总] 长文:[{total_stats['long_updated']}] | 短帖:[{total_stats['other_updated']}] | "
+        f"媒体:[{total_stats['total_download_success']}/{total_stats['total_download_urls']}] | "
+        f"评论:[{total_stats['comments_fetched']}] | 失败:[{total_stats['failed']}]"
     )
     return final_clean_list
 
@@ -711,10 +723,6 @@ def _dedup_vos(all_vos, label):
         if item_id not in seen_ids:
             seen_ids.add(item_id)
             deduped.append(item)
-    logger.debug(
-        f"✅ [{label}] 去重完成 | 抓取 {len(all_vos)} 条 | "
-        f"移除重复 {len(all_vos) - len(deduped)} 条 | 最终保留 {len(deduped)} 条"
-    )
     return deduped
 
 
@@ -742,16 +750,19 @@ def _paginate_feed(url, headers, build_payload, required_count, label, on_page=N
             retry_count = 0
             time.sleep(random.uniform(0.5, 1.5))
         except Exception as e:
-            detail = ""
-            if response is not None and response.status_code >= 400:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            detail = f"HTTP {response.status_code}" if (response is not None and response.status_code >= 400) else "网络或解析异常"
             retry_count += 1
-            logger.warning(
-                f"🚨 [{label}] 第 {page_index} 页请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
-            )
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止采集")
+                logger.error(
+                    f"❌ [币安采集/{label}] 分页请求连续失败达上限，终止当前流采集 | 页码: [{page_index}] "
+                    f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 状态: [{detail}] | 原因: [{e}] "
+                    f"| 排查方向: [检查代理连通性或币安接口限流]"
+                )
                 break
+            logger.warning(
+                f"[币安采集/{label}] 分页请求异常，准备重试 | 页码: [{page_index}] "
+                f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 状态: [{detail}] | 原因: [{e}]"
+            )
             time.sleep(random.uniform(0.5, 1.5))
 
     return _dedup_vos(all_vos, label)
@@ -841,8 +852,6 @@ def get_binance_feed_token(token="DOGE", required_count=20, orderBy=2):
         "referrer": f"https://www.binance.com/zh-CN/square/community?token={token}",
     }
 
-    logger.info(f"⏳ [币种:{token}] 开始采集 | 目标条数: {required_count} | 排序: {orderBy}")
-
     def build_payload(page_index):
         return {
             "token": token,
@@ -856,24 +865,27 @@ def get_binance_feed_token(token="DOGE", required_count=20, orderBy=2):
 
 
 def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **kwargs):
-    """统一的币安广场数据拉取接口（智能路由 + 增量拦截 + 自营拦截 + 清洗富化）"""
+    """统一的币安广场数据拉取接口（智能路由 + 增量拦截 + 自营拦截 + 清洗富化，单条聚合日志输出）"""
+    started = time.monotonic()
     if existing_ids is None:
         existing_ids = set()
     elif isinstance(existing_ids, list):
         existing_ids = set(existing_ids)
 
-    task_label = keyword if keyword else (token if token else "推荐流")
-
     if keyword:
-        logger.info(f"🚀 开始探测: [搜索流] 关键词: {keyword} | 目标条数: {count}")
+        feed_type = "搜索流"
+        target_desc = f"{keyword}"
         search_type = kwargs.get("search_type", 1)
         feed_list = fetch_binance_feed_search(keyword=keyword, required_count=count, search_type=search_type)
     elif token:
-        logger.info(f"🚀 开始探测: [币种流] 币种: {token} | 目标条数: {count}")
+        feed_type = "币种流"
         order_by = kwargs.get("orderBy", 2)
+        order_label = "热门" if str(order_by) == "1" else "最新"
+        target_desc = f"{token}-{order_label}"
         feed_list = get_binance_feed_token(token=token, required_count=count, orderBy=order_by)
     else:
-        logger.info(f"🚀 开始探测: [推荐流] | 目标条数: {count}")
+        feed_type = "推荐流"
+        target_desc = "首页推荐"
         content_ids = kwargs.get("content_ids", [])
         feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
 
@@ -893,16 +905,21 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
 
     if not filtered_feed_list:
         logger.info(
-            f"🛑 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
+            f"[币安采集/{feed_type}] 探测完成，无新增帖子 | 标的: [{target_desc}] | 原始抓取: [{len(feed_list)}] "
+            f"| 拦截过滤: [{intercepted_count}] | 净增有效: [0] | 耗时: [{time.monotonic() - started:.2f}s]"
         )
         return []
 
-    logger.info(
-        f"📥 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
-    )
-
     clean_feed_list = clean_universal_posts(filtered_feed_list)
-    return update_posts_in_place(clean_feed_list)
+    enrich_stats = {}
+    enriched_list = update_posts_in_place(clean_feed_list, _stats_out=enrich_stats)
+    logger.info(
+        f"[币安采集/{feed_type}] 采集与富化完成 | 标的: [{target_desc}] | 原始抓取: [{len(feed_list)}] "
+        f"| 拦截过滤: [{intercepted_count}] | 净增有效: [{len(enriched_list)}] "
+        f"| 媒体下载: [{enrich_stats.get('total_download_success', 0)}/{enrich_stats.get('total_download_urls', 0)}] "
+        f"| 评论拉取: [{enrich_stats.get('comments_fetched', 0)}帖] | 耗时: [{time.monotonic() - started:.2f}s]"
+    )
+    return enriched_list
 
 
 def fetch_binance_post_detail(post_id, session=None):
@@ -931,20 +948,16 @@ def fetch_binance_post_detail(post_id, session=None):
             response.raise_for_status()
             data_field = response.json().get("data")
             if not data_field:
-                logger.warning(f"⚠️ [详情:{post_id}] 接口未返回有效数据")
-            else:
-                logger.debug(f"✅ [详情:{post_id}] 获取文章详情成功")
+                logger.debug(f"[币安采集/长文详情] 接口未返回有效数据 | 帖子ID: [{post_id}]")
             return data_field
         except Exception as e:
-            detail = ""
-            if response is not None and response.status_code >= 400:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            detail = f"HTTP {response.status_code}" if (response is not None and response.status_code >= 400) else "请求异常"
             retry_count += 1
-            logger.warning(
-                f"🚨 [详情:{post_id}] 请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
-            )
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [详情:{post_id}] 连续失败达到 {MAX_RETRIES} 次上限，终止")
+                logger.warning(
+                    f"[币安采集/长文详情] 连续失败达上限，跳过该长文富化 | 帖子ID: [{post_id}] "
+                    f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 状态: [{detail}] | 原因: [{e}]"
+                )
                 break
             time.sleep(random.uniform(0.5, 1.5))
 
@@ -989,7 +1002,6 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
     all_replies = []
     page_index = 1
     retry_count = 0
-    label = f"评论流: {content_id}"
     req_client = session if session else requests
 
     while len(all_replies) < required_count:
@@ -1008,7 +1020,9 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
             response.raise_for_status()
             json_resp = response.json()
             if not json_resp.get("success"):
-                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message')}")
+                logger.debug(
+                    f"[币安采集/评论流] 接口返回非成功状态 | 帖子ID: [{content_id}] | 原因: [{json_resp.get('message')}]"
+                )
                 break
             data = json_resp.get("data") or []
             page_items = data if isinstance(data, list) else (data.get("list") or [])
@@ -1019,15 +1033,13 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
             retry_count = 0
             time.sleep(random.uniform(0.5, 1.5))
         except Exception as e:
-            detail = ""
-            if response is not None:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            detail = f"HTTP {response.status_code}" if response is not None else "请求异常"
             retry_count += 1
-            logger.warning(
-                f"🚨 [{label}] 第 {page_index} 页请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
-            )
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止采集。")
+                logger.warning(
+                    f"[币安采集/评论流] 评论拉取连续失败达上限 | 帖子ID: [{content_id}] "
+                    f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 状态: [{detail}] | 原因: [{e}]"
+                )
                 break
             time.sleep(random.uniform(1.0, 3.0))
 
@@ -1037,15 +1049,15 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
 def fetch_binance_relations(target_username, relation_type, required_count, session=None):
     """聚合获取币安广场指定用户的关注/粉丝列表 ("following" 或 "followers")"""
     if relation_type not in ["following", "followers"]:
-        logger.error("❌ relation_type 只能是 'following' 或 'followers'")
+        logger.error(f"❌ [币安接口/关系] 参数错误 | relation_type: [{relation_type}] | 说明: [仅支持 following 或 followers]")
         return []
 
     if relation_type == "following":
         url = "https://www.binance.com/bapi/composite/v3/friendly/pgc/user/following"
-        label = f"关注列表: {target_username}"
+        label = f"关注列表:{target_username}"
     else:
         url = "https://www.binance.com/bapi/composite/v3/friendly/pgc/user/queryFollowers"
-        label = f"粉丝列表: {target_username}"
+        label = f"粉丝列表:{target_username}"
 
     headers = _build_public_headers(
         referer=f"https://www.binance.com/zh-CN/square/profile/{target_username}/{relation_type}"
@@ -1083,9 +1095,9 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
                 error_code = str(json_resp.get("code", ""))
                 error_msg = json_resp.get("message", "未知错误")
                 if error_code == "10003" and page_index > 100:
-                    logger.info(f"✅ [{label}] 触及币安最大翻页限制 (第 {page_index} 页)，已获取公开允许的最大数据量。")
+                    logger.info(f"[币安接口/{label}] 触及最大翻页限制，采集完成 | 页码: [{page_index}] | 累计: [{len(all_items)}]")
                     break
-                logger.error(f"❌ [{label}] API 业务错误: {error_msg} | code={error_code}")
+                logger.warning(f"[币安接口/{label}] 接口业务返回错误 | 错误码: [{error_code}] | 原因: [{error_msg}]")
                 break
 
             data_obj = json_resp.get("data")
@@ -1099,15 +1111,13 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
             retry_count = 0
             time.sleep(random.uniform(0.5, 1.5))
         except Exception as e:
-            detail = ""
-            if response is not None:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            detail = f"HTTP {response.status_code}" if response is not None else "请求异常"
             retry_count += 1
-            logger.warning(
-                f"🚨 [{label}] 第 {page_index} 页请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
-            )
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止当前采集。")
+                logger.error(
+                    f"❌ [币安接口/{label}] 连续失败达上限，终止采集 | 页码: [{page_index}] "
+                    f"| 状态: [{detail}] | 原因: [{e}]"
+                )
                 break
             time.sleep(random.uniform(2.0, 4.0))
 
@@ -1124,7 +1134,7 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
         "queryFollowersInfo": True,
         "queryRelationTokens": True,
     }
-    label = f"用户主页: {username}"
+    label = f"用户主页:{username}"
     req_client = session if session else requests
     retry_count = 0
 
@@ -1135,17 +1145,14 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
             response.raise_for_status()
             json_resp = response.json()
             if not json_resp.get("success"):
-                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message')}")
+                logger.warning(f"[币安接口/{label}] 业务返回失败 | 原因: [{json_resp.get('message')}]")
                 return {}
             return json_resp.get("data") or {}
         except Exception as e:
-            detail = ""
-            if response is not None:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            detail = f"HTTP {response.status_code}" if response is not None else "请求异常"
             retry_count += 1
-            logger.warning(f"🚨 [{label}] 请求失败 (第 {retry_count}/{max_retries} 次){detail} | 异常: {e}")
             if retry_count >= max_retries:
-                logger.error(f"❌ [{label}] 连续失败达到 {max_retries} 次上限，终止采集。")
+                logger.error(f"❌ [币安接口/{label}] 连续失败达上限 | 状态: [{detail}] | 原因: [{e}]")
                 break
             time.sleep(random.uniform(1.0, 3.0))
 
@@ -1156,14 +1163,14 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
 # 5. 批量互动、删帖与历史内容查询
 # ============================================================
 def like_and_bookmark(target_post_id_list, cookie_map_info):
-    """执行多账号批量点赞与收藏交互"""
+    """执行多账号批量点赞与收藏交互（单条聚合汇总日志输出）"""
     if not target_post_id_list:
-        logger.info("[互动任务/过滤] 目标帖子列表为空，无操作执行。")
         return
     if not cookie_map_info:
-        logger.error("[互动任务/鉴权] 未提供有效的 cookie_map_info | 结果: [当前批次互动任务中止]")
+        logger.error("❌ [币安互动/批量] 未提供有效账号凭证字典 | 结果: [互动任务中止] | 排查方向: [检查浏览器登录态]")
         return
 
+    started = time.monotonic()
     total_posts = len(target_post_id_list)
     total_accounts = len(cookie_map_info)
     global_like_success = 0
@@ -1171,48 +1178,34 @@ def like_and_bookmark(target_post_id_list, cookie_map_info):
     global_like_fail = 0
     global_bookmark_fail = 0
 
-    logger.info(f"[互动任务/开始] 准备处理 {total_posts} 个帖子，动用 {total_accounts} 个账号参与互动")
-
-    for index, post_id in enumerate(target_post_id_list, 1):
-        post_like_success = 0
-        post_bookmark_success = 0
+    for post_id in target_post_id_list:
         for acc, info in cookie_map_info.items():
             try:
                 cookies = info.get("cookies")
                 csrf_token = info.get("csrf_token")
                 if not cookies or not csrf_token:
-                    logger.warning(f"[互动任务/鉴权] 账号 {acc} 缺少完整的 cookies 或 csrf_token | 结果: [跳过该账号]")
+                    logger.warning(f"[币安互动/鉴权] 账号缺少 cookies 或 csrf_token，已跳过 | 账号: [{acc}]")
                     continue
                 bookmark_res = toggle_binance_bookmark(post_id, "add", cookies, csrf_token)
                 like_res = toggle_binance_like(post_id, "like", cookies, csrf_token)
                 if bookmark_res:
-                    post_bookmark_success += 1
                     global_bookmark_success += 1
                 else:
                     global_bookmark_fail += 1
                 if like_res:
-                    post_like_success += 1
                     global_like_success += 1
                 else:
                     global_like_fail += 1
             except Exception as e:
                 global_bookmark_fail += 1
                 global_like_fail += 1
-                logger.error(f"[互动任务/执行异常] 账号: {acc}, 目标ID: {post_id} | 详情: {e}")
-
-        logger.info(
-            f"[互动任务/进度] ({index}/{total_posts}) 帖子ID: {post_id} | "
-            f"🌟收藏成功: {post_bookmark_success}/{total_accounts} | "
-            f"💖点赞成功: {post_like_success}/{total_accounts}"
-        )
+                logger.warning(f"[币安互动/异常] 单次点赞收藏异常 | 账号: [{acc}] | 帖子ID: [{post_id}] | 原因: [{e}]")
 
     logger.info(
-        f"========== 🏁 互动任务总览 ==========\n"
-        f" 🎯 处理帖子总数: {total_posts}\n"
-        f" 👥 动用账号总数: {total_accounts}\n"
-        f" 🌟 累计收藏: {global_bookmark_success} 成功 / {global_bookmark_fail} 失败\n"
-        f" 💖 累计点赞: {global_like_success} 成功 / {global_like_fail} 失败\n"
-        f"======================================"
+        f"[币安互动/汇总] 批量点赞与收藏完成 | 目标帖数: [{total_posts}] | 参与账号: [{total_accounts}] "
+        f"| 点赞(成功/失败): [{global_like_success}/{global_like_fail}] "
+        f"| 收藏(成功/失败): [{global_bookmark_success}/{global_bookmark_fail}] "
+        f"| 耗时: [{time.monotonic() - started:.2f}s]"
     )
 
 
@@ -1226,30 +1219,38 @@ def delete_binance_square_content(
     url = "https://www.binance.com/bapi/composite/v1/private/pgc/content/delete"
     headers = _build_private_headers(cookies, csrf_token)
     payload = {"contentId": int(content_id), "contentType": content_type}
-    logger.info(f"正在尝试删除广场内容: contentId={content_id}...")
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10, proxies=PROXIES)
         if response.status_code != 200:
-            logger.error(f"删除请求失败! HTTP 状态码: {response.status_code}, 响应: {response.text[:150]}")
+            logger.warning(
+                f"[币安清理/删帖] 删除接口返回非 200 | 内容ID: [{content_id}] | HTTP: [{response.status_code}] "
+                f"| 响应: [{response.text[:150]}] | 排查方向: [检查 Cookie/CSRF 是否过期]"
+            )
             return False
         try:
             res_json = response.json()
         except Exception:
-            logger.error(f"响应无法解析为 JSON，可能触发了 WAF 拦截: {response.text[:200]}")
+            logger.warning(
+                f"[币安清理/删帖] 响应非 JSON 格式，疑似触发 WAF 拦截 | 内容ID: [{content_id}] | 响应预览: [{response.text[:120]}]"
+            )
             return False
 
         biz_code = res_json.get("code")
         if biz_code == "000000" and res_json.get("success") is True:
-            logger.info(f"内容 contentId={content_id} 删除成功！")
+            logger.debug(f"[币安清理/删帖] 删除成功 | 内容ID: [{content_id}]")
             return True
         else:
             logger.warning(
-                f"删除失败: code={biz_code}, message={res_json.get('message')}, detail={res_json.get('messageDetail')}"
+                f"[币安清理/删帖] 业务拒收删除请求 | 内容ID: [{content_id}] | 错误码: [{biz_code}] "
+                f"| 原因: [{res_json.get('message') or res_json.get('messageDetail')}]"
             )
             return False
     except Exception as e:
-        logger.exception(f"删除操作执行期间发生未捕获异常 (contentId={content_id}): {e}")
+        logger.error(
+            f"❌ [币安清理/删帖] 删除请求发生未预期异常 | 内容ID: [{content_id}] | 原因: [{e}] "
+            f"| 排查方向: [检查代理网络连通性]"
+        )
         return False
 
 
@@ -1275,35 +1276,37 @@ def fetch_binance_square_replies(
                 "timeOffset": current_offset,
                 "filterType": filter_type,
             }
-            logger.info(f"正在拉取第 {page} 页数据, timeOffset={current_offset}...")
             try:
                 response = requests.get(base_url, headers=headers, params=params, timeout=10, proxies=PROXIES)
             except requests.exceptions.RequestException as e:
-                logger.error(f"网络请求发生异常: {e}")
+                logger.warning(
+                    f"[币安清理/历史拉取] 网络请求异常，停止翻页 | UID: [{target_square_uid}] | 页码: [{page}] | 原因: [{e}]"
+                )
                 break
 
             if response.status_code != 200:
-                logger.warning(f"HTTP 请求失败! 状态码: {response.status_code}, 响应: {response.text[:150]}")
+                logger.warning(
+                    f"[币安清理/历史拉取] HTTP 状态码异常 | UID: [{target_square_uid}] | HTTP: [{response.status_code}]"
+                )
                 break
 
             try:
                 res_json = response.json()
             except Exception:
-                logger.error(f"响应解析 JSON 失败，返回内容: {response.text[:200]}")
+                logger.warning(f"[币安清理/历史拉取] 响应解析 JSON 失败 | UID: [{target_square_uid}] | 页码: [{page}]")
                 break
 
             biz_code = res_json.get("code")
             if biz_code != "000000":
-                logger.warning(f"币安接口业务报错: code={biz_code}, msg={res_json.get('message')}")
+                logger.warning(
+                    f"[币安清理/历史拉取] 接口业务返回非成功 | UID: [{target_square_uid}] | 错误码: [{biz_code}] | 原因: [{res_json.get('message')}]"
+                )
                 break
 
             data = res_json.get("data") or {}
             contents = data.get("contents") or []
             if not contents:
-                logger.info(f"第 {page} 页没有查询到回复内容 (contents 为空)，停止翻页。")
                 break
-
-            logger.info(f"第 {page} 页成功获取到 {len(contents)} 组互动数据。")
 
             for item in contents:
                 reply_post_list = item.get("replyPostList") or []
@@ -1363,12 +1366,13 @@ def fetch_binance_square_replies(
 
                 results.append(simplified_item)
                 if 0 < limit <= len(results):
-                    logger.info(f"已达到设定的拉取限制 limit={limit}，停止抓取。")
-                    return results
+                    break
+
+            if 0 < limit <= len(results):
+                break
 
             next_offset = data.get("timeOffset")
             if not next_offset or next_offset == current_offset:
-                logger.info("已无下一页游标 (timeOffset 耗尽)，拉取完毕。")
                 break
 
             current_offset = next_offset
@@ -1376,10 +1380,12 @@ def fetch_binance_square_replies(
             time.sleep(0.5)
 
     except Exception as e:
-        logger.exception(f"处理数据时发生意外错误: {e}")
+        logger.error(f"❌ [币安清理/历史拉取] 拉取用户历史动态异常 | UID: [{target_square_uid}] | 原因: [{e}]")
         return results
 
-    logger.info(f"抓取完成，共提取到 {len(results)} 条精简数据。")
+    logger.debug(
+        f"[币安清理/历史拉取] 扫描完成 | UID: [{target_square_uid}] | 类型: [{filter_type}] | 提取条数: [{len(results)}]"
+    )
     return results
 
 
@@ -1404,18 +1410,20 @@ def _fetch_public_get_list(url: str, label: str, params=None, inner_data_key=Non
                 data = json_resp.get("data", [])
                 if inner_data_key and isinstance(data, dict):
                     data = data.get(inner_data_key, [])
-                logger.info(f"✅ [{label}] 成功 | 提取到 {len(data)} 条记录")
+                logger.debug(f"[币安榜单/{label}] 拉取成功 | 条数: [{len(data)}]")
                 return data
-            logger.error(f"❌ [{label}] API 业务错误 | Code: {json_resp.get('code')} | Msg: {json_resp.get('message')}")
+            logger.warning(
+                f"[币安榜单/{label}] 接口返回业务错误 | 错误码: [{json_resp.get('code')}] | 原因: [{json_resp.get('message')}]"
+            )
             return []
         except Exception as e:
-            detail = ""
-            if response is not None:
-                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:200]}"
+            detail = f"HTTP {response.status_code}" if response is not None else "请求异常"
             retry_count += 1
-            logger.warning(f"🚨 [{label}] 请求失败 (第 {retry_count}/{max_retries} 次){detail} | 异常: {e}")
             if retry_count >= max_retries:
-                logger.error(f"❌ [{label}] 连续失败达到 {max_retries} 次上限，终止采集。")
+                logger.error(
+                    f"❌ [币安榜单/{label}] 榜单请求连续失败达上限 | 尝试: [{retry_count}/{max_retries}] "
+                    f"| 状态: [{detail}] | 原因: [{e}] | 排查方向: [检查本地代理或币安公开接口状态]"
+                )
                 break
             time.sleep(random.uniform(1.0, 3.0))
 
@@ -1426,7 +1434,7 @@ def fetch_binance_hot_hashtags(session=None, max_retries=3):
     """获取币安广场热门话题 (Hashtag) 列表"""
     return _fetch_public_get_list(
         url="https://www.binance.com/bapi/composite/v2/public/pgc/hashtag/hot-list",
-        label="获取热门话题",
+        label="热门话题",
         inner_data_key="data",
         session=session,
         max_retries=max_retries,
@@ -1437,7 +1445,7 @@ def fetch_binance_spot_hot_coins(currency="USD", session=None, max_retries=3):
     """获取币安现货热门币种 (Hot Coins) 列表"""
     return _fetch_public_get_list(
         url="https://www.binance.com/bapi/apex/v1/public/apex/market/spot/hot-coins",
-        label=f"现货热门币种:{currency}",
+        label=f"现货热币:{currency}",
         params={"currency": currency},
         session=session,
         max_retries=max_retries,
@@ -1448,7 +1456,7 @@ def fetch_binance_future_hot_coins(business_enum="USDT_FUTURES", session=None, m
     """获取币安合约热搜榜数据"""
     return _fetch_public_get_list(
         url="https://www.binance.com/bapi/composite/v1/public/future/external/topSearchList",
-        label=f"合约热搜榜:{business_enum}",
+        label=f"合约热搜:{business_enum}",
         params={"businessEnum": business_enum},
         session=session,
         max_retries=max_retries,
@@ -1480,7 +1488,7 @@ def _get_ccxt_binance_client(market_type: str = "future", proxy: str = None):
 def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890") -> float | None:
     """使用 ccxt 获取指定币种最新价格（优先查询U本位合约，查不到则降级查询现货）"""
     if not coin_name or not isinstance(coin_name, str):
-        logger.warning("⚠️ [价格查询] 传入的币种名称无效")
+        logger.warning(f"[行情查询/价格] 传入币种名称无效 | 输入: [{coin_name}]")
         return None
 
     clean_name = coin_name.replace("$", "").strip().upper()
@@ -1514,14 +1522,14 @@ def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890"
                     price = ticker.get("last") or ticker.get("close")
                     if price:
                         price = float(price)
-                        logger.info(f"✅ [价格查询-合约命中] {coin_name} -> 交易对: {sym} | 最新价: {price}")
+                        logger.debug(f"[行情查询/价格] 合约报价命中 | 币种: [{coin_name}] | 交易对: [{sym}] | 最新价: [{price}]")
                         return price
                 except (ccxt.BadSymbol, ccxt.OrderBookEmpty):
                     continue
                 except Exception as e:
-                    logger.debug(f"🔍 [价格查询] 合约探测 {sym} 失败: {e}")
+                    logger.debug(f"[行情查询/价格] 合约探测异常 | 交易对: [{sym}] | 原因: [{e}]")
     except Exception as e:
-        logger.debug(f"🔍 [价格查询] 合约通道查询失败: {e}")
+        logger.debug(f"[行情查询/价格] 合约通道异常 | 原因: [{e}]")
 
     # 阶段二：降级探测 现货 (Spot)
     try:
@@ -1533,16 +1541,16 @@ def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890"
                 price = ticker.get("last") or ticker.get("close")
                 if price:
                     price = float(price)
-                    logger.info(f"✅ [价格查询-现货命中] {coin_name} -> 交易对: {sym} | 最新价: {price}")
+                    logger.debug(f"[行情查询/价格] 现货报价命中 | 币种: [{coin_name}] | 交易对: [{sym}] | 最新价: [{price}]")
                     return price
             except (ccxt.BadSymbol, ccxt.OrderBookEmpty):
                 continue
             except Exception as e:
-                logger.debug(f"🔍 [价格查询] 现货探测 {sym} 失败: {e}")
+                logger.debug(f"[行情查询/价格] 现货探测异常 | 交易对: [{sym}] | 原因: [{e}]")
     except Exception as e:
-        logger.debug(f"🔍 [价格查询] 现货通道查询失败: {e}")
+        logger.debug(f"[行情查询/价格] 现货通道异常 | 原因: [{e}]")
 
-    logger.warning(f"❌ [价格查询失败] {coin_name} 合约与现货均未找到报价")
+    logger.warning(f"[行情查询/价格] 合约与现货均未找到报价 | 币种: [{coin_name}] | 可能原因: [该币种未在币安上线或已下架]")
     return None
 
 
@@ -1563,7 +1571,9 @@ def get_top_k_movers(top_k: int = 5) -> dict:
         )
         return {"top_gainers": ranked[:top_k], "top_losers": ranked[-top_k:][::-1]}
     except Exception as exc:
-        logger.warning(f"⚠️ [行情/获取] 获取涨跌榜异常，降级返回空榜单 | 原因: {exc}")
+        logger.warning(
+            f"[行情查询/涨跌榜] 获取合约涨跌榜失败，降级为空列表 | 原因: [{exc}] | 排查方向: [检查代理网络与 CCXT 币安连接]"
+        )
         return {"top_gainers": [], "top_losers": []}
 
 

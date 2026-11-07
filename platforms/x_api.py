@@ -138,13 +138,16 @@ def fetch_x_user_profile(screen_name=DEFAULT_SCREEN_NAME, proxies=PROXIES):
                 user_info = data.get("user") or {}
                 if user_info:
                     logger.info(
-                        f"👤 [X账号信息] @{clean_name} ({user_info.get('name')}) | "
-                        f"UID={user_info.get('id')} | 粉丝={user_info.get('followers')} | "
-                        f"总帖数={user_info.get('tweets')} | 媒体帖={user_info.get('media_count')}"
+                        f"[X平台/账号画像] 账号画像拉取完成 | 账号: [@{clean_name}] | 昵称: [{user_info.get('name')}] "
+                        f"| UID: [{user_info.get('id')}] | 粉丝: [{user_info.get('followers')}] "
+                        f"| 总帖: [{user_info.get('tweets')}]"
                     )
                     return user_info
         except Exception as e:
-            logger.warning(f"⚠️ [X账号信息] 获取 @{clean_name} 失败 ({attempt}/{MAX_RETRIES}): {e}")
+            logger.warning(
+                f"[X平台/账号画像] 拉取账号画像异常 | 账号: [@{clean_name}] | 尝试: [{attempt}/{MAX_RETRIES}] "
+                f"| 原因: [{e}] | 排查方向: [检查 fxtwitter 接口或网络代理]"
+            )
             time.sleep(1.0)
     return {}
 
@@ -167,7 +170,7 @@ def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES)
                 return None
         except Exception as e:
             if attempt == MAX_RETRIES:
-                logger.debug(f"拉取单帖 {clean_id} 失败: {e}")
+                logger.debug(f"[X平台/单帖拉取] 拉取单帖失败 | 帖子ID: [{clean_id}] | 原因: [{e}]")
             time.sleep(random.uniform(0.3, 1.0))
     return None
 
@@ -194,7 +197,7 @@ def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
             for m in re.finditer(r"status/(\d{18,20})", resp.text):
                 found_ids.add(m.group(1))
     except Exception as e:
-        logger.debug(f"[SSR探测] x.com 主页请求异常: {e}")
+        logger.debug(f"[X平台/SSR探测] x.com 主页请求异常 | 原因: [{e}]")
 
     try:
         resp_jina = requests.get(
@@ -207,7 +210,7 @@ def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
             for m in re.finditer(r"(?:status/|in_reply_to=)(\d{18,20})", resp_jina.text):
                 found_ids.add(m.group(1))
     except Exception as e:
-        logger.debug(f"[SSR探测] Jina 快照请求异常: {e}")
+        logger.debug(f"[X平台/SSR探测] Jina 快照请求异常 | 原因: [{e}]")
 
     return found_ids
 
@@ -286,7 +289,10 @@ def extract_x_cookies_from_user_data_dir(user_data_dir):
             finally:
                 context.close()
     except Exception as e:
-        logger.warning(f"⚠️ [X-Auth] 从目录 {user_data_dir} 提取 Cookie 失败: {e}")
+        logger.warning(
+            f"[X平台/凭证提取] 从会话目录提取 Cookie 失败 | 目录: <{user_data_dir}> "
+            f"| 原因: [{e}] | 排查方向: [检查浏览器会话目录或关闭占用进程]"
+        )
         return ""
 
 
@@ -296,7 +302,7 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
     auth_token = cookie_dict.get("auth_token")
     ct0 = cookie_dict.get("ct0")
     if not auth_token or not ct0:
-        logger.warning("⚠️ [X-GraphQL] 传入的 cookies 缺少 auth_token 或 ct0，跳过 GraphQL 通道")
+        logger.warning("[X平台/GraphQL] 传入 Cookie 缺少 auth_token 或 ct0，跳过 GraphQL 通道 | 排查方向: [检查 X 账号登录状态]")
         return []
 
     headers = {
@@ -367,7 +373,10 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
                     timeout=REQUEST_TIMEOUT,
                 )
                 if resp.status_code != 200:
-                    logger.warning(f"⚠️ [X-GraphQL] 第 {page} 页返回 HTTP {resp.status_code}: {resp.text[:200]}")
+                    logger.warning(
+                        f"[X平台/GraphQL] 分页请求返回非 200 状态 | 页码: [{page}] "
+                        f"| HTTP: [{resp.status_code}] | 响应: [{resp.text[:200]}]"
+                    )
                     break
 
                 body_text = resp.text
@@ -382,14 +391,18 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
                 if not next_cursors:
                     next_cursors = re.findall(r'"cursorType"\s*:\s*"Bottom"\s*,\s*"value"\s*:\s*"([^"]+)"', body_text)
 
-                logger.info(f"📥 [X-GraphQL] 第 {page} 页提取新增 ID: {new_cnt} 个 | 累计: {len(discovered_ids)} 个")
+                logger.debug(
+                    f"[X平台/GraphQL] 单页提取完成 | 页码: [{page}] | 新增ID: [{new_cnt}] | 累计ID: [{len(discovered_ids)}]"
+                )
                 if not next_cursors or new_cnt == 0:
                     break
                 cursor = next_cursors[0]
                 page += 1
                 time.sleep(random.uniform(0.8, 1.8))
             except Exception as e:
-                logger.warning(f"⚠️ [X-GraphQL] 第 {page} 页请求异常: {e}")
+                logger.warning(
+                    f"[X平台/GraphQL] 分页请求异常 | 页码: [{page}] | 原因: [{e}] | 排查方向: [检查网络代理与 Cookie 有效性]"
+                )
                 break
 
     return discovered_ids[:count]
@@ -509,7 +522,7 @@ def clean_x_posts(raw_tweets):
 def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
     """将清洗后的 X 帖子列表导出为带 UTF-8-SIG BOM 头的 CSV 文件"""
     if not posts:
-        logger.warning("⚠️ [CSV导出] 帖子列表为空，跳过导出")
+        logger.warning("[X平台/报表导出] 帖子列表为空，跳过 CSV 导出")
         return None
 
     sorted_posts = list(posts)
@@ -573,7 +586,7 @@ def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
                 " | ".join(imgs),
             ])
 
-    logger.info(f"📊 [CSV导出成功] 共 {len(sorted_posts)} 条帖子已写入: {csv_path}")
+    logger.info(f"[X平台/报表导出] CSV 报表导出完成 | 条数: [{len(sorted_posts)}] | 路径: <{csv_path}>")
     return csv_path
 
 
@@ -590,8 +603,8 @@ def fetch_x_user_posts(
     sort_by="views",
 ):
     """一键拉取指定 X 账号的帖子内容与实时数据表现"""
+    started = time.monotonic()
     clean_name = str(screen_name).lstrip("@").strip()
-    logger.info(f"========== 🚀 开始拉取 X 账号 @{clean_name} 帖子与数据表现 ==========")
 
     profile = fetch_x_user_profile(clean_name)
     user_rest_id = profile.get("id")
@@ -636,8 +649,8 @@ def fetch_x_user_posts(
     )
 
     logger.info(
-        f"🔍 [ID汇总] 本地缓存:{len(cached_ids)} | 主页SSR:{len(ssr_ids)} | "
-        f"浏览器历史:{len(hist_ids)} -> 去重后待拉取候选 ID 共 {len(valid_candidate_ids)} 个"
+        f"[X平台/候选探测] 候选帖子 ID 汇总完成 | 账号: [@{clean_name}] | 本地缓存: [{len(cached_ids)}] "
+        f"| 主页SSR: [{len(ssr_ids)}] | 浏览器历史: [{len(hist_ids)}] | 去重待拉取: [{len(valid_candidate_ids)}]"
     )
 
     raw_tweets = []
@@ -663,7 +676,7 @@ def fetch_x_user_posts(
                         continue
                     raw_tweets.append(tw)
                 except Exception as e:
-                    logger.debug(f"处理推文 {tid} 异常: {e}")
+                    logger.debug(f"[X平台/单帖处理] 处理推文异常 | 帖子ID: [{tid}] | 原因: [{e}]")
 
     updated_cache_ids = sorted(cached_ids | verified_author_ids, key=lambda x: int(x), reverse=True)
     save_json(cache_path, updated_cache_ids)
@@ -698,7 +711,7 @@ def fetch_x_user_posts(
 
     if save_json_path:
         save_json(save_json_path, cleaned_posts)
-        logger.info(f"💾 [JSON保存成功] 路径: {save_json_path}")
+        logger.debug(f"[X平台/落盘] JSON 数据已保存 | 路径: <{save_json_path}>")
 
     if save_csv_path:
         export_x_posts_to_csv(cleaned_posts, save_csv_path, sort_by=sort_by)
@@ -711,9 +724,10 @@ def fetch_x_user_posts(
     avg_views = total_views / len(cleaned_posts) if cleaned_posts else 0
 
     logger.info(
-        f"🎉 [X采集完成] @{clean_name} | 成功获取原创帖: {len(cleaned_posts)} 条 | "
-        f"总浏览: {total_views:,} (篇均: {avg_views:,.1f}) | "
-        f"总赞: {total_likes} | 总评: {total_replies} | 总转: {total_shares} | 总收藏: {total_bookmarks}"
+        f"[X平台/采集汇总] 账号帖子与互动数据采集完成 | 账号: [@{clean_name}] | 原创帖: [{len(cleaned_posts)}] "
+        f"| 总浏览: [{total_views:,}] | 篇均浏览: [{avg_views:,.1f}] "
+        f"| 点赞/评论/转发/收藏: [{total_likes}/{total_replies}/{total_shares}/{total_bookmarks}] "
+        f"| 耗时: [{time.monotonic() - started:.2f}s]"
     )
 
     return cleaned_posts
@@ -830,7 +844,9 @@ def fetch_recent_viral_candidates(hours=6, limit=0, only_usable=True):
             limit=limit if (limit and limit > 0) else 0,
         ) or []
     except Exception as e:
-        logger.warning(f"⚠️ [X候选帖查询] 从 MongoDB 查询近 {hours} 小时流量帖失败: {e}")
+        logger.warning(
+            f"[X平台/候选选材] 查询近 {hours}h 流量重塑帖异常 | 原因: [{e}] | 排查方向: [检查 MongoDB 连接状态]"
+        )
         return []
 
     cleaned_list = []
@@ -874,7 +890,8 @@ def fetch_recent_viral_candidates(hours=6, limit=0, only_usable=True):
         cleaned_list.append({"remodeled_article": remodeled_article_data})
 
     logger.info(
-        f"📥 [X候选帖查询] 近 {hours} 小时共命中 {len(candidates)} 条记录 -> 清洗有效候选帖: {len(cleaned_list)} 条"
+        f"[X平台/候选选材] 流量候选帖查询与清洗完成 | 时间窗口: [近{hours}h] "
+        f"| 命中记录: [{len(candidates)}] | 有效候选: [{len(cleaned_list)}]"
     )
     return cleaned_list
 
@@ -928,8 +945,9 @@ def build_x_selection_prompt(
             f.write(full_prompt)
         candidate_cnt = len(candidate_posts) if isinstance(candidate_posts, list) else "自定义"
         logger.info(
-            f"📝 [完整提示词已生成] 已拼接最近 {min(recent_count, len(posts_data))} 条 X 帖子表现 + "
-            f"近 {candidate_hours} 小时流量候选帖 ({candidate_cnt} 条) -> 保存至: {save_prompt_path}"
+            f"[X平台/提示词组装] 选帖与改写完整提示词已生成 | 账号: [@{clean_name}] "
+            f"| 历史表现帖: [{min(recent_count, len(posts_data))}] "
+            f"| 流量候选帖: [{candidate_cnt} (近{candidate_hours}h)] | 保存路径: <{save_prompt_path}>"
         )
 
     return full_prompt

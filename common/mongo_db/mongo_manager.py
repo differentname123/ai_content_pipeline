@@ -3,6 +3,7 @@
 
 import logging
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +17,9 @@ from common.mongo_db.mongo_base import gen_db_object
 
 setup_logger()
 logger = logging.getLogger(__name__)
+
+_INDEXED_COLLECTIONS = set()
+_INDEX_LOCK = threading.Lock()
 
 
 class UniversalPostManager:
@@ -41,23 +45,29 @@ class UniversalPostManager:
 
     def _ensure_indexes(self):
         """
-        初始化核心索引，保障查询速度与数据隔离：
+        初始化核心索引（进程周期内每个集合仅执行并输出一次日志）：
         - (source, post_id)  : 联合唯一，防止跨平台 ID 冲突与重复写入
         - (source, publish_time) : 支撑按平台 + 时间窗口的下推过滤查询，避免全表扫描
         - publish_time       : 全局时间线拉取
         - (source, card_type): 平台 / 帖子类型维度统计
         - post_id            : 纯按 ID 列表检索
         """
-        self.db.create_index(self.collection_name, [("source", 1), ("post_id", 1)], unique=True)
-        self.db.create_index(self.collection_name, [("source", 1), ("publish_time", -1)], unique=False)
-        self.db.create_index(self.collection_name, [("publish_time", -1)], unique=False)
-        self.db.create_index(self.collection_name, [("source", 1), ("card_type", 1)], unique=False)
-        self.db.create_index(self.collection_name, [("post_id", 1)], unique=False)
-
-        logger.info(
-            "索引就绪 | collection=%s | indexes=[uniq(source,post_id), (source,publish_time), publish_time(-1), (source,card_type), post_id]",
-            self.collection_name,
-        )
+        if self.collection_name in _INDEXED_COLLECTIONS:
+            return
+        with _INDEX_LOCK:
+            if self.collection_name in _INDEXED_COLLECTIONS:
+                return
+            self.db.create_index(self.collection_name, [("source", 1), ("post_id", 1)], unique=True)
+            self.db.create_index(self.collection_name, [("source", 1), ("publish_time", -1)], unique=False)
+            self.db.create_index(self.collection_name, [("publish_time", -1)], unique=False)
+            self.db.create_index(self.collection_name, [("source", 1), ("card_type", 1)], unique=False)
+            self.db.create_index(self.collection_name, [("post_id", 1)], unique=False)
+            _INDEXED_COLLECTIONS.add(self.collection_name)
+            logger.info(
+                "[数据库/索引] 原帖集合索引就绪 | 集合: [%s] | 唯一键: [%s]",
+                self.collection_name,
+                self.UNIQUE_KEYS,
+            )
 
     def upsert_posts(self, data_list):
         """
@@ -66,7 +76,7 @@ class UniversalPostManager:
         - 未命中               -> 插入新帖
         """
         if not data_list:
-            logger.warning("upsert_posts 收到空数据集，已跳过入库")
+            logger.debug("[数据库/入库] upsert_posts 收到空列表，已跳过")
             return
 
         source_counter = {}
@@ -75,7 +85,9 @@ class UniversalPostManager:
             source = item.get("source")
             if not post_id or not source:
                 logger.error(
-                    "入库校验失败 | index=%s | post_id=%r | source=%r | reason=缺失联合唯一键字段",
+                    "❌ [数据库/校验] 帖子入库缺少必填唯一键 | 集合: [%s] | 索引位置: [%s] "
+                    "| post_id: [%r] | source: [%r] | 排查方向: [检查上游采集清洗逻辑是否漏填主键]",
+                    self.collection_name,
                     i,
                     post_id,
                     source,
@@ -90,12 +102,11 @@ class UniversalPostManager:
         start = datetime.now(timezone.utc)
         self.db.bulk_upsert(self.collection_name, data_list, self.UNIQUE_KEYS)
         cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
-        logger.info(
-            "批量入库完成 | total=%s | dist=%s | cost=%.1fms | keys=%s",
+        logger.debug(
+            "[数据库/入库] 原帖批量写入完成 | 数量: [%s] | 平台分布: [%s] | 耗时: [%.1fms]",
             len(data_list),
             source_counter,
             cost_ms,
-            self.UNIQUE_KEYS,
         )
 
     def find_posts(self, query=None, sort=None, limit=0, projection=None):
@@ -123,8 +134,8 @@ class UniversalPostManager:
             limit=limit,
         )
 
-        logger.info(
-            "查询完成 | source=%s | limit=%s | matched=%s",
+        logger.debug(
+            "[数据库/查询] 按平台查询完成 | 平台: [%s] | 上限: [%s] | 命中: [%s]",
             source,
             limit,
             len(posts) if posts else 0,
@@ -144,9 +155,9 @@ class UniversalPostManager:
         posts = self.db.find_many(self.collection_name, query=query)
         cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
 
-        logger.info(
-            "按ID列表查询完成 | source=%s | id_count=%s | matched=%s | cost=%.1fms",
-            source or "ALL_PLATFORMS",
+        logger.debug(
+            "[数据库/查询] 按ID列表查询完成 | 平台: [%s] | 目标ID数: [%s] | 命中: [%s] | 耗时: [%.1fms]",
+            source or "ALL",
             len(post_ids),
             len(posts) if posts else 0,
             cost_ms,
@@ -179,23 +190,34 @@ class GeneratedArticleManager:
         return self.db.get_collection(self.collection_name)
 
     def _ensure_indexes(self):
-        self.db.create_index(self.collection_name, [("article_id", 1)], unique=True)
-        self.db.create_index(
-            self.collection_name,
-            [("type", 1), ("created_at", -1)],
-            unique=False,
-        )
-        self.db.create_index(
-            self.collection_name,
-            [("source", 1), ("status", 1), ("post_id_list", 1)],
-            unique=False,
-        )
-        self.db.create_index(
-            self.collection_name,
-            [("source", 1), ("topic", 1), ("stance", 1), ("status", 1), ("created_at", -1)],
-            unique=False,
-        )
-        self.db.create_index(self.collection_name, [("updated_at", -1)], unique=False)
+        if self.collection_name in _INDEXED_COLLECTIONS:
+            return
+        with _INDEX_LOCK:
+            if self.collection_name in _INDEXED_COLLECTIONS:
+                return
+            self.db.create_index(self.collection_name, [("article_id", 1)], unique=True)
+            self.db.create_index(
+                self.collection_name,
+                [("type", 1), ("created_at", -1)],
+                unique=False,
+            )
+            self.db.create_index(
+                self.collection_name,
+                [("source", 1), ("status", 1), ("post_id_list", 1)],
+                unique=False,
+            )
+            self.db.create_index(
+                self.collection_name,
+                [("source", 1), ("topic", 1), ("stance", 1), ("status", 1), ("created_at", -1)],
+                unique=False,
+            )
+            self.db.create_index(self.collection_name, [("updated_at", -1)], unique=False)
+            _INDEXED_COLLECTIONS.add(self.collection_name)
+            logger.info(
+                "[数据库/索引] 生成文章集合索引就绪 | 集合: [%s] | 唯一键: [%s]",
+                self.collection_name,
+                self.UNIQUE_KEYS,
+            )
 
     def upsert_articles(self, data_list):
         """
@@ -203,7 +225,7 @@ class GeneratedArticleManager:
         自动补齐 updated_at，若为新数据则自动生成 article_id 和 created_at。
         """
         if not data_list:
-            logger.warning("upsert_articles 收到空数据集，已跳过入库")
+            logger.debug("[数据库/入库] upsert_articles 收到空列表，已跳过")
             return
 
         now = datetime.now(timezone.utc)

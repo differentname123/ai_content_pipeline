@@ -167,7 +167,7 @@ class _HttpLogsFilter(logging.Filter):
     def filter(self, record):
         """依据 LogRecord 的 name/funcName 决定是否保留日志。"""
         return not (
-            record.name.startswith(("httpx", "httpcore", "openai", "urllib3"))
+            record.name.startswith(("httpx", "httpx2", "httpcore", "openai", "urllib3"))
             or record.funcName in ("_send_single_request", "send")
         )
 
@@ -404,8 +404,18 @@ def _atomic_write_model_usage(path, data):
                      f" | 原因: [{type(exc).__name__}: {exc}]", logging.WARNING)
 
 
+def _format_usage_summary(usage):
+    """将 OpenAI usage 字典提炼为紧凑易读的输入/输出/总计 Token 摘要。"""
+    if not isinstance(usage, dict):
+        return "未知"
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+    return f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
+
+
 def _save_model_usage(events):
-    """取得独占锁后读取最新 JSON，只合并本次增量；坏文件不清空、不覆盖。"""
+    """取得独占锁后读取最新 JSON，只合并本次增量；自动兼容清理旧版非字典格式。"""
     path = Path(MODEL_USAGE_JSON_PATH).expanduser().resolve()
     with _model_usage_file_lock(path):
         existed = True
@@ -414,6 +424,9 @@ def _save_model_usage(events):
                 data = json.load(usage_file)
         except FileNotFoundError:
             existed = False
+            data = {}
+        # 自动识别旧版结构（含 updated_at / total_calls / models / daily）并平滑重置为按模型统计的新结构
+        if isinstance(data, dict) and ("updated_at" in data or "total_calls" in data or "daily" in data):
             data = {}
         if not isinstance(data, dict) or any(not isinstance(value, dict) for value in data.values()):
             raise ValueError("模型统计 JSON 必须是以模型名为 key、dict 为 value 的对象；原文件保留")
@@ -533,11 +546,11 @@ def generate_content(
             for attempt in range(1, max_retries_per_model + 1):
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
-                context = (f"trace_id: [{trace_id}] | 模型: [{current_model}]"
-                           f" | 本模型尝试: [{attempt}/{max_retries_per_model}]"
-                           f" | 累计尝试: [{metrics['attempts']}]")
-                _log(f"[文本网关/请求] 开始同步生成 | {context} | 附件数: [{len(paths)}]"
-                     + (f" | 提示词预览: [{_preview(prompt)}]" if metrics["attempts"] == 1 else ""))
+                _log(
+                    f"[模型网关/请求] 发起模型请求 | 模型: [{current_model}]"
+                    f" | 尝试: [{attempt}/{max_retries_per_model}] | 附件: [{len(paths)}]",
+                    logging.DEBUG,
+                )
                 request_started = time.perf_counter()
                 status_code = None
                 usage = None
@@ -558,8 +571,13 @@ def generate_content(
                     metrics["model_used"] = response.model or current_model
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
-                    completion_log = (f"[文本网关/完成] 已取得有效文本 | 响应模型: [{metrics['model_used']}]"
-                                      f" | 响应预览: [{_preview(reply)}]")
+                    req_cost = time.perf_counter() - request_started
+                    completion_log = (
+                        f"[模型网关/生成] 调用成功 | 模型: [{metrics['model_used']}]"
+                        f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
+                        f" | 附件: [{len(paths)}] | Token: [{_format_usage_summary(usage)}]"
+                        f" | 耗时: [{req_cost:.2f}s]"
+                    )
                     level = logging.INFO
                     request_event["status"] = "✅ 成功"
                     request_event["response_model"] = response.model or current_model
@@ -572,22 +590,37 @@ def generate_content(
                     request_event["error"] = error
                     terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                     if attempt < max_retries_per_model:
-                        action = f"等待 {delay:g} 秒后重试"
+                        action = f"等待 {delay:g}s 后重试同模型"
                     elif not terminal:
                         action = f"切换备用模型 {models[model_index + 1]}"
                     else:
-                        action = "所有模型尝试耗尽，返回失败结果"
+                        action = "所有候选模型尝试耗尽，返回失败结果"
                     hint = {
                         400: "请求格式或附件类型不被模型接受，请检查网关协议和附件支持",
                         401: "密钥无效或过期，请检查 local_api_key",
                         403: "当前密钥无权访问此模型，请检查模型权限",
                         404: "模型名称或接口路由不存在，请检查模型名及 local_api_url",
                         429: "请求过于频繁或额度不足，请检查服务端限流与余额",
-                    }.get(status_code, "服务连接或响应格式异常，请结合错误原因检查网关及模型文本支持")
-                    completion_log = (f"{'❌ ' if terminal else ''}[文本网关/完成] 生成文本失败"
-                                      f" | 下一步: [{action}] | 原因: [{_preview(error)}]"
-                                      f" | 可能原因与排查: [{hint}]")
-                    level = logging.ERROR if terminal else logging.WARNING
+                    }.get(status_code, "服务连接或上游模型账号池不可用，请检查网关状态")
+                    req_cost = time.perf_counter() - request_started
+                    if terminal:
+                        completion_log = (
+                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]"
+                            f" | 累计尝试: [{metrics['attempts']}] | HTTP: [{status_code or 'N/A'}]"
+                            f" | 总耗时: [{time.perf_counter() - started:.2f}s]"
+                            f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 160)}]"
+                            f" | 排查方向: [{hint}]"
+                        )
+                        level = logging.ERROR
+                    else:
+                        completion_log = (
+                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]"
+                            f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
+                            f" | HTTP: [{status_code or 'N/A'}] | 耗时: [{req_cost:.2f}s]"
+                            f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
+                            f" | 后续动作: [{action}]"
+                        )
+                        level = logging.WARNING
                 except BaseException as exc:
                     request_event["status"] = "⚠️ 中断"
                     request_event["error"] = _redact(f"[请求中断] {type(exc).__name__}: {exc}")
@@ -596,9 +629,7 @@ def generate_content(
                     request_event["http_status"] = status_code
                     request_event["duration_seconds"] = round(time.perf_counter() - request_started, 6)
                     request_event["finished_time_bj"] = _beijing_now()
-                _log(f"{completion_log} | {context} | HTTP: [{status_code or 'N/A'}]"
-                     f" | 本次耗时: [{time.perf_counter() - request_started:.3f}s]"
-                     f" | 累计耗时: [{time.perf_counter() - started:.3f}s] | Token用量: [{usage}]", level)
+                _log(completion_log, level)
                 if result["status"] == "✅ 成功":
                     return result
                 if attempt < max_retries_per_model:
@@ -613,8 +644,8 @@ def generate_content(
             preparation_event["error"] = error
             preparation_event["finished_time_bj"] = _beijing_now()
             usage_events.append(preparation_event)
-        _log(f"❌ [文本网关/调用] 准备请求或执行重试流程失败 | trace_id: [{trace_id}]"
-             f" | 原因: [{error}] | 排查: [检查调用参数、附件路径/格式/编码及网关配置]", logging.ERROR)
+        _log(f"❌ [模型网关/准备失败] 请求初始化或附件读取异常 | trace_id: [{trace_id}]"
+             f" | 原因: [{error}] | 排查方向: [检查调用参数、附件文件路径/格式及网关配置]", logging.ERROR)
     finally:
         try:
             cleanup_error = _close_client(client, f"generate_content / trace_id={trace_id}")
@@ -627,8 +658,8 @@ def generate_content(
                 # 统计故障对调用方可见，但不把成功的模型请求改判为失败。
                 stats_error = _redact(f"[模型统计/保存失败] {type(exc).__name__}: {exc}")
                 result["error_history"].append(stats_error)
-                _log(f"[模型统计/保存] 本次统计未能保存 | trace_id: [{trace_id}]"
-                     f" | 路径: [{MODEL_USAGE_JSON_PATH}] | 原因: [{stats_error}]", logging.ERROR)
+                _log(f"❌ [模型统计/保存] 本次调用统计写盘失败（不影响生成结果） | 路径: [{MODEL_USAGE_JSON_PATH}]"
+                     f" | 原因: [{stats_error}] | 排查方向: [检查统计文件格式、权限或锁文件状态]", logging.ERROR)
             finally:
                 metrics["total_time_seconds"] = round(time.perf_counter() - started, 3)
                 if result["status"] == "❌ 失败":

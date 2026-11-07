@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -112,6 +113,10 @@ def _build_okx_headers(
 # ============================================================
 # 1. OKX 热门币榜单采集
 # ============================================================
+_OKX_HOT_COINS_CACHE = {"ts": 0.0, "key": None, "coins": []}
+_OKX_HOT_COINS_LOCK = threading.Lock()
+
+
 def fetch_okx_hot_coins(
     num=25,
     quote_type="USDT",
@@ -122,9 +127,17 @@ def fetch_okx_hot_coins(
     session=None,
 ):
     """查询 OKX 最新热门币榜单（仅拉取第一页），返回纯币种符号列表"""
+    cache_key = (num, quote_type, country_filter, rank)
+    with _OKX_HOT_COINS_LOCK:
+        if (
+            _OKX_HOT_COINS_CACHE["coins"]
+            and _OKX_HOT_COINS_CACHE["key"] == cache_key
+            and (time.monotonic() - _OKX_HOT_COINS_CACHE["ts"]) < 20.0
+        ):
+            return list(_OKX_HOT_COINS_CACHE["coins"])
+
     url = "https://www.okx.com/priapi/v5/rubik/web/public/hot-rank"
     referer = "https://www.okx.com/zh-hans/markets/rankings/spot/hot-crypto"
-    label = "OKX热门币榜"
 
     req_client = session if session else requests
     retry_count = 0
@@ -152,13 +165,18 @@ def fetch_okx_hot_coins(
             json_resp = response.json()
 
             if str(json_resp.get("code")) != "0":
-                logger.error(f"❌ [{label}] API 业务报错 | code={json_resp.get('code')} | msg={json_resp.get('msg')}")
+                logger.error(
+                    f"❌ [行情热榜/欧易] 热门币榜接口返回业务错误 | 响应码: [{json_resp.get('code')}] "
+                    f"| 原因: [{json_resp.get('msg')}] | 排查方向: [检查 OKX 热门榜接口参数与网络代理]"
+                )
                 return []
 
             data_obj = json_resp.get("data") or {}
             rank_list = data_obj.get("data") or []
             if not rank_list:
-                logger.warning(f"⚠️ [{label}] 返回的榜单列表为空")
+                logger.warning(
+                    "[行情热榜/欧易] 热门币榜返回列表为空 | 排查方向: [检查 OKX 热门榜接口返回结构是否变更]"
+                )
                 return []
 
             hot_coins = []
@@ -175,18 +193,31 @@ def fetch_okx_hot_coins(
                     seen_coins.add(coin)
                     hot_coins.append(coin)
 
-            logger.info(f"🔥 [{label}] 拉取成功 | 共获取 {len(hot_coins)} 个热门币种: {hot_coins}")
+            with _OKX_HOT_COINS_LOCK:
+                _OKX_HOT_COINS_CACHE["ts"] = time.monotonic()
+                _OKX_HOT_COINS_CACHE["key"] = cache_key
+                _OKX_HOT_COINS_CACHE["coins"] = list(hot_coins)
+
+            logger.info(
+                f"[行情热榜/欧易] 热门币榜单拉取完成 | 币种数: [{len(hot_coins)}] | 列表: [{', '.join(hot_coins)}]"
+            )
             return hot_coins
 
         except Exception as e:
             detail = ""
             if response is not None and response.status_code >= 400:
-                detail = f" | HTTP {response.status_code} | 返回: {response.text[:300]}"
+                detail = f" | HTTP: [{response.status_code}]"
             retry_count += 1
-            logger.warning(f"🚨 [{label}] 请求失败 ({retry_count}/{MAX_RETRIES}){detail} | 异常: {e}")
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，放弃采集")
+                logger.error(
+                    f"❌ [行情热榜/欧易] 热门币榜连续请求失败，放弃拉取 | 尝试上限: [{MAX_RETRIES}]{detail} "
+                    f"| 最后原因: [{e}] | 排查方向: [检查代理连通性或 OKX 站点风控]"
+                )
                 break
+            logger.warning(
+                f"[行情热榜/欧易] 热门币榜请求异常，准备重试 | 尝试: [{retry_count}/{MAX_RETRIES}]{detail} "
+                f"| 原因: [{e}] | 排查方向: [检查网络代理与 OKX 接口连通性]"
+            )
             time.sleep(random.uniform(1.0, 2.5))
 
     return []
@@ -233,14 +264,18 @@ def _paginate_okx_cursor_feed(
 
                 if str(json_resp.get("code")) != "0":
                     logger.error(
-                        f"❌ [{label}] API 业务报错 | code={json_resp.get('code')} | msg={json_resp.get('msg')}"
+                        f"❌ [欧易采集/翻页] 接口返回业务错误，终止当前流采集 | 任务: [{label}] | 页码: [{page_index}] "
+                        f"| 响应码: [{json_resp.get('code')}] | 原因: [{json_resp.get('msg')}] "
+                        f"| 排查方向: [检查请求参数、Cookie 或限流状态]"
                     )
                     break
 
                 data_obj = json_resp.get("data") or {}
                 raw_list = data_obj.get("contentDataList") or data_obj.get("dataList") or []
                 if not raw_list:
-                    logger.debug(f"⚠️ [{label}] 第 {page_index} 页帖子列表为空，采集结束")
+                    logger.debug(
+                        f"[欧易采集/翻页] 当前页帖子列表为空，采集结束 | 任务: [{label}] | 页码: [{page_index}]"
+                    )
                     break
 
                 new_in_page = 0
@@ -262,8 +297,9 @@ def _paginate_okx_cursor_feed(
 
                 next_cursor = str(data_obj.get("nextCursor") or "")
                 logger.debug(
-                    f"📥 [{label}] 第 {page_index} 页成功 | 本页返回:{len(raw_list)}条 | "
-                    f"净增未见:{new_in_page}条 | 累计净增:{len(all_items)}/{required_count} | nextCursor={next_cursor}"
+                    f"[欧易采集/翻页] 单页拉取成功 | 任务: [{label}] | 页码: [{page_index}] "
+                    f"| 本页返回: [{len(raw_list)}] | 净增: [{new_in_page}] "
+                    f"| 累计: [{len(all_items)}/{required_count}]"
                 )
 
                 if not next_cursor or next_cursor == "0" or next_cursor == cursor:
@@ -277,14 +313,20 @@ def _paginate_okx_cursor_feed(
             except Exception as e:
                 detail = ""
                 if response is not None and response.status_code >= 400:
-                    detail = f" | HTTP {response.status_code} | 返回: {response.text[:300]}"
+                    detail = f" | HTTP: [{response.status_code}]"
                 retry_count += 1
-                logger.warning(
-                    f"🚨 [{label}] 第 {page_index} 页请求失败 ({retry_count}/{MAX_RETRIES}){detail} | 异常: {e}"
-                )
                 if retry_count >= MAX_RETRIES:
-                    logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止采集")
+                    logger.error(
+                        f"❌ [欧易采集/翻页] 连续请求失败达上限，提前终止采集 | 任务: [{label}] | 页码: [{page_index}] "
+                        f"| 已获条数: [{len(all_items)}/{required_count}]{detail} | 最后原因: [{e}] "
+                        f"| 排查方向: [检查代理连通性或 OKX 站点风控]"
+                    )
                     break
+                logger.warning(
+                    f"[欧易采集/翻页] 分页请求异常，准备重试 | 任务: [{label}] | 页码: [{page_index}] "
+                    f"| 尝试: [{retry_count}/{MAX_RETRIES}]{detail} | 原因: [{e}] "
+                    f"| 排查方向: [检查网络代理或触发频控]"
+                )
                 time.sleep(random.uniform(1.0, 2.5))
 
     return all_items[:required_count]
@@ -370,6 +412,7 @@ def fetch_okx_feed(
     initial_cursor=None,
 ):
     """统一的 OKX 广场流数据拉取总入口 (支持全网推荐流、指定币种推荐/最新流)"""
+    started = time.monotonic()
     coin_name = token
     caller_existing_ref = existing_ids
     normalized_existing = set(str(i) for i in existing_ids) if existing_ids else set()
@@ -379,9 +422,10 @@ def fetch_okx_feed(
 
     is_latest = str(orderBy).lower() in ["1", "latest", "new", "time"]
     order_label = "最新" if is_latest else "推荐"
-    task_label = f"OKX币种流[{clean_coin_name}-{order_label}]" if is_coin_mode else "OKX广场推荐流"
+    mode_tag = "欧易采集/币种流" if is_coin_mode else "欧易采集/推荐流"
+    target_desc = f"{clean_coin_name}-{order_label}" if is_coin_mode else "广场推荐"
 
-    logger.info(f"🚀 开始探测: [{task_label}] | 目标净增条数: {count}")
+    logger.debug(f"[{mode_tag}] 启动探测 | 标的: [{target_desc}] | 目标净增: [{count}]")
 
     if is_coin_mode:
         cur = initial_cursor if initial_cursor is not None else ""
@@ -427,23 +471,29 @@ def fetch_okx_feed(
 
     if not filtered_feed_list:
         logger.info(
-            f"🛑 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-            f"🛡️历史/自营拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
+            f"[{mode_tag}] 探测完成(无新增有效帖) | 标的: [{target_desc}] | 原始抓取: [{len(raw_feed_list)}] "
+            f"| 拦截过滤: [{intercepted_count}] | 净增有效: [0] | 耗时: [{time.monotonic() - started:.2f}s]"
         )
         return []
 
-    logger.info(
-        f"📥 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-        f"🛡️历史/自营拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
-    )
-
     clean_feed_list = clean_okx_posts(filtered_feed_list)
-    return update_okx_posts_in_place(
+    enrich_stats = {}
+    enriched_list = update_okx_posts_in_place(
         clean_feed_list,
         cookies=cookies,
         extra_headers=extra_headers,
         download_media=download_media,
+        _stats_out=enrich_stats,
     )
+    dl_ok = enrich_stats.get("total_download_success", 0)
+    dl_total = enrich_stats.get("total_download_urls", 0)
+    cm_cnt = enrich_stats.get("comments_fetched", 0)
+    logger.info(
+        f"[{mode_tag}] 采集与富化完成 | 标的: [{target_desc}] | 原始抓取: [{len(raw_feed_list)}] "
+        f"| 拦截过滤: [{intercepted_count}] | 净增有效: [{len(enriched_list)}] "
+        f"| 媒体下载: [{dl_ok}/{dl_total}] | 评论拉取: [{cm_cnt}帖] | 耗时: [{time.monotonic() - started:.2f}s]"
+    )
+    return enriched_list
 
 
 # ============================================================
@@ -614,9 +664,12 @@ def clean_okx_posts(raw_data_list):
             cleaned_list.append(data)
         except Exception as e:
             failed += 1
-            logger.error(f"[OKX_CLEAN] 帖子清洗失败 | error={e}", exc_info=True)
+            logger.error(
+                f"❌ [欧易采集/清洗] 单帖结构化清洗异常，已跳过该帖 | 原因: [{e}] | 排查方向: [检查 OKX 原始 JSON 字段结构变化]",
+                exc_info=True,
+            )
 
-    logger.info(f"🗂️ [OKX清洗] 完成 | 成功={len(cleaned_list)}条 | 失败={failed}条")
+    logger.debug(f"[欧易采集/清洗] 清洗完成 | 成功: [{len(cleaned_list)}] | 失败: [{failed}]")
     return cleaned_list
 
 
@@ -685,7 +738,6 @@ def fetch_okx_replies(content_id, required_count=10, cookies="", extra_headers=N
     cursor = None
     page_index = 1
     retry_count = 0
-    label = f"OKX评论流:{content_id}"
 
     while len(all_raw_comments) < required_count:
         now_ms = str(int(time.time() * 1000))
@@ -708,7 +760,10 @@ def fetch_okx_replies(content_id, required_count=10, cookies="", extra_headers=N
             json_resp = response.json()
 
             if str(json_resp.get("code")) != "0":
-                logger.error(f"❌ [{label}] API 业务错误 | code={json_resp.get('code')} | msg={json_resp.get('msg')}")
+                logger.warning(
+                    f"[欧易采集/评论] 评论接口返回非0状态，停止拉取该帖后续评论 | 帖子ID: [{content_id}] "
+                    f"| 响应码: [{json_resp.get('code')}] | 原因: [{json_resp.get('msg')}]"
+                )
                 break
 
             data_obj = json_resp.get("data") or {}
@@ -729,14 +784,18 @@ def fetch_okx_replies(content_id, required_count=10, cookies="", extra_headers=N
         except Exception as e:
             detail = ""
             if response is not None:
-                detail = f" | HTTP {response.status_code} | 返回: {response.text[:300]}"
+                detail = f" | HTTP: [{response.status_code}]"
             retry_count += 1
-            logger.warning(
-                f"🚨 [{label}] 第 {page_index} 页请求失败 ({retry_count}/{MAX_RETRIES}){detail} | 异常: {e}"
-            )
             if retry_count >= MAX_RETRIES:
-                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止评论采集。")
+                logger.warning(
+                    f"[欧易采集/评论] 评论连续请求失败达上限，跳过该帖剩余评论 | 帖子ID: [{content_id}] "
+                    f"| 页码: [{page_index}]{detail} | 原因: [{e}] | 排查方向: [检查代理连通性或 OKX 评论接口频控]"
+                )
                 break
+            logger.debug(
+                f"[欧易采集/评论] 评论页请求异常，准备重试 | 帖子ID: [{content_id}] | 页码: [{page_index}] "
+                f"| 尝试: [{retry_count}/{MAX_RETRIES}]{detail} | 原因: [{e}]"
+            )
             time.sleep(random.uniform(1.0, 2.5))
 
     cleaned_replies = clean_okx_replies(all_raw_comments, content_id=str(content_id))
@@ -805,7 +864,9 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
                         media_info["local_mapping"][url] = local_path
                         stats["total_download_success"] += 1
                 except Exception as dl_e:
-                    logger.error(f"[OKX_DOWNLOAD] 媒体下载失败 | post_id={post_id} | url={url} | error={dl_e}")
+                    logger.warning(
+                        f"[欧易采集/媒体] 单张图片下载异常 | 帖子ID: [{post_id}] | URL: <{url}> | 原因: [{dl_e}]"
+                    )
 
         try:
             comment_count = item.get("engagement", {}).get("comment_count", 0)
@@ -823,16 +884,19 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
                 if replies:
                     stats["comments_fetched"] = 1
         except Exception as reply_e:
-            logger.error(f"[OKX_COMMENTS] 评论拉取失败 | post_id={post_id} | error={reply_e}")
+            logger.warning(f"[欧易采集/评论] 单帖评论拉取异常 | 帖子ID: [{post_id}] | 原因: [{reply_e}]")
 
     except Exception as e:
         stats["failed"] = 1
-        logger.error(f"[OKX_UPDATE] 就地富化失败 | post_id={post_id} | error={e}", exc_info=True)
+        logger.error(
+            f"❌ [欧易采集/富化] 单帖就地富化失败 | 帖子ID: [{post_id}] | 原因: [{e}] | 排查方向: [检查媒体字段或网络代理]",
+            exc_info=True,
+        )
 
     return item, stats
 
 
-def update_okx_posts_in_place(clean_list, cookies="", extra_headers=None, download_media=True):
+def update_okx_posts_in_place(clean_list, cookies="", extra_headers=None, download_media=True, _stats_out=None):
     """多线程并发富化 OKX 帖子"""
     if not clean_list:
         return []
@@ -846,7 +910,7 @@ def update_okx_posts_in_place(clean_list, cookies="", extra_headers=None, downlo
         "failed": 0,
     }
     max_workers = min(10, len(clean_list))
-    logger.debug(f"⏳ [OKX并发富化] 开始处理 {len(clean_list)} 条数据 (线程数={max_workers})...")
+    logger.debug(f"[欧易采集/富化] 开始并发富化 | 帖子数: [{len(clean_list)}] | 线程数: [{max_workers}]")
 
     with requests.Session() as session:
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
@@ -866,13 +930,16 @@ def update_okx_posts_in_place(clean_list, cookies="", extra_headers=None, downlo
                     for key in total_stats:
                         total_stats[key] += task_stats.get(key, 0)
                 except Exception as exc:
-                    logger.error(f"🚨 [OKX并发富化] 线程异常: {exc}", exc_info=True)
+                    logger.error(f"❌ [欧易采集/富化] 并发富化工作线程异常 | 原因: [{exc}]", exc_info=True)
                     total_stats["failed"] += 1
 
-    logger.info(
-        f"✅ [OKX并发富化] 完毕 | 媒体拼接:{total_stats['other_updated']} | "
-        f"下载成功:{total_stats['total_download_success']}/{total_stats['total_download_urls']} | "
-        f"评论拉取:{total_stats['comments_fetched']} | 失败:{total_stats['failed']}"
+    if isinstance(_stats_out, dict):
+        _stats_out.update(total_stats)
+
+    logger.debug(
+        f"[欧易采集/富化] 并发富化完成 | 媒体拼接: [{total_stats['other_updated']}] "
+        f"| 媒体下载: [{total_stats['total_download_success']}/{total_stats['total_download_urls']}] "
+        f"| 评论拉取: [{total_stats['comments_fetched']}] | 失败: [{total_stats['failed']}]"
     )
     return clean_list
 
@@ -922,7 +989,8 @@ def fetch_okx_user_timeline(
                 json_resp = resp.json()
                 if str(json_resp.get("code")) != "0":
                     logger.warning(
-                        f"⚠️ [OKX用户主页流:{clean_uid}] 接口返回非0 | code={json_resp.get('code')} | msg={json_resp.get('msg')}"
+                        f"[欧易采集/主页流] 用户主页时间线接口返回非0 | UID: [{clean_uid}] "
+                        f"| 响应码: [{json_resp.get('code')}] | 原因: [{json_resp.get('msg')}]"
                     )
                     break
 
@@ -977,7 +1045,8 @@ def fetch_okx_user_timeline(
             except Exception as e:
                 retry_count += 1
                 logger.warning(
-                    f"🚨 [OKX用户主页流:{clean_uid}] 第 {page_index} 页请求异常 ({retry_count}/{MAX_RETRIES}): {e}"
+                    f"[欧易采集/主页流] 用户主页时间线请求异常 | UID: [{clean_uid}] | 页码: [{page_index}] "
+                    f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 原因: [{e}]"
                 )
                 if retry_count >= MAX_RETRIES:
                     break
