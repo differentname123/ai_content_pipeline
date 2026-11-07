@@ -45,6 +45,8 @@ from common.common_utils import (
     save_json,
     setup_logger,
 )
+from common.mongo_db.mongo_base import gen_db_object
+from common.mongo_db.mongo_manager import GeneratedArticleManager
 
 setup_logger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -789,15 +791,104 @@ def format_historical_x_posts_for_prompt(posts, recent_count=50):
     return "\n" + ("\n" + "-" * 90 + "\n").join(blocks) + "\n"
 
 
+def _format_candidate_posts_literal(obj, level=0):
+    """将候选帖子列表格式化为标准 2 空格缩进的 Python 字面量文本"""
+    pad = "  " * level
+    next_pad = "  " * (level + 1)
+    if isinstance(obj, list):
+        if not obj:
+            return "[]"
+        items = [f"{next_pad}{_format_candidate_posts_literal(item, level + 1)}" for item in obj]
+        return "[\n" + ",\n".join(items) + f"\n{pad}]"
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        items = [
+            f"{next_pad}{repr(k)}: {_format_candidate_posts_literal(v, level + 1)}"
+            for k, v in obj.items()
+        ]
+        return "{\n" + ",\n".join(items) + f"\n{pad}}}"
+    return repr(obj)
+
+
+def fetch_recent_viral_candidates(hours=6, limit=0, only_usable=True):
+    """
+    查询最近 hours 小时内的高流量重塑帖子 (type='viral')，
+    清洗为 [{'remodeled_article': {...}}] 标准候选列表供 X 选帖提示词直接使用。
+    """
+    try:
+        article_manager = GeneratedArticleManager(gen_db_object())
+        query = {"type": "viral"}
+        if only_usable:
+            query["status"] = "ok"
+        if hours and hours > 0:
+            query["created_at"] = {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}
+
+        candidates = article_manager.find_articles(
+            query=query,
+            sort=[("created_at", -1)],
+            limit=limit if (limit and limit > 0) else 0,
+        ) or []
+    except Exception as e:
+        logger.warning(f"⚠️ [X候选帖查询] 从 MongoDB 查询近 {hours} 小时流量帖失败: {e}")
+        return []
+
+    cleaned_list = []
+    for article in candidates:
+        if not isinstance(article, dict):
+            continue
+        info = article.get("article_info") or {}
+        usable = bool(info.get("usable", False))
+        if only_usable and not usable:
+            continue
+
+        p_list = article.get("post_id_list") or []
+        target_post_id = (
+            str(p_list[0]).strip()
+            if p_list
+            else str(
+                ((article.get("creation_brief") or {}).get("original_post") or {}).get("post_id")
+                or article.get("article_id")
+                or ""
+            ).strip()
+        )
+
+        remodeled_article_data = {
+            "usable": usable,
+            "id": target_post_id,
+            "topic_tag": info.get("topic_tag", ""),
+            "viral_score": info.get("viral_score", 0.0),
+            "image_semantics": info.get("image_semantics", []),
+            "selected_images": info.get("selected_images", []),
+            "viral_analysis": info.get("viral_analysis", ""),
+            "decision_reason": info.get("decision_reason", ""),
+            "image_role": info.get("image_role", ""),
+            "post_text": info.get("post_text", ""),
+            "bait_comments": info.get("bait_comments", []),
+        }
+        remodeled_article_data = {
+            k: v
+            for k, v in remodeled_article_data.items()
+            if k == "usable" or v not in (None, "", [], {})
+        }
+        cleaned_list.append({"remodeled_article": remodeled_article_data})
+
+    logger.info(
+        f"📥 [X候选帖查询] 近 {hours} 小时共命中 {len(candidates)} 条记录 -> 清洗有效候选帖: {len(cleaned_list)} 条"
+    )
+    return cleaned_list
+
+
 def build_x_selection_prompt(
     screen_name=DEFAULT_SCREEN_NAME,
     recent_count=50,
     candidate_posts=None,
+    candidate_hours=6,
     posts_data=None,
     prompt_template_path=DEFAULT_X_PROMPT_TEMPLATE_PATH,
     save_prompt_path=None,
 ):
-    """拼接【账号最近 50 条 X 帖子真实表现数据】+【提示词规则】+【末尾候选帖子占位/数据】"""
+    """拼接【账号最近 50 条 X 帖子真实表现数据】+【提示词规则】+【近 6 小时流量候选帖子数据】"""
     clean_name = str(screen_name).lstrip("@").strip()
     if posts_data is None:
         posts_data = fetch_x_user_posts(screen_name=clean_name, count=max(recent_count, 100), sort_by="time")
@@ -805,13 +896,14 @@ def build_x_selection_prompt(
     historical_block = format_historical_x_posts_for_prompt(posts_data, recent_count=recent_count)
 
     if candidate_posts is None:
-        candidate_block = "以下是我待筛选的候选帖子列表：\n"
-    elif isinstance(candidate_posts, str):
+        candidate_posts = fetch_recent_viral_candidates(hours=candidate_hours)
+
+    if isinstance(candidate_posts, str):
         candidate_block = "以下是我待筛选的候选帖子列表：\n" + candidate_posts.strip() + "\n"
     else:
         candidate_block = (
             "以下是我待筛选的候选帖子列表：\n"
-            + json.dumps(candidate_posts, ensure_ascii=False, indent=2)
+            + _format_candidate_posts_literal(candidate_posts)
             + "\n"
         )
 
@@ -834,8 +926,10 @@ def build_x_selection_prompt(
     if save_prompt_path:
         with open(save_prompt_path, "w", encoding="utf-8") as f:
             f.write(full_prompt)
+        candidate_cnt = len(candidate_posts) if isinstance(candidate_posts, list) else "自定义"
         logger.info(
-            f"📝 [完整提示词已生成] 已拼接最近 {min(recent_count, len(posts_data))} 条 X 帖子表现 -> 保存至: {save_prompt_path}"
+            f"📝 [完整提示词已生成] 已拼接最近 {min(recent_count, len(posts_data))} 条 X 帖子表现 + "
+            f"近 {candidate_hours} 小时流量候选帖 ({candidate_cnt} 条) -> 保存至: {save_prompt_path}"
         )
 
     return full_prompt
@@ -852,9 +946,11 @@ if __name__ == "__main__":
         screen_name=target_account,
         recent_count=50,
         candidate_posts=None,
+        candidate_hours=6,
         posts_data=all_x_posts,
     )
     print("\n" + "=" * 115)
-    print("🚀 已为您生成拼接好最近 50 条 X 帖子数据的完整提示词（在末尾粘贴候选帖子即可发给 AI）：")
+    print("🚀 已为您生成拼接好【最近 50 条 X 帖子数据 + 近 6 小时流量候选帖】的完整提示词：")
     print("=" * 115 + "\n")
     print(full_prompt_text)
+

@@ -58,12 +58,12 @@ _safe_int = safe_int
 
 def _clean_text(raw):
     """清理 HTML 转义、OKX 内嵌 HTML 注释占位符、不可见字符与多余空行"""
-    return clean_post_text(raw, strip_html_comments=True)
+    return clean_post_text(raw, unescape_html=True, strip_html_comments=True)
 
 
 def _clean_title(raw):
     """清理标题，空值返回 None"""
-    return clean_post_title(raw, strip_html_comments=True)
+    return clean_post_title(raw, unescape_html=True, strip_html_comments=True)
 
 
 def _build_okx_headers(

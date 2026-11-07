@@ -954,16 +954,18 @@ def fetch_binance_post_detail(post_id, session=None):
 def clean_binance_replies(raw_replies):
     """清洗币安广场评论数据"""
     cleaned_data = []
-    for item in raw_replies:
+    for item in raw_replies or []:
+        if not isinstance(item, dict):
+            continue
         create_time_ms = item.get("createTime")
-        original_text = item.get("bodyTextOnly", "")
-        detected_lang = item.get("detectedLang", "")
+        original_text = item.get("bodyTextOnly") or ""
+        detected_lang = str(item.get("detectedLang") or "")
         is_chinese = detected_lang.startswith("zh") or item.get("lan") == "cn"
         if is_chinese:
             content = original_text
         else:
             translated_data = item.get("translatedData") or {}
-            translated_text = translated_data.get("content", "")
+            translated_text = translated_data.get("content") or ""
             content = translated_text if translated_text else original_text
 
         cleaned_data.append({
@@ -972,7 +974,7 @@ def clean_binance_replies(raw_replies):
             "create_time": create_time_ms,
             "author_uid": item.get("squareUid"),
             "author_name": item.get("displayName"),
-            "content": content.strip() if content else "",
+            "content": str(content).strip() if content else "",
             "likes": item.get("likeCount", 0),
             "replies": item.get("replyCount", 0),
             "views": item.get("viewCount", 0),
@@ -1008,8 +1010,8 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
             if not json_resp.get("success"):
                 logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message')}")
                 break
-            data = json_resp.get("data", [])
-            page_items = data if isinstance(data, list) else data.get("list", [])
+            data = json_resp.get("data") or []
+            page_items = data if isinstance(data, list) else (data.get("list") or [])
             if not page_items:
                 break
             all_replies.extend(page_items)

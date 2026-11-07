@@ -649,10 +649,19 @@ def clean_post_text(raw: Any, unescape_html: bool = False, strip_html_comments: 
     return text.strip()
 
 
-def clean_post_title(raw: Any, unescape_html: bool = False) -> Optional[str]:
+def clean_post_title(
+    raw: Any,
+    unescape_html: bool = False,
+    strip_html_comments: bool = False,
+) -> Optional[str]:
     """统一清理帖子标题：空值返回 None，否则去除不可见字符与首尾空白。"""
     if not raw:
         return None
-    title = clean_post_text(raw, unescape_html=unescape_html)
+    title = clean_post_text(
+        raw,
+        unescape_html=unescape_html,
+        strip_html_comments=strip_html_comments,
+    )
     return title if title else None
+
 
