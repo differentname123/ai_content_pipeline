@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
-""":authors:
-    zhuxiaohu
-:create_date:
-    2026/11/07
-:description:
-    X (Twitter) 个人主页帖子内容与数据表现（浏览量/点赞/评论/转发/收藏/引用）拉取与清洗模块。
-    - 支持【免登录零配置模式】：自动聚合 X 主页最新 SSR + 本地浏览器历史记录 + 本地持久化 ID 库，
-      并通过 fxtwitter 公开接口高并发拉取每条帖子的实时浏览量与互动明细；
-    - 支持【Cookie / Playwright 登录态 GraphQL 模式】：传入 auth_token & ct0（或持久化浏览器目录），
-      走 X 官方 UserTweets GraphQL 游标翻页接口拉取全量历史帖子；
-    - 输出 Schema 与 fetch_binance_feed / fetch_okx_feed 保持 100% 兼容，并支持一键导出 Excel 可直接打开的 CSV 报表。
+"""
+X (Twitter) 个人主页帖子内容与数据表现（浏览量/点赞/评论/转发/收藏/引用）拉取与清洗模块。
+输出 Schema 与 fetch_binance_feed / fetch_okx_feed 保持 100% 兼容，并支持一键导出 CSV 报表与生成选帖提示词。
 """
 import concurrent.futures
 import csv
 import glob
-import html
 import json
 import logging
 import os
@@ -26,6 +17,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -33,13 +25,26 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import requests
 
-from common.common_utils import download_web_media, read_json, save_json, setup_logger
+from common.common_utils import (
+    PLATFORM_X,
+    PROMPT_DIR,
+    clean_post_text,
+    create_standard_post_schema,
+    download_web_media,
+    get_media_save_dir,
+    get_requests_proxies,
+    get_runtime_file_path,
+    read_json,
+    safe_int,
+    save_json,
+    setup_logger,
+)
 
 setup_logger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -47,26 +52,21 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 全局常量配置
+# 全局常量配置（统一从 common_utils 获取代理与目录）
 # ============================================================
-PROXIES = {
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890",
-}
+PROXIES = get_requests_proxies() or {}
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 MAX_WORKERS = 10
 
 DEFAULT_SCREEN_NAME = "2434954452qqc"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEDIA_SAVE_DIR = os.path.join(BASE_DIR, "media_downloads")
+MEDIA_SAVE_DIR = get_media_save_dir()
 
-# X Web 端公开固定 Bearer Token
 X_WEB_BEARER_TOKEN = (
     "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
     "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 )
-# X GraphQL Query IDs
 X_GQL_USER_BY_SCREEN_NAME = "xmU6X_CKVnQ5lSrCbAmJsg"
 X_GQL_USER_TWEETS = "E3opETHurmVJflFsUBVuUQ"
 
@@ -75,83 +75,37 @@ DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\ufeff\u202a-\u202e]")
-_MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _CASHTAG_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
 _HASHTAG_RE = re.compile(r"#([^\s#]+)")
 _TCO_URL_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
 
 TZ_CN = timezone(timedelta(hours=8))
+_safe_int = safe_int
 
 
-# ============================================================
-# 标准数据结构定义 (与 biance_squre_api / okx_squre_api 保持一致)
-# ============================================================
 def get_standard_schema():
     """获取与币安广场 / OKX Orbit 100% 兼容的通用帖子 Schema，额外扩展 X 专属收藏与互动率指标"""
-    return {
-        "post_id": None,
-        "publish_time": 0,
-        "publish_time_str": "",
-        "author_id": None,
-        "card_type": "BUZZ_SHORT",
-        "source": "x",
-        "metadata": {
-            "url": None,
-            "is_ai_generated": False,
-            "lang": None,
-            "replying_to": None,
-        },
-        "author": {
-            "username": None,
-            "author_name": None,
-            "is_verified": False,
-            "followers_count": 0,
-        },
-        "content": {
-            "title": None,
-            "text_content": "",
-            "text_length": 0,
-            "hashtags": [],
-            "mentioned_coins": [],
-        },
-        "media": {
-            "cover_image": None,
-            "images": [],
-            "inline_images": [],
-            "video_url": None,
-            "video_duration": 0,
-            "local_mapping": {},
-        },
-        "engagement": {
-            "view_count": 0,
-            "like_count": 0,
-            "comment_count": 0,
-            "share_count": 0,
-            "quote_count": 0,
-            "bookmark_count": 0,
-            "engagement_rate_pct": 0.0,
-            "bookmark_rate_pct": 0.0,
-        },
-        "comments": [],
-    }
-
-
-def _safe_int(val, default=0):
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
+    schema = create_standard_post_schema(source=PLATFORM_X, card_type="BUZZ_SHORT")
+    schema["publish_time_str"] = ""
+    schema["metadata"].update({
+        "lang": None,
+        "replying_to": None,
+    })
+    schema["author"]["followers_count"] = 0
+    schema["content"]["text_length"] = 0
+    schema["engagement"].update({
+        "bookmark_count": 0,
+        "engagement_rate_pct": 0.0,
+        "bookmark_rate_pct": 0.0,
+    })
+    return schema
 
 
 def _clean_text(raw):
     if not raw:
         return ""
-    text = html.unescape(str(raw))
-    text = _INVISIBLE_RE.sub("", text)
-    text = _TCO_URL_RE.sub("", text)
-    text = _MULTI_NEWLINE_RE.sub("\n\n", text)
-    return text.strip()
+    cleaned = _TCO_URL_RE.sub("", str(raw))
+    return clean_post_text(cleaned)
 
 
 def _parse_cookie_dict(cookies_str):
@@ -166,12 +120,10 @@ def _parse_cookie_dict(cookies_str):
 
 
 # ============================================================
-# 1. 账号基本信息拉取
+# 1. 账号基本信息与单帖实时数据拉取
 # ============================================================
 def fetch_x_user_profile(screen_name=DEFAULT_SCREEN_NAME, proxies=PROXIES):
-    """
-    获取 X 账号基础画像数据（粉丝数、总帖数、简介、注册时间、User Rest ID 等）
-    """
+    """获取 X 账号基础画像数据（粉丝数、总帖数、简介、注册时间、User Rest ID 等）"""
     clean_name = str(screen_name).lstrip("@").strip()
     url = f"https://api.fxtwitter.com/{clean_name}"
     headers = {"User-Agent": DEFAULT_UA, "Accept": "application/json"}
@@ -195,13 +147,8 @@ def fetch_x_user_profile(screen_name=DEFAULT_SCREEN_NAME, proxies=PROXIES):
     return {}
 
 
-# ============================================================
-# 2. 单条帖子实时数据拉取 (免登录公开高速接口)
-# ============================================================
 def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES):
-    """
-    通过 fxtwitter 接口拉取单条 X 帖子的完整实时数据（含浏览量 views、书签 bookmarks、点赞、评论、转发、媒体等）
-    """
+    """通过 fxtwitter 接口拉取单条 X 帖子的完整实时数据"""
     clean_name = str(screen_name).lstrip("@").strip()
     clean_id = str(post_id).strip()
     url = f"https://api.fxtwitter.com/{clean_name}/status/{clean_id}"
@@ -213,10 +160,7 @@ def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES)
             resp = client.get(url, headers=headers, proxies=proxies, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 jd = resp.json()
-                tweet = jd.get("tweet")
-                if tweet:
-                    return tweet
-                return None
+                return jd.get("tweet")
             elif resp.status_code == 404:
                 return None
         except Exception as e:
@@ -227,22 +171,21 @@ def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES)
 
 
 # ============================================================
-# 3. 候选帖子 ID 自动发现机制（SSR + 浏览器历史 + 本地缓存库）
+# 2. 候选帖子 ID 自动发现机制（SSR + 浏览器历史 + 本地缓存库）
 # ============================================================
 def _get_known_ids_cache_path(screen_name):
     clean_name = str(screen_name).lstrip("@").strip().lower()
-    return os.path.join(BASE_DIR, f"x_known_ids_{clean_name}.json")
+    filename = f"x_known_ids_{clean_name}.json"
+    legacy_path = _PROJECT_ROOT / "biance" / filename
+    return get_runtime_file_path(filename, legacy_path=legacy_path)
 
 
 def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
-    """
-    从 X 网页端主页与 Jina 镜像页提取最新公开渲染的帖子 ID
-    """
+    """从 X 网页端主页与 Jina 镜像页提取最新公开渲染的帖子 ID"""
     clean_name = str(screen_name).lstrip("@").strip()
     found_ids = set()
     headers = {"User-Agent": DEFAULT_UA}
 
-    # 1. 直接请求 x.com 主页 SSR HTML
     try:
         resp = requests.get(f"https://x.com/{clean_name}", headers=headers, proxies=proxies, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
@@ -251,7 +194,6 @@ def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
     except Exception as e:
         logger.debug(f"[SSR探测] x.com 主页请求异常: {e}")
 
-    # 2. 补充请求 r.jina.ai 渲染快照以捕获主页首屏帖子链接
     try:
         resp_jina = requests.get(
             f"https://r.jina.ai/https://x.com/{clean_name}",
@@ -269,10 +211,7 @@ def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
 
 
 def _discover_tweet_ids_from_local_browsers(screen_name):
-    """
-    只读扫描本机 Chrome / Edge 及 W:\\temp 下持久化浏览器目录的 History 数据库，
-    提取曾访问或发布过的 <screen_name>/status/<tweet_id>
-    """
+    """只读扫描本机 Chrome / Edge 及 W:\\temp 下持久化浏览器目录的 History 数据库"""
     clean_name = str(screen_name).lstrip("@").strip()
     found_ids = set()
 
@@ -301,10 +240,7 @@ def _discover_tweet_ids_from_local_browsers(screen_name):
                 shutil.copy2(hist_path, tmp_db)
                 conn = sqlite3.connect(tmp_db)
                 cur = conn.cursor()
-                cur.execute(
-                    "SELECT url FROM urls WHERE url LIKE ?",
-                    (f"%{clean_name}/status/%",),
-                )
+                cur.execute("SELECT url FROM urls WHERE url LIKE ?", (f"%{clean_name}/status/%",))
                 for (url,) in cur.fetchall():
                     m = pattern.search(url or "")
                     if m:
@@ -323,17 +259,16 @@ def _discover_tweet_ids_from_local_browsers(screen_name):
 
 
 # ============================================================
-# 4. 登录态 GraphQL UserTweets 游标翻页拉取（可选增强通道）
+# 3. 登录态 GraphQL UserTweets 游标翻页拉取（可选增强通道）
 # ============================================================
 def extract_x_cookies_from_user_data_dir(user_data_dir):
-    """
-    从指定的 Playwright Chrome user_data_dir 提取 X (x.com) 登录 Cookie (含 auth_token 与 ct0)
-    """
+    """从指定的 Playwright Chrome user_data_dir 提取 X (x.com) 登录 Cookie"""
     if not user_data_dir or not os.path.exists(user_data_dir):
         return ""
     try:
         from playwright.sync_api import sync_playwright
 
+        proxy_server = PROXIES.get("http") if isinstance(PROXIES, dict) else None
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
@@ -341,12 +276,11 @@ def extract_x_cookies_from_user_data_dir(user_data_dir):
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
                 ignore_default_args=["--enable-automation"],
-                proxy={"server": PROXIES["http"]} if PROXIES else None,
+                proxy={"server": proxy_server} if proxy_server else None,
             )
             try:
                 raw_cookies = context.cookies(["https://x.com", "https://twitter.com"])
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
-                return cookie_str
+                return "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
             finally:
                 context.close()
     except Exception as e:
@@ -355,9 +289,7 @@ def extract_x_cookies_from_user_data_dir(user_data_dir):
 
 
 def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies=False, proxies=PROXIES):
-    """
-    当提供包含 auth_token 和 ct0 的登录 Cookie 时，通过 X 官方 GraphQL UserTweets 接口游标翻页拉取帖子
-    """
+    """通过 X 官方 GraphQL UserTweets 接口游标翻页拉取帖子"""
     cookie_dict = _parse_cookie_dict(cookies)
     auth_token = cookie_dict.get("auth_token")
     ct0 = cookie_dict.get("ct0")
@@ -444,7 +376,6 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
                         discovered_ids.append(pid)
                         new_cnt += 1
 
-                # 提取 bottom cursor
                 next_cursors = re.findall(r'"value"\s*:\s*"([^"]+)"\s*,\s*"cursorType"\s*:\s*"Bottom"', body_text)
                 if not next_cursors:
                     next_cursors = re.findall(r'"cursorType"\s*:\s*"Bottom"\s*,\s*"value"\s*:\s*"([^"]+)"', body_text)
@@ -463,12 +394,10 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
 
 
 # ============================================================
-# 5. 数据清洗：转换为通用标准 Schema
+# 4. 数据清洗：转换为通用标准 Schema
 # ============================================================
 def clean_x_posts(raw_tweets):
-    """
-    将 fxtwitter 返回的原始 tweet 字典列表清洗为统一的 get_standard_schema() 格式
-    """
+    """将 fxtwitter 返回的原始 tweet 字典列表清洗为统一的 get_standard_schema() 格式"""
     cleaned_list = []
 
     for tw in raw_tweets:
@@ -482,15 +411,17 @@ def clean_x_posts(raw_tweets):
         author = tw.get("author") or {}
         screen_name = author.get("screen_name") or DEFAULT_SCREEN_NAME
         ts = _safe_int(tw.get("created_timestamp"), 0)
-        dt_str = datetime.fromtimestamp(ts, TZ_CN).strftime("%Y-%m-%d %H:%M:%S") if ts else (tw.get("created_at") or "")
+        dt_str = (
+            datetime.fromtimestamp(ts, TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+            if ts
+            else (tw.get("created_at") or "")
+        )
 
-        # 1. 顶层字段
         item["post_id"] = post_id
         item["publish_time"] = ts
         item["publish_time_str"] = dt_str
         item["author_id"] = str(author.get("id") or "") or None
 
-        # 2. 媒体解析
         media_obj = tw.get("media") or {}
         photos = media_obj.get("photos") or []
         videos = media_obj.get("videos") or []
@@ -516,7 +447,6 @@ def clean_x_posts(raw_tweets):
             "video_duration": video_duration,
         })
 
-        # 3. 元数据与作者
         item["metadata"].update({
             "url": tw.get("url") or f"https://x.com/{screen_name}/status/{post_id}",
             "is_ai_generated": False,
@@ -530,7 +460,6 @@ def clean_x_posts(raw_tweets):
             "followers_count": _safe_int(author.get("followers"), 0),
         })
 
-        # 4. 正文与币种/标签提取
         raw_text = tw.get("text") or ""
         clean_txt = _clean_text(raw_text)
         coins = sorted(set(m.upper() for m in _CASHTAG_RE.findall(clean_txt)))
@@ -544,7 +473,6 @@ def clean_x_posts(raw_tweets):
             "mentioned_coins": coins,
         })
 
-        # 5. 互动与流量表现指标
         views = _safe_int(tw.get("views"), 0)
         likes = _safe_int(tw.get("likes"), 0)
         replies = _safe_int(tw.get("replies"), 0)
@@ -569,21 +497,15 @@ def clean_x_posts(raw_tweets):
 
         cleaned_list.append(item)
 
-    # 默认按发布时间倒序（最新在前）
     cleaned_list.sort(key=lambda x: x["publish_time"], reverse=True)
     return cleaned_list
 
 
 # ============================================================
-# 6. 导出 CSV 报表与打印汇总看板
+# 5. 导出 CSV 报表与一键拉取主入口
 # ============================================================
 def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
-    """
-    将清洗后的 X 帖子列表导出为带 UTF-8-SIG BOM 头的 CSV 文件（Excel 双击直接打开不乱码）
-    :param posts:   clean_x_posts 返回的标准帖子列表
-    :param csv_path: 导出的 CSV 文件路径
-    :param sort_by: "views" (按浏览量从高到低) 或 "time" (按发布时间从新到旧)
-    """
+    """将清洗后的 X 帖子列表导出为带 UTF-8-SIG BOM 头的 CSV 文件"""
     if not posts:
         logger.warning("⚠️ [CSV导出] 帖子列表为空，跳过导出")
         return None
@@ -629,7 +551,7 @@ def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
             imgs = med.get("images") or []
             writer.writerow([
                 idx,
-                f"'{p.get('post_id')}",  # 前缀单引号防止 Excel 将 19 位 ID 截断为科学计数法
+                f"'{p.get('post_id')}",
                 p.get("publish_time_str", ""),
                 eng.get("view_count", 0),
                 eng.get("like_count", 0),
@@ -653,9 +575,6 @@ def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
     return csv_path
 
 
-# ============================================================
-# 7. 主入口：一键拉取指定 X 账号全量帖子与数据表现
-# ============================================================
 def fetch_x_user_posts(
     screen_name=DEFAULT_SCREEN_NAME,
     count=200,
@@ -668,29 +587,13 @@ def fetch_x_user_posts(
     save_json_path=None,
     sort_by="views",
 ):
-    """
-    一键拉取指定 X 账号的帖子内容与实时数据表现（浏览/点赞/评论/转发/收藏）。
-
-    :param screen_name:     X 账号用户名（如 "2434954452qqc" 或 "@2434954452qqc"）
-    :param count:           最大拉取帖子数量，默认 200
-    :param cookies:         可选，X 登录 Cookie（含 auth_token 和 ct0 时自动启用 GraphQL 全量翻页）
-    :param user_data_dir:   可选，已登录 X 的 Chrome user_data_dir 路径
-    :param extra_tweet_ids: 可选，额外指定的推文 ID 列表/集合
-    :param include_replies: 是否包含回复他人的评论帖，默认 False（仅保留原创主帖）
-    :param download_media:  是否下载帖子中的配图到本地 media_downloads，默认 False
-    :param save_csv_path:   可选，自动导出 CSV 报表路径（不传则默认保存到当前目录 x_posts_<screen_name>.csv）
-    :param save_json_path:  可选，自动导出标准 JSON 路径（不传则默认保存到当前目录 x_posts_<screen_name>.json）
-    :param sort_by:         返回与导出的排序方式："views"（按浏览量降序）或 "time"（按发布时间降序）
-    :return:                清洗后的标准 Schema 帖子列表 (list[dict])
-    """
+    """一键拉取指定 X 账号的帖子内容与实时数据表现"""
     clean_name = str(screen_name).lstrip("@").strip()
     logger.info(f"========== 🚀 开始拉取 X 账号 @{clean_name} 帖子与数据表现 ==========")
 
-    # 1. 拉取账号头部资料
     profile = fetch_x_user_profile(clean_name)
     user_rest_id = profile.get("id")
 
-    # 2. 收集候选推文 ID（多源合并 + 本地持久化缓存）
     cache_path = _get_known_ids_cache_path(clean_name)
     cached_ids = set()
     if os.path.exists(cache_path):
@@ -701,16 +604,13 @@ def fetch_x_user_posts(
         except Exception:
             pass
 
-    # 若未保存在缓存中，尝试从初始化归档导入已知历史 ID
     candidate_ids = set(cached_ids)
     if extra_tweet_ids:
         candidate_ids.update(str(x) for x in extra_tweet_ids if x)
 
-    # 2.1 若传入了 user_data_dir 但没传 cookies，自动提取 Cookie
     if not cookies and user_data_dir:
         cookies = extract_x_cookies_from_user_data_dir(user_data_dir)
 
-    # 2.2 若有合法登录 Cookie 且拿到了 user_rest_id，走 GraphQL 翻页拉取
     if cookies and user_rest_id:
         gql_ids = fetch_x_tweets_via_graphql(
             user_rest_id=user_rest_id,
@@ -720,13 +620,11 @@ def fetch_x_user_posts(
         )
         candidate_ids.update(gql_ids)
 
-    # 2.3 免登录多路探测：主页 SSR + 本地浏览器历史记录
     ssr_ids = _discover_tweet_ids_from_ssr(clean_name)
     hist_ids = _discover_tweet_ids_from_local_browsers(clean_name)
     candidate_ids.update(ssr_ids)
     candidate_ids.update(hist_ids)
 
-    # 剔除用户自身的 UID 以及长度异常的非推文 ID
     if user_rest_id:
         candidate_ids.discard(str(user_rest_id))
     valid_candidate_ids = sorted(
@@ -740,7 +638,6 @@ def fetch_x_user_posts(
         f"浏览器历史:{len(hist_ids)} -> 去重后待拉取候选 ID 共 {len(valid_candidate_ids)} 个"
     )
 
-    # 3. 并发请求 fxtwitter 获取每条推文的最新实时数据表现
     raw_tweets = []
     verified_author_ids = set()
 
@@ -766,11 +663,9 @@ def fetch_x_user_posts(
                 except Exception as e:
                     logger.debug(f"处理推文 {tid} 异常: {e}")
 
-    # 4. 更新本地持久化推文 ID 库（只保存已验证属于该账号的真实推文 ID）
     updated_cache_ids = sorted(cached_ids | verified_author_ids, key=lambda x: int(x), reverse=True)
     save_json(cache_path, updated_cache_ids)
 
-    # 5. 清洗并转换为标准 Schema
     cleaned_posts = clean_x_posts(raw_tweets)
     if sort_by == "views":
         cleaned_posts.sort(key=lambda x: x["engagement"]["view_count"], reverse=True)
@@ -779,7 +674,6 @@ def fetch_x_user_posts(
 
     cleaned_posts = cleaned_posts[:count]
 
-    # 6. 可选下载配图到本地
     if download_media and cleaned_posts:
         os.makedirs(MEDIA_SAVE_DIR, exist_ok=True)
         for p in cleaned_posts:
@@ -791,11 +685,14 @@ def fetch_x_user_posts(
                     mapping[img_url] = local_path
             p["media"]["local_mapping"] = mapping
 
-    # 7. 自动保存 JSON 与 CSV 报表
     if save_json_path is None:
-        save_json_path = os.path.join(BASE_DIR, f"x_posts_{clean_name}.json")
+        save_json_path = get_runtime_file_path(
+            f"x_posts_{clean_name}.json", legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.json"
+        )
     if save_csv_path is None:
-        save_csv_path = os.path.join(BASE_DIR, f"x_posts_{clean_name}.csv")
+        save_csv_path = get_runtime_file_path(
+            f"x_posts_{clean_name}.csv", legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.csv"
+        )
 
     if save_json_path:
         save_json(save_json_path, cleaned_posts)
@@ -804,7 +701,6 @@ def fetch_x_user_posts(
     if save_csv_path:
         export_x_posts_to_csv(cleaned_posts, save_csv_path, sort_by=sort_by)
 
-    # 8. 打印汇总统计
     total_views = sum(p["engagement"]["view_count"] for p in cleaned_posts)
     total_likes = sum(p["engagement"]["like_count"] for p in cleaned_posts)
     total_replies = sum(p["engagement"]["comment_count"] for p in cleaned_posts)
@@ -822,12 +718,7 @@ def fetch_x_user_posts(
 
 
 def print_x_posts_summary_table(posts, top_n=None, show_full_text=True):
-    """
-    在终端直观打印帖子表现与完整文案
-    :param posts:          帖子列表
-    :param top_n:          打印前 N 条，默认 None 表示打印全部
-    :param show_full_text: 是否打印完整正文，默认 True（不截断，完整输出所有文案）
-    """
+    """在终端直观打印帖子表现与完整文案"""
     if not posts:
         print("暂无帖子数据。")
         return
@@ -855,20 +746,14 @@ def print_x_posts_summary_table(posts, top_n=None, show_full_text=True):
         print("-" * 115)
 
 
-DEFAULT_X_PROMPT_TEMPLATE_PATH = os.path.join(
-    _PROJECT_ROOT, "prompt", "X平台_基于历史表现选帖与改写提示词.txt"
-)
+DEFAULT_X_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "X平台_基于历史表现选帖与改写提示词.txt")
 
 
 def format_historical_x_posts_for_prompt(posts, recent_count=50):
-    """
-    将已拉取的 X 帖子列表提取最近 recent_count 条（按发布时间从新到旧），
-    格式化为高信息密度文本块，供拼入大模型提示词。
-    """
+    """将已拉取的 X 帖子列表提取最近 recent_count 条，格式化为高信息密度文本块"""
     if not posts:
         return "暂无历史已发帖子数据。"
 
-    # 按发布时间从新到旧排序，取最近 recent_count 条
     by_time = sorted(posts, key=lambda x: x.get("publish_time", 0), reverse=True)[:recent_count]
     now_ts = int(time.time())
 
@@ -912,18 +797,7 @@ def build_x_selection_prompt(
     prompt_template_path=DEFAULT_X_PROMPT_TEMPLATE_PATH,
     save_prompt_path=None,
 ):
-    """
-    拼接【账号最近 50 条 X 帖子真实表现数据】+【提示词规则】+【末尾候选帖子占位/数据】，
-    生成可直接发给 AI 进行选品与 X 文案改写的完整提示词。
-
-    :param screen_name:          X 账号名，默认 "2434954452qqc"
-    :param recent_count:         拼接最近多少条 X 帖子，默认 50
-    :param candidate_posts:      可选，待筛选的候选帖子 list/dict 或字符串；若传 None 则在末尾保留粘贴占位区
-    :param posts_data:           可选，已拉取好的 X 帖子列表；若传 None 则自动调用 fetch_x_user_posts 拉取最新数据
-    :param prompt_template_path: 提示词模板文件路径
-    :param save_prompt_path:     完整提示词保存路径，默认保存为 biance/x_selection_prompt_<screen_name>.txt
-    :return:                     拼接完成的完整提示词字符串 (str)
-    """
+    """拼接【账号最近 50 条 X 帖子真实表现数据】+【提示词规则】+【末尾候选帖子占位/数据】"""
     clean_name = str(screen_name).lstrip("@").strip()
     if posts_data is None:
         posts_data = fetch_x_user_posts(screen_name=clean_name, count=max(recent_count, 100), sort_by="time")
@@ -952,7 +826,10 @@ def build_x_selection_prompt(
     )
 
     if save_prompt_path is None:
-        save_prompt_path = os.path.join(BASE_DIR, f"x_selection_prompt_{clean_name}.txt")
+        save_prompt_path = get_runtime_file_path(
+            f"x_selection_prompt_{clean_name}.txt",
+            legacy_path=_PROJECT_ROOT / "biance" / f"x_selection_prompt_{clean_name}.txt",
+        )
 
     if save_prompt_path:
         with open(save_prompt_path, "w", encoding="utf-8") as f:
@@ -966,25 +843,18 @@ def build_x_selection_prompt(
 
 if __name__ == "__main__":
     target_account = "2434954452qqc"
-
-    # 1. 拉取 @2434954452qqc 的全量帖子数据
     all_x_posts = fetch_x_user_posts(
         screen_name=target_account,
         count=200,
-        sort_by="time",  # 可选 "views" (按浏览量降序) 或 "time" (按发布时间降序)
+        sort_by="time",
     )
-
-    # 2. 自动拼接最近 50 条已发 X 帖子数据，生成完整的选品与改写提示词
-    #    （你可以直接在控制台复制，或打开生成的 x_selection_prompt_2434954452qqc.txt 在末尾粘贴候选帖子）
     full_prompt_text = build_x_selection_prompt(
         screen_name=target_account,
         recent_count=50,
-        candidate_posts=None,  # 也可直接把候选帖子 list 传给 candidate_posts
+        candidate_posts=None,
         posts_data=all_x_posts,
     )
     print("\n" + "=" * 115)
     print("🚀 已为您生成拼接好最近 50 条 X 帖子数据的完整提示词（在末尾粘贴候选帖子即可发给 AI）：")
     print("=" * 115 + "\n")
     print(full_prompt_text)
-
-

@@ -30,58 +30,67 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import ccxt
 from PIL import Image
 
 from app.ai_api.model_api import generate_content
-from biance.biance_playwright import (
-    comment_on_binance_post, create_binance_post, get_auth_tokens_robust,
-)
-from biance.biance_squre_api import (
-    SELF_BINANCE_AUTHOR_NAMES, SELF_BINANCE_USERNAMES,
-    delete_binance_square_content, fetch_binance_feed, fetch_binance_future_hot_coins,
-    fetch_binance_hot_hashtags, fetch_binance_spot_hot_coins,
-    fetch_binance_square_replies, get_latest_crypto_price, like_and_bookmark,
-)
-from biance.okx_playwright import comment_on_okx_post, create_okx_post, delete_okx_posts
-from biance.okx_squre_api import (
-    SELF_OKX_AUTHOR_IDS, SELF_OKX_AUTHOR_NAMES, fetch_okx_feed, fetch_okx_hot_coins,
-    fetch_okx_user_timeline,
-)
 from common.common_utils import (
-    PROMPT_DIR, get_config, get_image_content_id, get_requests_proxies,
-    read_file_to_str, read_json, resolve_session_dir, save_json,
-    setup_logger, string_to_object,
+    BINANCE_ACCOUNTS as ACCOUNTS,
+    BINANCE_ACCOUNT_USERNAME_MAP,
+    OKX_ACCOUNTS,
+    OKX_ACCOUNT_UID_MAP,
+    PLATFORM_ACCOUNTS,
+    PLATFORM_BINANCE,
+    PLATFORM_OKX,
+    POST_SOURCES,
+    PROMPT_DIR,
+    SELF_AUTHOR_IDS,
+    SELF_AUTHOR_NAMES,
+    get_config,
+    get_image_content_id,
+    get_requests_proxies,
+    get_runtime_file_path,
+    read_file_to_str,
+    read_json,
+    resolve_session_dir,
+    save_json,
+    setup_logger,
+    string_to_object,
 )
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
+from platforms.binance_api import (
+    SELF_BINANCE_AUTHOR_NAMES,
+    SELF_BINANCE_USERNAMES,
+    delete_binance_square_content,
+    fetch_binance_feed,
+    fetch_binance_future_hot_coins,
+    fetch_binance_hot_hashtags,
+    fetch_binance_spot_hot_coins,
+    fetch_binance_square_replies,
+    get_latest_crypto_price,
+    get_top_k_movers,
+    like_and_bookmark,
+)
+from platforms.binance_playwright import (
+    comment_on_binance_post,
+    create_binance_post,
+    get_auth_tokens_robust,
+)
+from platforms.okx_api import (
+    SELF_OKX_AUTHOR_IDS,
+    SELF_OKX_AUTHOR_NAMES,
+    fetch_okx_feed,
+    fetch_okx_hot_coins,
+    fetch_okx_user_timeline,
+)
+from platforms.okx_playwright import comment_on_okx_post, create_okx_post, delete_okx_posts
 
 logger = setup_logger(app_name="media_format")
 
 # 一、全局配置与常量
 prompt_version = "1016-1"
-BINANCE_SOURCE = "binance"
-OKX_SOURCE = "okx"
-POST_SOURCES = (BINANCE_SOURCE, OKX_SOURCE)
-PLATFORM_BINANCE = "binance"
-PLATFORM_OKX = "okx"
-ACCOUNTS = ["qiqi", "ruru"]
-OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
-PLATFORM_ACCOUNTS = {PLATFORM_BINANCE: ACCOUNTS, PLATFORM_OKX: OKX_ACCOUNTS}
-
-# OKX 矩阵账号与唯一 author_id 映射（用于防自产自销与按账号删帖）
-OKX_ACCOUNT_UID_MAP = {
-    "myself": "872834593500823552",
-    "mama": "872896855657885696",
-    "nana": "1035697745975390208",
-    "ruru": "950093749101883392",
-}
-BINANCE_ACCOUNT_USERNAME_MAP = {
-    "qiqi": "insights_anchor",
-    "ruru": "ruivision",
-}
-SELF_AUTHOR_IDS = {str(x).lower() for x in (set(SELF_OKX_AUTHOR_IDS) | set(SELF_BINANCE_USERNAMES))}
-SELF_AUTHOR_NAMES = set(SELF_OKX_AUTHOR_NAMES) | set(SELF_BINANCE_AUTHOR_NAMES)
+BINANCE_SOURCE = PLATFORM_BINANCE
+OKX_SOURCE = PLATFORM_OKX
 
 PRE_SCREEN_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU初筛.txt")
 PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU提取.txt")
@@ -101,6 +110,10 @@ VIRAL_POST_MAX_AGE_HOURS = 24
 VIRAL_PUBLISH_MAX_AGE_HOURS = 24
 VIRAL_MIN_VIEW_COUNT_BINANCE = 1000
 VIRAL_MIN_VIEW_COUNT_OKX = 10000
+VIRAL_MIN_VIEW_COUNTS = {
+    PLATFORM_BINANCE: VIRAL_MIN_VIEW_COUNT_BINANCE,
+    PLATFORM_OKX: VIRAL_MIN_VIEW_COUNT_OKX,
+}
 
 ARTICLE_TYPE_ANALYSIS = "analysis"
 ARTICLE_TYPE_VIRAL = "viral"
@@ -138,7 +151,12 @@ INTERACTION_CONFIG = {
     },
 }
 
-STATE_FILE = str(Path(__file__).resolve().with_name("account_publish_state.json"))
+STATE_FILE = str(
+    get_runtime_file_path(
+        "account_publish_state.json",
+        legacy_path=Path(__file__).resolve().with_name("account_publish_state.json"),
+    )
+)
 STATE_FILE_LOCK = threading.Lock()
 ACCOUNT_COOLDOWN_SECONDS = 3600
 OKX_ACCOUNT_COOLDOWN_SECONDS = 1300
@@ -254,11 +272,11 @@ def _execute_platform_post(platform, session_dir, text, image_paths, topic=None,
 # 三、原帖筛选与模型字段契约
 
 
-# 统一按多个 source 查询原帖列表，覆盖 binance 与 okx 双数据源。
-def _find_posts_by_sources(post_manager, sources=POST_SOURCES, limit=POST_QUERY_LIMIT):
+# 统一按多个 source 查询原帖列表，覆盖 binance 与 okx 双数据源，并支持附加过滤条件（如时间窗口下推）。
+def _find_posts_by_sources(post_manager, sources=POST_SOURCES, limit=POST_QUERY_LIMIT, extra_query=None):
     posts = []
     for source in sources:
-        posts.extend(post_manager.find_posts_by_source(source, limit=limit) or [])
+        posts.extend(post_manager.find_posts_by_source(source, limit=limit, extra_query=extra_query) or [])
     return posts
 
 
@@ -423,7 +441,7 @@ def is_need_formatting(post):
     return _is_valid_raw_post(post)
 
 
-# post{viral_screen,engagement.view_count,publish_time,content,media} → bool；仅筛查24h内且浏览量>1000的纯图文帖。
+# post{viral_screen,engagement.view_count,publish_time,content,media} → bool；仅筛查24h内且达到平台浏览阈值的纯图文帖。
 def is_need_viral_screening(post):
     screen = post.get("viral_screen")
     if (isinstance(screen, dict) and screen.get("prompt_version") == prompt_version
@@ -431,13 +449,8 @@ def is_need_viral_screening(post):
         return False
     engagement = post.get("engagement") or {}
     view_count = engagement.get("view_count", 0)
-    VIRAL_MIN_VIEW_COUNT = 1000
-    source = post.get("source")
-    if source == OKX_SOURCE:
-        VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_OKX
-    elif source == BINANCE_SOURCE:
-        VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_BINANCE
-    if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
+    min_view_count = VIRAL_MIN_VIEW_COUNTS.get(post.get("source"), 1000)
+    if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= min_view_count:
         return False
     try:
         publish_time = _publish_time_seconds(post.get("publish_time", 0))
@@ -781,37 +794,6 @@ def batch_screen_viral_posts(posts, post_manager):
 # 四、采集与论据提取调度
 
 
-# top_k → {top_gainers/top_losers:[{symbol,percentage}]}；安全释放 CCXT 客户端，禁止释放异常阻断正常返回。
-def get_top_k_movers(top_k=5):
-    ccxt_cfg = {
-        "enableRateLimit": True, "options": {"defaultType": "future"},
-    }
-    proxies = get_requests_proxies()
-    if proxies:
-        ccxt_cfg["proxies"] = proxies
-    exchange = ccxt.binance(ccxt_cfg)
-    try:
-        tickers = exchange.fetch_tickers()
-        ranked = sorted(
-            ({"symbol": symbol, "percentage": ticker["percentage"]}
-             for symbol, ticker in tickers.items()
-             if symbol.endswith(":USDT") and ticker.get("percentage") is not None),
-            key=lambda item: item["percentage"], reverse=True,
-        )
-        return {"top_gainers": ranked[:top_k], "top_losers": ranked[-top_k:][::-1]}
-    except Exception as exc:
-        _log("行情/获取", "获取涨跌榜异常，降级返回空榜单", level="warning", 原因=exc)
-        return {"top_gainers": [], "top_losers": []}
-    finally:
-        try:
-            close_fn = getattr(exchange, "close", None)
-            if callable(close_fn):
-                close_fn()
-        except Exception:
-            pass
-
-
-
 # 合约/现货热榜与涨跌榜各前2项 → 去重币种列表；沿用集合的无序返回。
 def get_hot_coin():
     top_k, coins = 2, []
@@ -856,8 +838,13 @@ def format_image_article():
             post_manager = UniversalPostManager(gen_db_object())
             fetch_binance_hot_post(post_manager, PLATFORMS[PLATFORM_BINANCE].hot_coins())
             fetch_okx_hot_post(post_manager, PLATFORMS[PLATFORM_OKX].hot_coins())
+            min_publish_ts = time.time() - (POST_MAX_AGE_HOURS + 2) * 3600
             source_batches = [
-                post_manager.find_posts_by_source(source, limit=POST_QUERY_LIMIT) or []
+                post_manager.find_posts_by_source(
+                    source,
+                    limit=POST_QUERY_LIMIT,
+                    extra_query={"publish_time": {"$gte": min_publish_ts}},
+                ) or []
                 for source in POST_SOURCES
             ]
             posts = [post for batch in source_batches for post in batch]
@@ -994,10 +981,15 @@ def extract_and_group_valid_evidences(article_manager=None):
     hot_coins = binance_hot_coins.union(okx_hot_coins)
     started = time.monotonic()
     manager = UniversalPostManager(gen_db_object())
-    posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
+    now = time.time()
+    posts = _find_posts_by_sources(
+        manager,
+        limit=POST_QUERY_LIMIT,
+        extra_query={"publish_time": {"$gte": now - 16 * 24 * 3600}},
+    )
     self_post_ids = _get_all_self_published_post_ids(article_manager)
     grouped = defaultdict(lambda: defaultdict(list))
-    now, invalid_times, self_skipped = time.time(), 0, 0
+    invalid_times, self_skipped = 0, 0
     for post in posts:
         if _is_self_post(post, self_post_ids):
             self_skipped += 1
@@ -1289,9 +1281,13 @@ def get_remodeled_viral_post_ids(article_manager, source, post_ids):
 def extract_valid_viral_posts(article_manager):
     started = time.monotonic()
     post_manager = UniversalPostManager(gen_db_object())
-    posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
-    self_post_ids = _get_all_self_published_post_ids(article_manager)
     now = time.time()
+    posts = _find_posts_by_sources(
+        post_manager,
+        limit=POST_QUERY_LIMIT,
+        extra_query={"publish_time": {"$gte": now - (VIRAL_POST_MAX_AGE_HOURS + 2) * 3600}},
+    )
+    self_post_ids = _get_all_self_published_post_ids(article_manager)
 
     recent_viral_articles = (
         article_manager.find_articles(
@@ -1328,15 +1324,9 @@ def extract_valid_viral_posts(article_manager):
         comment_count = engagement.get("comment_count", 0) or 0
 
         source = post.get("source")
-        VIRAL_MIN_VIEW_COUNT = 1000
-        if source == OKX_SOURCE:
-            VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_OKX
-        elif source == BINANCE_SOURCE:
-            VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_BINANCE
-        else:
-            logger.info(f"{source} not in {POST_SOURCES}")
+        min_view_count = VIRAL_MIN_VIEW_COUNTS.get(source, 1000)
 
-        if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
+        if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= min_view_count:
             continue
         try:
             publish_time = _publish_time_seconds(post.get("publish_time", 0))
@@ -2241,7 +2231,7 @@ def _load_account_credentials(action, with_user_info=False):
     credentials, errors = {}, 0
     for account in ACCOUNTS:
         try:
-            session_dir = get_config(f"{account}_browser_session_dir")
+            session_dir = _get_account_session_dir(PLATFORM_BINANCE, account)
             cookies, token, user_info = get_auth_tokens_robust(session_dir, debug=False)
             if not cookies or not token:
                 logger.warning(
@@ -2518,7 +2508,12 @@ def delete_posts_by_account_and_time(
         uid_to_account = {uname: acc for acc, uname in BINANCE_ACCOUNT_USERNAME_MAP.items() if acc in account_post_ids}
 
     if uid_to_account:
-        raw_posts = _find_posts_by_sources(post_manager, sources=(platform,), limit=POST_QUERY_LIMIT)
+        raw_posts = _find_posts_by_sources(
+            post_manager,
+            sources=(platform,),
+            limit=POST_QUERY_LIMIT,
+            extra_query={"publish_time": {"$gte": start_ts - 3600}},
+        )
         for p in raw_posts:
             pid = str(p.get("post_id") or "").strip()
             if not pid:
@@ -2667,9 +2662,8 @@ def delete_posts_by_account_and_time(
                 except Exception as exc:
                     _log("按时间删帖/回写", "回写 generated_articles 删除状态异常", level="warning", 账号=acc, 原因=exc)
             try:
-                if hasattr(post_manager, "collection"):
-                    q_ids = list(deleted_list) + [int(x) for x in deleted_list if x.isdigit()]
-                    post_manager.collection.delete_many({"post_id": {"$in": q_ids}})
+                q_ids = list(deleted_list) + [int(x) for x in deleted_list if x.isdigit()]
+                post_manager.delete_posts({"post_id": {"$in": q_ids}})
             except Exception as exc:
                 _log("按时间删帖/清理原帖", "清理 social_media_posts 自爬记录异常", level="warning", 账号=acc, 原因=exc)
 
@@ -3162,10 +3156,10 @@ def main():
     task_map = {
         "fetch_and_screen": format_image_article,
         "single_analysis_gen": generate_analysis_articles,
-        "single_analysis_pub": auto_publish_articles,
+        # "single_analysis_pub": auto_publish_articles,
         "viral_gen": generate_viral_articles,
         # "viral_pub": auto_publish_viral_articles,
-        "hudong": hudong,
+        # "hudong": hudong,
         # "delete_old_post": delete_old_post,
     }
 

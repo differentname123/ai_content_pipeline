@@ -29,7 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from openai import OpenAI
 
-from common.common_utils import get_config, save_json, setup_logger
+from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
 if os.name == "nt":
     import msvcrt
@@ -92,11 +92,10 @@ LOW_MODEL_LIST = [
 
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
-# 默认固定在本模块同目录，不随调用程序的工作目录变化。
-# 若多个程序使用本模块的不同副本，请将环境变量设为同一个本地绝对路径。
+# 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
 MODEL_USAGE_JSON_PATH = Path(
     os.environ.get("MODEL_USAGE_JSON_PATH")
-    or Path(__file__).resolve().with_name("model_usage.json")
+    or get_runtime_file_path("model_usage.json", legacy_path=Path(__file__).resolve().with_name("model_usage.json"))
 ).expanduser().resolve()
 MODEL_USAGE_LOCK_TIMEOUT = 10.0
 _MODEL_USAGE_THREAD_LOCK = threading.Lock()
