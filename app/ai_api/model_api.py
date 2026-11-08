@@ -799,16 +799,30 @@ def probe_models(json_path):
 
 
 if __name__ == "__main__":
-    # result = generate_content(
-    #     prompt="你是谁，请分别描述这些图片，并标明对应的文件名。",
-    #     model="gemini-3.8-flash",
-    #     file_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg",
-    #                 r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png"
-    #                 ]
-    # )
-    # print(_redact(result))
-    # probe_models("model_probe_results.json")
-    # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
+    # 示例 1：使用本地 Antigravity 的 Gemini 3.8 Flash (High) 进行纯文本生成
+    res_flash = generate_content(
+        prompt="用一句话分析比特币减半对矿工的长期影响。",
+        model="antigravity-3.8-flash-high",
+    )
+    print("Flash (High) 文本结果:", res_flash)
+
+    # 示例 2：使用本地 Antigravity 的 Gemini 4 Argon (High) 进行纯文本生成
+    res_argon = generate_content(
+        prompt="请输出一个包含 coin 和 sentiment 字段的 JSON 示例。",
+        model="antigravity-argon-high",
+    )
+    print("Argon (High) 文本结果:", res_argon)
     for i in range(10):
         generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-3.8-flash-high")
+    # 示例 3：传入本地图片路径 (file_paths) 进行多模态图片分析（支持单张或多张图片）
+    # res_img = generate_content(
+    #     prompt="请分别描述这些图片的内容，并标明对应的文件名。",
+    #     model="antigravity-argon-high",  # 或 "antigravity-3.8-flash-high"
+    #     file_paths=[
+    #         r"C:\Users\zxh\Desktop\temp\test.jpg",
+    #         r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png",
+    #     ],
+    # )
+    # print("图片分析结果:", res_img)
+
 
