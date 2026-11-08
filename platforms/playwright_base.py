@@ -639,7 +639,17 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
                         continue
                     if item.evaluate(_INSIDE_EDITOR_JS, EDITOR_GUARD_SELECTOR):
                         continue
+                    if item.evaluate(
+                        """(el) => {
+                            const inDialog = el.closest("div[role='dialog'],[class*='modal'],[class*='mask'],[class*='guide'],[class*='onboard'],[class*='popup'],[class*='tooltip'],[class*='tour']");
+                            if (inDialog) return false;
+                            return !!el.closest("main[role='main'],article,[data-testid='primaryColumn']");
+                        }"""
+                    ):
+                        continue
                     txt = (item.inner_text() or "").strip()[:20]
+                    if not txt:
+                        continue
                     item.click(timeout=2500, no_wait_after=True, force=True)
                     acted = True
                     logger.info(f"[清障/L1] 已点掉引导浮层 | 文案: <{txt}> | 场景: <{desc}>")

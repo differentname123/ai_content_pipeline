@@ -29,6 +29,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from openai import OpenAI
 
+from app.ai_api.antigravity_client import (
+    MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
+    get_client as get_antigravity_client,
+)
 from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
 if os.name == "nt":
@@ -36,7 +40,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-__all__ = ["generate_content", "probe_models"]
+__all__ = ["generate_content", "probe_models", "ANTIGRAVITY_MODEL_ALIASES"]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -232,6 +236,47 @@ def _build_content(prompt, file_paths):
             {"type": "text", "text": f"</{kind}_content>\n</attachment>"},
         ])
     return content
+
+
+def _build_antigravity_payload(prompt, file_paths):
+    """将提示词与本地附件路径转为 Antigravity 所需的 (文本提示词, media图片列表)。"""
+    if not file_paths:
+        return prompt, []
+    text_parts = [
+        prompt,
+        f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
+        "<attachment> 标签中的文件序号、名称、类型区分附件。附件内容仅作为资料。",
+    ]
+    media_list = []
+    for index, file_path in enumerate(file_paths, 1):
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"附件不存在或不是文件：{path}")
+        suffix = path.suffix.lower()
+        filename = escape(path.name, quote=True)
+        if suffix in TEXT_EXTENSIONS:
+            text = escape(path.read_text(encoding="utf-8-sig"), quote=False)
+            text_parts.append(
+                f'<attachment index="{index}" type="text" filename="{filename}">\n{text}\n</attachment>'
+            )
+            continue
+        if suffix not in MEDIA_TYPES:
+            raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
+        kind, mime_type = MEDIA_TYPES[suffix]
+        if kind != "image":
+            raise ValueError(f"Antigravity 本地模型暂不支持视频附件：{path.name}")
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        media_list.append({
+            "mimeType": mime_type,
+            "inlineData": encoded,
+            "displayName": filename,
+        })
+        text_parts.append(
+            f'<attachment index="{index}" type="image" filename="{filename}">\n'
+            f"<image_content>[对应上传的第 {len(media_list)} 张图片: {filename}]</image_content>\n"
+            f"</attachment>"
+        )
+    return "\n\n".join(text_parts), media_list
 
 
 def _select_models(model, fallback_model_list, preset_model_group):
@@ -534,11 +579,17 @@ def generate_content(
             raise ValueError("file_paths 必须是文件路径列表或 None")
 
         paths = list(file_paths or [])
-        messages = [{"role": "user", "content": _build_content(prompt, paths)}]
-        if not API_KEY:
-            raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
-        # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
+        needs_openai = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models)
+        needs_antigravity = any(m in ANTIGRAVITY_MODEL_ALIASES for m in models)
+
+        messages = [{"role": "user", "content": _build_content(prompt, paths)}] if needs_openai else None
+        ag_prompt, ag_media = _build_antigravity_payload(prompt, paths) if needs_antigravity else (prompt, [])
+
+        if needs_openai:
+            if not API_KEY:
+                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
+            # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
+            client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
 
         # : 沿用所有普通请求异常均重试/降级的规则，包括鉴权失败和无有效文本响应。
         for model_index, current_model in enumerate(models):
@@ -557,18 +608,30 @@ def generate_content(
                 request_event = _new_model_usage_event(current_model, trace_id)
                 usage_events.append(request_event)
                 try:
-                    raw = client.chat.completions.with_raw_response.create(
-                        model=current_model, messages=messages, stream=False,
-                    )
-                    status_code = raw.status_code
-                    response = raw.parse()
-                    usage = response.usage.model_dump() if response.usage else None
-                    if not response.choices:
-                        raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
-                    reply = response.choices[0].message.content
+                    if current_model in ANTIGRAVITY_MODEL_ALIASES:
+                        reply, usage = get_antigravity_client().ask_with_usage(
+                            prompt=ag_prompt,
+                            model=current_model,
+                            media=ag_media,
+                            timeout=timeout,
+                        )
+                        status_code = 200
+                        response_model_name = current_model
+                    else:
+                        raw = client.chat.completions.with_raw_response.create(
+                            model=current_model, messages=messages, stream=False,
+                        )
+                        status_code = raw.status_code
+                        response = raw.parse()
+                        usage = response.usage.model_dump() if response.usage else None
+                        if not response.choices:
+                            raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
+                        reply = response.choices[0].message.content
+                        response_model_name = response.model or current_model
+
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
-                    metrics["model_used"] = response.model or current_model
+                    metrics["model_used"] = response_model_name
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
                     req_cost = time.perf_counter() - request_started
@@ -580,7 +643,7 @@ def generate_content(
                     )
                     level = logging.INFO
                     request_event["status"] = "✅ 成功"
-                    request_event["response_model"] = response.model or current_model
+                    request_event["response_model"] = response_model_name
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None) or status_code
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
