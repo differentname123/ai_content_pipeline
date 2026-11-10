@@ -95,8 +95,10 @@ OKX_SOURCE = PLATFORM_OKX
 PRE_SCREEN_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU初筛.txt")
 PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU提取.txt")
 ARTICLE_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类文章生成.txt")
+ANALYSIS_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类_发布前总编精选.txt")
 VIRAL_STAGE1_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖可用性筛选.txt")
 VIRAL_STAGE2_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖洗稿和神评生成.txt")
+VIRAL_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_发布前总编精选.txt")
 
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -160,8 +162,8 @@ STATE_FILE = str(
     )
 )
 STATE_FILE_LOCK = threading.Lock()
-ACCOUNT_COOLDOWN_SECONDS = 3600
-OKX_ACCOUNT_COOLDOWN_SECONDS = 1300
+ACCOUNT_COOLDOWN_SECONDS = 6 * 3600
+OKX_ACCOUNT_COOLDOWN_SECONDS = 6 * 3600
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600
 PUBLISH_MAX_ATTEMPTS = 3
 PUBLISH_POLL_SECONDS = 600
@@ -1270,6 +1272,8 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
     used_ids, selected_images = article_info["used_material_ids"], article_info["image_placeholders"]
     if not used_ids or any(item not in material_by_id for item in used_ids):
         return False, "used_material_ids 必须引用实际存在的素材且不能为空"
+    if image_mapping and not selected_images:
+        return False, "ok 状态下必须至少选择 1 张配图（image_placeholders 不能为空）"
     if len(selected_images) > 3:
         return False, "最多使用 3 张图片"
     allowed_images = set()
@@ -1289,7 +1293,7 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
 
 
 # coin/stance、论据[{source,source_post_id,core_fact,dimension,shelf_life,impact_weight}]
-# → {is_skip,record,coin,stance,reason?}；可执行任务另含full_prompt/materials/image_mapping/model_name。
+# → {is_skip,record,coin,stance,reason?}；可执行任务另含full_prompt/materials/image_mapping/file_paths/model_name。
 def build_article_task(coin, stance, ev_list, article_manager):
     brief = {"task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS}, "materials": []}
     model_name = "gemini-3.1-pro-preview"
@@ -1311,13 +1315,25 @@ def build_article_task(coin, stance, ev_list, article_manager):
     for item in candidates:
         if usage.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT:
             groups[(item.get("dimension"), item.get("shelf_life"))].append(item)
+
+    def _has_usable_img(ev):
+        return any(isinstance(img, dict) and img.get("usable") for img in (ev.get("images") or []))
+
     groups = {
-        key: deque(sorted(items, key=lambda item: (item.get("impact_weight", 0), random.random()), reverse=True))
+        key: deque(sorted(
+            items,
+            key=lambda item: (1 if _has_usable_img(item) else 0, item.get("impact_weight", 0), random.random()),
+            reverse=True,
+        ))
         for key, items in groups.items()
     }
     selected = []
     while groups and len(selected) < ARTICLE_MATERIAL_LIMIT:
-        keys = sorted(groups, key=lambda key: (groups[key][0].get("impact_weight", 0), random.random()), reverse=True)
+        keys = sorted(
+            groups,
+            key=lambda key: (1 if _has_usable_img(groups[key][0]) else 0, groups[key][0].get("impact_weight", 0), random.random()),
+            reverse=True,
+        )
         for key in keys:
             if len(selected) >= ARTICLE_MATERIAL_LIMIT:
                 break
@@ -1337,6 +1353,26 @@ def build_article_task(coin, stance, ev_list, article_manager):
             "reason": reason, "selected_count": len(selected),
         }
     materials, image_mapping = transform_mlus(selected)
+    file_paths, uploaded_images_desc = [], []
+    for ph, meta in image_mapping.items():
+        lp = meta.get("local_path") if isinstance(meta, dict) else None
+        if lp and _is_valid_image_file(lp):
+            file_paths.append(lp)
+            uploaded_images_desc.append(f"上传的第 {len(file_paths)} 张图片对应占位符 {ph}")
+            if len(file_paths) >= 4:
+                break
+    if not file_paths:
+        reason = "选中论据中无有效本地实锤配图，跳过无图纯文字生成"
+        record["status"] = "skip"
+        record["article_info"] = {
+            "status": "skip", "text": "", "god_comments": [], "image_placeholders": [], "used_material_ids": [],
+            "score": None, "reason": reason, "image_mapping": {},
+        }
+        return {
+            "is_skip": True, "record": record, "coin": coin, "stance": stance,
+            "reason": reason, "selected_count": len(selected),
+        }
+    brief["task"]["uploaded_images"] = uploaded_images_desc
     brief["materials"] = materials
     record["material_post_mapping"] = {
         material["id"]: evidence["source_post_id"] for material, evidence in zip(materials, selected)
@@ -1346,8 +1382,8 @@ def build_article_task(coin, stance, ev_list, article_manager):
         raise ValueError(f"文章提示词为空或读取失败: {ARTICLE_PROMPT_FILE_PATH}")
     return {
         "is_skip": False, "record": record, "full_prompt": f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}",
-        "materials": materials, "image_mapping": image_mapping, "coin": coin, "stance": stance,
-        "model_name": model_name,
+        "materials": materials, "image_mapping": image_mapping, "file_paths": file_paths,
+        "coin": coin, "stance": stance, "model_name": model_name,
     }
 
 
@@ -1694,6 +1730,7 @@ def execute_article_task(task_data, article_manager):
     record = _generate_article_record(
         task_data, lambda info: check_article_info(info, task_data["materials"], mapping, ARTICLE_MAX_CHARS),
         convert, "单币分析/生成", f"币种={coin},立场={stance}", preset_model_group="medium",
+        file_paths=task_data.get("file_paths") or [],
     )
     if record["status"] != "ok":
         if record["status"] == "skip":
@@ -1955,9 +1992,10 @@ def _get_recent_published_image_usage(article_manager, platform, hours=IMAGE_DED
     return addresses, primary, len(recent)
 
 
-# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却适用于单币分析帖。
-def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
+# 账号状态、候选三元组列表 → 所有满足主题冷却与图片去重的候选索引列表（最多取前 limit 个）。
+def _get_valid_publish_candidate_indices(account_state, candidates, now, used_addresses, article_type, limit=8):
     history = account_state.get("topic_publish_history") or {}
+    valid_indices = []
     for index, (article, addresses, _) in enumerate(candidates):
         if article_type == ARTICLE_TYPE_ANALYSIS:
             coins_to_check = article.get("coins") or ([article.get("topic")] if article.get("topic") else [])
@@ -1965,8 +2003,172 @@ def _select_publish_candidate(account_state, candidates, now, used_addresses, ar
                 continue
         if addresses and addresses & used_addresses:
             continue
-        return index
-    return None
+        valid_indices.append(index)
+        if len(valid_indices) >= limit:
+            break
+    return valid_indices
+
+
+# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却适用于单币分析帖。
+def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
+    valid = _get_valid_publish_candidate_indices(account_state, candidates, now, used_addresses, article_type, limit=1)
+    return valid[0] if valid else None
+
+
+# 总编横向擂台（Top-8 选 1 + 终审去 AI 味精修）：异常时无缝回退至排第一的候选。
+def _select_and_polish_best_candidate(article_manager, platform, account, account_state, candidates, now, used_addresses, article_type):
+    valid_indices = _get_valid_publish_candidate_indices(
+        account_state, candidates, now, used_addresses, article_type, limit=8,
+    )
+    if not valid_indices:
+        return None
+    rule = PUBLISH_RULES[article_type]
+    viral = article_type == ARTICLE_TYPE_VIRAL
+    comments_key = "bait_comments" if viral else "god_comments"
+
+    # 获取近期已发帖摘要，供总编防撞车
+    recent_arts = article_manager.find_articles(
+        query={
+            "status": "ok",
+            f"publish_records.{platform}.status": "success",
+            f"publish_records.{platform}.publish_time": {"$gte": now - 72 * 3600},
+        },
+        sort=[(f"publish_records.{platform}.publish_time", -1)],
+        limit=12,
+    ) or []
+    recent_summaries = []
+    for r_art in recent_arts:
+        r_info = r_art.get("article_info") or {}
+        r_txt = (r_info.get("post_text") or r_info.get("text") or "").strip().replace("\n", " ")
+        if r_txt:
+            recent_summaries.append(f"[{r_art.get('topic', '')}] {r_txt[:70]}")
+
+    arena_items = []
+    for rank_no, idx in enumerate(valid_indices, 1):
+        art, _, m_coin = candidates[idx]
+        info = art["article_info"]
+        eng = art.get("_source_engagement") or {}
+        if viral:
+            img_roles = [
+                img.get("semantic_role", "")
+                for img in (info.get("image_semantics") or [])
+                if isinstance(img, dict) and img.get("keep")
+            ]
+            arena_items.append({
+                "candidate_no": rank_no,
+                "matched_coin": m_coin,
+                "viral_score": info.get("viral_score"),
+                "source_engagement": f"浏览={eng.get('view_count', 0):,}, 点赞={eng.get('like_count', 0)}, 评论={eng.get('comment_count', 0)}",
+                "viral_analysis": info.get("viral_analysis", ""),
+                "kept_images_desc": img_roles,
+                "draft_text": info.get("post_text", ""),
+                "draft_comments": info.get("bait_comments", []),
+            })
+        else:
+            brief_mats = ((art.get("creation_brief") or {}).get("materials") or [])
+            used_ids = set(info.get("used_material_ids") or [])
+            selected_phs = set(info.get("image_placeholders") or [])
+            used_facts, img_descs = [], []
+            for m in brief_mats:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("id") in used_ids and m.get("fact"):
+                    used_facts.append(m["fact"])
+                vis = m.get("visual_evidence")
+                vis_list = vis if isinstance(vis, list) else ([vis] if isinstance(vis, dict) else [])
+                for v in vis_list:
+                    if isinstance(v, dict) and v.get("placeholder") in selected_phs and v.get("what_it_shows"):
+                        img_descs.append(v["what_it_shows"])
+            arena_items.append({
+                "candidate_no": rank_no,
+                "coin": art.get("topic"),
+                "stance": art.get("stance"),
+                "score": info.get("score"),
+                "image_count": len(info.get("image_placeholders") or []),
+                "kept_images_desc": img_descs,
+                "core_facts": used_facts,
+                "draft_text": info.get("text", ""),
+                "draft_comments": info.get("god_comments", []),
+            })
+
+    rival_ban = "严禁出现“币安/Binance”字样" if platform == PLATFORM_OKX else "严禁出现“欧易/OKX”字样"
+    prompt_path = VIRAL_EDITOR_PROMPT_FILE_PATH if viral else ANALYSIS_EDITOR_PROMPT_FILE_PATH
+    payload = {
+        "platform": platform.upper(),
+        "platform_constraints": f"{rival_ban}；正文非空白字符数 <= {ARTICLE_MAX_CHARS}",
+        "recent_published": recent_summaries,
+        "candidates": arena_items,
+    }
+
+    try:
+        base_prompt = read_file_to_str(prompt_path)
+        if not isinstance(base_prompt, str) or not base_prompt.strip():
+            raise ValueError(f"总编精选提示词为空或读取失败: {prompt_path}")
+        editor_prompt = f"{base_prompt}\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        t0 = time.monotonic()
+        res = generate_content(
+            prompt=editor_prompt,
+            model="antigravity-argon-high",
+        )
+        parsed = string_to_object(res.get("content", ""))
+        if not isinstance(parsed, dict):
+            raise ValueError("总编返回结果非字典")
+        cand_no = int(parsed.get("selected_candidate_no", 1))
+        if not (1 <= cand_no <= len(valid_indices)):
+            cand_no = 1
+        chosen_idx = valid_indices[cand_no - 1]
+        chosen_art, chosen_addrs, chosen_coin = candidates[chosen_idx]
+
+        final_text = str(parsed.get("final_text") or "").strip()
+        final_comments = [
+            str(c).strip() for c in (parsed.get("final_comments") or [])
+            if isinstance(c, str) and str(c).strip() and len(re.sub(r"\s", "", str(c))) <= 24
+        ][:3]
+        check_lower = (final_text + " " + " ".join(final_comments)).lower()
+        rival_hit = (
+            (platform == PLATFORM_OKX and ("binance" in check_lower or "币安" in check_lower))
+            or (platform == PLATFORM_BINANCE and ("okx" in check_lower or "欧易" in check_lower))
+        )
+        if (final_text
+                and len(re.sub(r"\s", "", final_text)) <= ARTICLE_MAX_CHARS
+                and not re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", final_text)
+                and not rival_hit):
+            chosen_art["article_info"][rule["text"]] = final_text
+            if final_comments:
+                chosen_art["article_info"][comments_key] = final_comments
+            # 同步更新数据库中的精修文案与神评，确保后续评论区互动使用精修后的神评
+            article_id = chosen_art.get("article_id")
+            if article_id and hasattr(article_manager, "db") and hasattr(article_manager.db, "get_collection"):
+                col = article_manager.db.get_collection(article_manager.collection_name)
+                col.update_one(
+                    {"article_id": article_id},
+                    {"$set": {
+                        f"article_info.{rule['text']}": chosen_art["article_info"][rule["text"]],
+                        f"article_info.{comments_key}": chosen_art["article_info"][comments_key],
+                    }},
+                )
+        _log(
+            f"{rule['action']}/总编擂台",
+            "横向比稿与终审精修完成",
+            平台=platform,
+            账号=account,
+            参选数=len(valid_indices),
+            胜出序号=f"#{cand_no}",
+            胜出主题=chosen_art.get("topic") or chosen_coin,
+            理由=str(parsed.get("reason") or "")[:80],
+            耗时=f"{time.monotonic() - t0:.2f}s",
+        )
+        return chosen_idx
+    except Exception as exc:
+        _log(
+            f"{rule['action']}/总编擂台",
+            "总编擂台调用异常，安全回退至榜首候选",
+            level="warning",
+            平台=platform,
+            账号=account,
+            原因=exc,
+        )
+        return valid_indices[0]
 
 
 # article{topic,article_info{text,image_placeholders,image_mapping}} → (最终正文,有序图片路径)。
@@ -1976,7 +2178,9 @@ def _format_analysis_post_content(article, platform=PLATFORM_BINANCE):
     if topic:
         text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda _: f"${topic} ", text, flags=re.IGNORECASE)
     adapter = PLATFORMS[PLATFORM_BINANCE if platform == PLATFORM_BINANCE else PLATFORM_OKX]
-    text = adapter.decorate_analysis(text, topic) + "\n\n\n\n\n\n👇"
+    text = adapter.decorate_analysis(text, topic)
+    if platform == PLATFORM_BINANCE:
+        text += "\n\n\n\n\n\n👇"
     if topic and not text.upper().startswith(f"${topic}".upper()):
         text = f"${topic} {text}"
     mapping = info.get("image_mapping") or {}
@@ -2198,10 +2402,13 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
         if not matched_coin:
             stats["no_hot_coin"] += 1
             continue
+        image_keys = info.get(rule["images"]) or []
         mapping = info.get("image_mapping") or {}
-        if any(not isinstance(mapping.get(key), dict)
-               or not _is_valid_image_file(mapping[key].get("local_path"))
-               for key in info.get(rule["images"]) or []):
+        if not image_keys or any(
+            not isinstance(mapping.get(key), dict)
+            or not _is_valid_image_file(mapping[key].get("local_path"))
+            for key in image_keys
+        ):
             stats["invalid_image"] += 1
             continue
         addresses, _ = _extract_article_image_addresses(article)
@@ -2209,7 +2416,43 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
             stats["image_dup"] += 1
             continue
         candidates.append((article, addresses, matched_coin))
-    candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
+
+    if viral and candidates:
+        # 批量关联原帖真实互动量（浏览/点赞/评论），计算市场验证综合排序分
+        eng_map = {}
+        try:
+            post_mgr = UniversalPostManager(article_manager.db if hasattr(article_manager, "db") else gen_db_object())
+            raw_pids = []
+            for art, _, _ in candidates:
+                for pid in (art.get("post_id_list") or []):
+                    if pid is not None:
+                        raw_pids.append(pid)
+                        if str(pid).isdigit():
+                            raw_pids.append(int(pid))
+                            raw_pids.append(str(pid))
+            if raw_pids:
+                src_posts = post_mgr.find_posts(query={"post_id": {"$in": list(dict.fromkeys(raw_pids))}}, limit=0) or []
+                for sp in src_posts:
+                    eng_map[str(sp.get("post_id"))] = sp.get("engagement") or {}
+        except Exception as exc:
+            logger.warning(f"[高流量/选材] 批量查询原帖互动数据异常，降级按 viral_score 排序: {exc}")
+
+        def _viral_rank_key(item):
+            art = item[0]
+            info = art["article_info"]
+            v_score = float(info.get(rule["score"], 0.0))
+            pid_str = str((art.get("post_id_list") or [""])[0])
+            eng = eng_map.get(pid_str) or {}
+            art["_source_engagement"] = eng
+            views = int(eng.get("view_count", 0) or 0)
+            likes = int(eng.get("like_count", 0) or 0)
+            comments = int(eng.get("comment_count", 0) or 0)
+            hot_energy = views + likes * 30 + comments * 80
+            return v_score + math.log10(max(hot_energy, 1000)) * 1.2
+
+        candidates.sort(key=_viral_rank_key, reverse=True)
+    else:
+        candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
     return candidates, len(raw), stats
 
 
@@ -2254,7 +2497,9 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
         if remaining > 0:
             _log(f"{rule['action']}/账号", "账号仍在冷却中", 平台=platform, 账号=account, 剩余=f"{int(remaining)}秒")
             continue
-        index = _select_publish_candidate(account_state, candidates, now, used_addresses, article_type)
+        index = _select_and_polish_best_candidate(
+            article_manager, platform, account, account_state, candidates, now, used_addresses, article_type,
+        )
         if index is None:
             _log(f"{rule['action']}/账号", "候选受主题冷却或已发图片冲突限制", 平台=platform, 账号=account)
             continue
@@ -2314,6 +2559,8 @@ def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
 # 管理器、单平台处理回调、动作名 → 按原顺序调度；平台异常只在这里输出一次最终故障日志。
 def _publish_on_platforms(article_manager, publish_one_platform, action):
     for platform, adapter in PLATFORMS.items():
+        if not (PLATFORM_ACCOUNTS.get(platform) or []):
+            continue
         try:
             hot_coins = adapter.hot_coins(for_publish=True) or ["BTC", "ETH", "BNB", "SOL"]
             publish_one_platform(article_manager, platform, hot_coins)
@@ -3293,9 +3540,9 @@ def main():
         "fetch_and_screen": format_image_article,
         "viral_screen": screen_viral_posts,
         "single_analysis_gen": generate_analysis_articles,
-        # "single_analysis_pub": auto_publish_articles,
+        "single_analysis_pub": auto_publish_articles,
         "viral_gen": generate_viral_articles,
-        # "viral_pub": auto_publish_viral_articles,
+        "viral_pub": auto_publish_viral_articles,
         # "hudong": hudong,
         # "delete_old_post": delete_old_post,
     }

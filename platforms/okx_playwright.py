@@ -59,7 +59,7 @@ logger = setup_logger(app_name="okx_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("okx_ruru_browser_session_dir", "okx_ruru")
+USER_DATA_DIR = resolve_session_dir("okx_myself_browser_session_dir", "okx_ruru")
 OKX_ORBIT_URL = "https://www.okx.com/zh-hans/orbit"
 API_WAIT_TIMEOUT_MS = 12000
 
