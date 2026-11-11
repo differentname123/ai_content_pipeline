@@ -258,7 +258,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
                     "create_time": safe_int(c.get("created_at_i"), int(time.time())),
                     "author_uid": str(c.get("author") or "hn_commenter"),
                     "author_name": str(c.get("author") or "hn_commenter"),
-                    "content": clean_c[:500],
+                    "content": clean_c[:4000],
                     "likes": 0,
                 })
                 if len(raw_comments) >= max_comments:
@@ -276,7 +276,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 12)
         per_keyword_count = safe_int(cfg.get("per_keyword_count"), 3)
         keywords = cfg.get("keywords") or []
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 5)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 20)
 
         self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
@@ -297,8 +297,19 @@ class HackerNewsHarvester(BasePlatformHarvester):
         all_posts = list(by_id.values())
 
         if top_n_comments > 0 and all_posts:
-            for item in all_posts[:top_n_comments]:
-                comments = self.fetch_post_comments(item["post_id"], max_comments=6)
+            comment_targets = [
+                p for p in all_posts
+                if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0
+            ]
+            comment_targets.sort(
+                key=lambda p: (
+                    safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2
+                    + safe_int((p.get("engagement") or {}).get("like_count"), 0)
+                ),
+                reverse=True,
+            )
+            for item in comment_targets[:top_n_comments]:
+                comments = self.fetch_post_comments(item["post_id"], max_comments=10)
                 if comments:
                     item["comments"] = comments
 

@@ -792,9 +792,20 @@ class XHarvester(BasePlatformHarvester):
 
         all_posts = list(collected_by_id.values())
 
-        # 3. 为前 N 条推文补充评论树
+        # 3. 为全局互动最高的前 N 条有评论推文补充评论树（避免按字典插入顺序只覆盖排在首位的博主）
         if self.has_burner_account and top_n_for_comments > 0:
-            for top_p in all_posts[:top_n_for_comments]:
+            comment_candidates = [
+                p for p in all_posts
+                if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0
+            ]
+            comment_candidates.sort(
+                key=lambda p: (
+                    safe_int((p.get("engagement") or {}).get("like_count"), 0) * 2
+                    + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 5
+                ),
+                reverse=True,
+            )
+            for top_p in comment_candidates[:top_n_for_comments]:
                 comments = self.fetch_post_comments(top_p["post_id"], max_comments=10)
                 if comments:
                     top_p["comments"] = comments

@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Module 3 (Step 4)：原创高网感正文撰写与多模态视觉生产模块 (`step4_creation.py`)
+Module 3 (Step 4)：X 平台原生推文创作与真实原图编辑生产模块 (`step4_creation.py`)
 
 本质职责：
-围绕 Step 3 选定的爆款选题（1~N 条跨平台原帖 + 图文情报卡 + 网友神评），一次性完成：
-1. 原创正文创作：融合多源事实与神评洞察，生成无搬运痕迹、开头抓人的高网感作品；
-2. 智能视觉生产：结合候选原图视觉说明与实图预览，自动执行「直接复用干净原图 (`reuse`)」、
-   「多模态 AI 去痕/重制改图 (`edit`)」或「多模态 AI 全新生图 (`generate`)」，输出图文双全的成品入库 (`pipeline_creations`)。
+1. 围绕 Step 3 选定的话题（1~N 条原帖原文 + Step 2 图文还原摘要 + 高价值评论），生成零废话、图文互补的 X 原生推文 (`post_text`)；
+2. 仅将 Step 2 体检合格 (`usable_as_visual=True`) 的真实主帖原图按 1:1 附件顺序喂给多模态模型看图决策，
+   驱动本地 `visual_studio.py` 执行确定性的 `reuse`（复用）/ `crop`（去杂边水印裁剪）/ `stitch`（多图拼接）/ `none`（纯文本推文）。
 
-可独立运行调试：直接在 IDE 运行本文件，即可自动消费库中 `pending_creation` 状态的选题并生成图文成品。
+可独立运行调试：直接在 IDE 运行本文件，即可消费库中 `pending_creation` 状态的选题并产出成品至 `pipeline_creations`。
 """
 import sys
 import time
@@ -21,6 +20,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from PIL import Image
+
 from content_pipeline.llm_gateway import call_llm_json, render_prompt_template
 from content_pipeline.pipeline_config import (
     ACTIVE_PROFILE,
@@ -29,98 +30,108 @@ from content_pipeline.pipeline_config import (
 )
 from content_pipeline.pipeline_db import PipelineDB
 from content_pipeline.pipeline_logger import get_pipeline_logger
+from content_pipeline.step2_comprehension import strip_inline_media_placeholders
 from content_pipeline.visual_studio import produce_visual_asset
+
+
+def _validate_step4_json(data: Dict[str, Any]) -> Optional[str]:
+    post_text = data.get("post_text")
+    if not isinstance(post_text, str) or not post_text.strip():
+        return "缺少非空字符串字段 `post_text`"
+    vp = data.get("visual_plan")
+    if not isinstance(vp, dict):
+        return "缺少对象字段 `visual_plan`"
+    action = str(vp.get("action") or "").strip().lower()
+    if action not in ("none", "reuse", "crop", "stitch"):
+        return f"`visual_plan.action` 必须是 none/reuse/crop/stitch 之一，当前为 {action!r}"
+    if action != "none" and not isinstance(vp.get("items"), list):
+        return f"当 action={action!r} 时，`visual_plan.items` 必须是数组"
+    return None
 
 
 def _assemble_topic_creation_bundle(
     topic: Dict[str, Any],
     raw_map: Dict[str, Dict[str, Any]],
     digest_map: Dict[str, Dict[str, Any]],
+    max_candidate_images: int = 4,
 ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]], List[str]]:
     """
-    组装单个选题的完整写作素材包、候选图片映射表 `IMG_1..IMG_k` 以及传给主笔模型的参考图片附件列表。
+    组装零冗余的写作与视觉决策素材包：
+    - 不传 Step 3 的 `why_selected` 或任何提纲指令，不传原帖浏览/赞数；
+    - 不重复堆砌原始水评（仅传 Step 2 提炼出的 `valuable_comments`）；
+    - 候选图片严格限定为 `usable_as_visual=True` 的主帖真实原图，且 `IMG_1..IMG_k` 与物理上传的 `file_paths` 100% 顺序一致。
     """
-    topic_info = (
-        f"- 选题标题: {topic.get('topic_title')}\n"
-        f"- 所属领域: {topic.get('domain')} | 素材模式: {topic.get('mode')}\n"
-        f"- 总编入选理由: {topic.get('selection_reason')}\n"
-        f"- 建议切入角度: {topic.get('creative_angle')}"
-    )
+    topic_label = str(topic.get("topic_summary") or topic.get("topic_title") or "").strip()
+    topic_info = f"- 核心事件/看点概述: {topic_label}"
 
     source_blocks: List[str] = []
     candidate_image_map: Dict[str, Dict[str, Any]] = {}
     image_manifest_lines: List[str] = []
-    writer_preview_files: List[str] = []
+    attached_image_files: List[str] = []
+    seen_img_paths = set()
 
-    img_counter = 0
     for idx, pk in enumerate(topic.get("post_keys") or [], 1):
         raw_p = raw_map.get(pk) or {}
         dig = digest_map.get(pk) or {}
-        eng = raw_p.get("engagement") or {}
         content_obj = raw_p.get("content") or {}
 
         raw_title = str(content_obj.get("title") or "").strip()
-        raw_body = str(content_obj.get("text_content") or "").strip()
-        full_raw_text = f"{raw_title}\n{raw_body}".strip() if raw_title and raw_title not in raw_body else raw_body
+        raw_body = strip_inline_media_placeholders(str(content_obj.get("text_content") or ""))
+        clean_raw_text = f"{raw_title}\n{raw_body}".strip() if (raw_title and raw_title not in raw_body) else raw_body
 
-        # 汇总前排原始高赞评论 + Step 2 提炼的神评精华
-        raw_comments = sorted(
-            [c for c in (raw_p.get("comments") or []) if isinstance(c, dict)],
-            key=lambda x: int(x.get("likes") or 0),
-            reverse=True,
-        )
-        comm_snippets = [
-            f"[{c.get('author_name') or '网友'} | 赞:{c.get('likes', 0)}] {str(c.get('content') or '').strip()[:220]}"
-            for c in raw_comments[:5]
-            if str(c.get("content") or "").strip()
-        ]
-        essence_list = dig.get("comment_essence") or []
+        dig_summary = str(dig.get("summary") or dig.get("complete_summary") or "").strip()
+        val_comments = dig.get("valuable_comments") or dig.get("comment_essence") or []
 
-        block = [
-            f"### 素材帖 #{idx} ({pk})",
-            f"- 互动热度: 浏览={eng.get('view_count', 0)}, 点赞={eng.get('like_count', 0)}, 评论={eng.get('comment_count', 0)}, 增速={eng.get('views_per_hour', 0)}浏览/h",
-            f"- 多模态完整摘要: {dig.get('complete_summary') or '无'}",
-            f"- 原始文本:\n{full_raw_text[:1500] or '（无正文文字）'}",
-        ]
-        if essence_list:
-            block.append("- 神评提炼: " + " ； ".join(essence_list))
-        if comm_snippets:
-            block.append("- 评论区原声摘录:\n  " + "\n  ".join(comm_snippets))
+        block = [f"### 素材源 #{idx} (来源平台: {raw_p.get('source') or dig.get('source') or 'unknown'})"]
+        if dig_summary:
+            block.append(f"- 图文完整事实还原: {dig_summary}")
+        if clean_raw_text:
+            block.append(f"- 原帖原文:\n{clean_raw_text[:2000]}")
+        if val_comments:
+            block.append("- 评论区关键补充/神吐槽:\n  - " + "\n  - ".join(str(c) for c in val_comments))
         source_blocks.append("\n".join(block))
 
-        # 整理该原帖下所有可用本地图片及 Step 2 产出的视觉体检信息
-        img_descs = dig.get("image_descriptions") or []
-        local_imgs = dig.get("local_images") or []
-        for i_pos, loc_item in enumerate(local_imgs):
-            lp = loc_item.get("local_path")
-            if not lp or not Path(lp).is_file():
+        # 收集通过视觉体检的主帖真实原图，保证每一张列进清单的 IMG_k 都真实作为多模态附件上传给模型查看
+        for img_item in (dig.get("images") or []):
+            if len(attached_image_files) >= max_candidate_images:
+                break
+            if not isinstance(img_item, dict) or not img_item.get("usable_as_visual", True):
                 continue
-            img_counter += 1
-            img_id = f"IMG_{img_counter}"
-            matched_desc = img_descs[i_pos] if i_pos < len(img_descs) else {}
-            v_fact = matched_desc.get("visual_fact") or "本地原帖配图"
-            v_role = matched_desc.get("role") or "news_visual"
-            has_wm = bool(matched_desc.get("has_watermark_or_ui", False))
+            lp = str(img_item.get("local_path") or "").strip()
+            if not lp or lp in seen_img_paths or not Path(lp).is_file():
+                continue
+            try:
+                with Image.open(lp) as im_probe:
+                    w, h = im_probe.size
+                if min(w, h) < 120 or max(w, h) < 240:
+                    continue
+            except Exception:
+                continue
+
+            seen_img_paths.add(lp)
+            attached_image_files.append(lp)
+            img_id = f"IMG_{len(attached_image_files)}"
+            has_ui = bool(img_item.get("has_ui_or_watermark", False))
+            img_desc = str(img_item.get("desc") or "").strip()
 
             candidate_image_map[img_id] = {
                 "image_id": img_id,
                 "from_post_key": pk,
                 "local_path": lp,
-                "visual_fact": v_fact,
-                "role": v_role,
-                "has_watermark_or_ui": has_wm,
+                "width": w,
+                "height": h,
+                "desc": img_desc,
+                "has_ui_or_watermark": has_ui,
             }
-            origin_tag = "主帖原图" if loc_item.get("origin") != "comment" else "热评配图"
+            ui_hint = "含软件顶底栏/昵称/边角水印（建议用 crop 裁出核心区）" if has_ui else "画面较干净（可直接 reuse 或按需微裁）"
             image_manifest_lines.append(
-                f"- `{img_id}` (来自 {pk} [{origin_tag}] | 角色:{v_role} | 含水印或平台UI边框:{'是' if has_wm else '否'}): {v_fact}"
+                f"- `{img_id}` (对应第 {len(attached_image_files)} 张上传附件 | 分辨率 {w}x{h} | 状态: {ui_hint}): {img_desc}"
             )
-            if len(writer_preview_files) < 3:
-                writer_preview_files.append(lp)
 
     images_manifest_str = (
         "\n".join(image_manifest_lines)
         if image_manifest_lines
-        else "（本选题关联原帖均无本地图片，visual_plan.action 请务必选择 `generate` 并编写高质量英文生图提示词）"
+        else "（本话题无可用的真实原帖配图，`visual_plan.action` 必须填 `\"none\"`，`items` 填 `[]`）"
     )
 
     slots = {
@@ -128,7 +139,7 @@ def _assemble_topic_creation_bundle(
         "SOURCE_MATERIALS": "\n\n".join(source_blocks),
         "AVAILABLE_IMAGES_MANIFEST": images_manifest_str,
     }
-    return slots, candidate_image_map, writer_preview_files
+    return slots, candidate_image_map, attached_image_files
 
 
 def create_single_work(
@@ -140,12 +151,13 @@ def create_single_work(
     step4_cfg: Dict[str, Any],
     run_id: str,
 ) -> Dict[str, Any]:
-    """围绕单个精选话题生产一篇完整原创作品（文案 + 多模态视觉配图）。"""
+    """围绕单个精选话题生产一篇 X 原生推文与真实像素配图。"""
     creation_id = f"work_{int(time.time())}_{uuid4().hex[:8]}"
     slots, candidate_image_map, preview_files = _assemble_topic_creation_bundle(
         topic=topic,
         raw_map=raw_map,
         digest_map=digest_map,
+        max_candidate_images=int(step4_cfg.get("max_candidate_images_per_topic", 4)),
     )
     slots["STYLE_GUIDELINES"] = profile_cfg.get("style_guidelines", "")
 
@@ -156,16 +168,19 @@ def create_single_work(
         model=step4_cfg.get("model"),
         fallback_models=step4_cfg.get("fallback_models"),
         file_paths=preview_files,
-        timeout=int(step4_cfg.get("timeout", 210)),
+        timeout=int(step4_cfg.get("timeout", 600)),
+        preset_model_group=str(step4_cfg.get("preset_model_group") or "medium"),
+        validator=_validate_step4_json,
     )
 
     now_ts = int(time.time())
+    topic_summary = str(topic.get("topic_summary") or topic.get("topic_title") or "").strip()
+
     base_doc: Dict[str, Any] = {
         "creation_id": creation_id,
         "run_id": run_id,
         "topic_id": topic.get("topic_id"),
-        "topic_title": topic.get("topic_title"),
-        "domain": topic.get("domain"),
+        "topic_summary": topic_summary,
         "topic_mode": topic.get("mode"),
         "profile_name": profile_name,
         "language": profile_cfg.get("language", "zh"),
@@ -180,52 +195,45 @@ def create_single_work(
             {
                 "status": "failed",
                 "error": llm_trace.get("parse_error") or "主笔模型调用失败",
-                "title": "",
-                "body": "",
-                "opening_hook": "",
-                "closing_question": "",
+                "post_text": "",
+                "char_count": 0,
                 "visual_plan": {},
                 "visual_trace": {},
+                "final_image_paths": [],
                 "final_image_path": None,
             }
         )
         return base_doc
 
-    title = str(parsed.get("title") or topic.get("topic_title") or "").strip()
-    body = str(parsed.get("body") or "").strip()
-    opening_hook = str(parsed.get("opening_hook") or (body.splitlines()[0] if body else "")).strip()
-    closing_question = str(parsed.get("closing_question") or "").strip()
-    visual_plan = parsed.get("visual_plan") if isinstance(parsed.get("visual_plan"), dict) else {}
+    post_text = str(parsed.get("post_text") or "").strip()
+    visual_plan = parsed.get("visual_plan") if isinstance(parsed.get("visual_plan"), dict) else {"action": "none", "items": []}
 
-    known_keys = {"title", "body", "opening_hook", "closing_question", "visual_plan"}
-    extra_fields = {k: v for k, v in parsed.items() if k not in known_keys}
-
-    visual_trace: Dict[str, Any] = {}
-    final_image_path: Optional[str] = None
-    if step4_cfg.get("enable_visual_studio", True) and body:
+    visual_trace: Dict[str, Any] = {
+        "requested_action": visual_plan.get("action"),
+        "executed_action": "none",
+        "final_image_paths": [],
+        "final_image_path": None,
+    }
+    if step4_cfg.get("enable_visual_studio", True) and post_text:
         visual_trace = produce_visual_asset(
             creation_id=creation_id,
             visual_plan=visual_plan,
             candidate_image_map=candidate_image_map,
-            fallback_topic_title=title or str(topic.get("topic_title") or ""),
-            image_models=step4_cfg.get("image_models") or ["gemini-3.1-flash-image"],
-            timeout=int(step4_cfg.get("image_timeout", 90)),
         )
-        final_image_path = visual_trace.get("final_image_path")
+
+    final_image_paths = list(visual_trace.get("final_image_paths") or [])
+    final_image_path = visual_trace.get("final_image_path")
 
     base_doc.update(
         {
-            "status": "ok" if body else "failed",
-            "title": title,
-            "body": body,
-            "body_length": len(body),
-            "opening_hook": opening_hook,
-            "closing_question": closing_question,
+            "status": "ok" if post_text else "failed",
+            "post_text": post_text,
+            "char_count": len(post_text),
             "visual_plan": visual_plan,
             "visual_trace": visual_trace,
+            "final_image_paths": final_image_paths,
             "final_image_path": final_image_path,
             "candidate_images_count": len(candidate_image_map),
-            "extra_fields": extra_fields,
         }
     )
     return base_doc
@@ -239,8 +247,7 @@ def run_step4_creation(
     run_id: str = "manual_step4",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
-    执行 Step 4 原创图文批量生产。
-    若未显式传入 `topics`，则自动从数据库拉取 `pending_creation` 状态的待产选题。
+    执行 Step 4 原生推文与真实配图批量生产。
     返回 `(step4_summary, creation_records)`。
     """
     logger = get_pipeline_logger()
@@ -282,9 +289,10 @@ def run_step4_creation(
     raw_map = db.fetch_raw_posts_by_keys(all_post_keys)
     digest_map = db.fetch_digests_by_keys(all_post_keys)
 
+    model_label = cfg.get("model") or f"group:{cfg.get('preset_model_group', 'medium')}"
     logger.info(
-        f"[Step4/启动] 待创作选题={len(target_topics)}个 | Profile={profile_name} | "
-        f"主笔模型={cfg.get('model')} | 视觉工作室={'开启' if cfg.get('enable_visual_studio', True) else '关闭'}"
+        f"[Step4/启动] 待生产选题={len(target_topics)}个 | Profile={profile_name} | "
+        f"路由={model_label} | 真实视觉编辑={'开启' if cfg.get('enable_visual_studio', True) else '关闭'}"
     )
 
     creations: List[Dict[str, Any]] = []
@@ -313,7 +321,6 @@ def run_step4_creation(
             else:
                 topic_item["status"] = "creation_failed"
 
-    # 按原选题 rank 顺序整理输出
     rank_order = {t["topic_id"]: t.get("rank", 99) for t in target_topics}
     creations.sort(key=lambda c: rank_order.get(c.get("topic_id"), 99))
 
@@ -334,14 +341,13 @@ def run_step4_creation(
             {
                 "creation_id": c["creation_id"],
                 "topic_id": c.get("topic_id"),
-                "domain": c.get("domain"),
-                "title": c.get("title"),
-                "body_length": c.get("body_length", 0),
-                "opening_hook": c.get("opening_hook"),
-                "closing_question": c.get("closing_question"),
+                "topic_summary": c.get("topic_summary"),
+                "char_count": c.get("char_count", 0),
+                "first_line": (c.get("post_text") or "").splitlines()[0][:80] if c.get("post_text") else "",
                 "text_model": (c.get("llm_trace") or {}).get("model_used"),
                 "visual_action": (c.get("visual_trace") or {}).get("executed_action"),
-                "image_model": (c.get("visual_trace") or {}).get("image_model_used"),
+                "visual_notes": (c.get("visual_trace") or {}).get("operation_notes"),
+                "final_image_paths": c.get("final_image_paths") or [],
                 "final_image_path": c.get("final_image_path"),
                 "source_post_keys": c.get("source_post_keys"),
             }
@@ -352,7 +358,8 @@ def run_step4_creation(
     logger.info(
         f"[Step4/完成] 耗时={elapsed:.2f}s | 成功产出={len(ok_works)}/{len(target_topics)}篇 | "
         + " ; ".join(
-            f"《{c['title']}》(配图:{(c.get('visual_trace') or {}).get('executed_action')})"
+            f"[{c.get('char_count')}字 | 视觉:{(c.get('visual_trace') or {}).get('executed_action')}] "
+            f"{((c.get('post_text') or '').splitlines()[0][:36])}"
             for c in ok_works
         )
     )
@@ -362,8 +369,9 @@ def run_step4_creation(
 if __name__ == "__main__":
     s4_res, works_out = run_step4_creation(run_id="standalone_step4_verify")
     for w in works_out:
-        print(f"\n================ 《{w.get('title')}》 ({w.get('status')}) ================")
+        print(f"\n================ [{w.get('creation_id')}] ({w.get('status')} | {w.get('char_count')}字) ================")
+        print(f"选题概述: {w.get('topic_summary')}")
         print(f"关联原帖: {w.get('source_post_keys')}")
-        print(f"视觉配图: {(w.get('visual_trace') or {}).get('executed_action')} -> {w.get('final_image_path')}")
+        print(f"视觉动作: {(w.get('visual_trace') or {}).get('executed_action')} -> {w.get('final_image_paths')}")
         print("-" * 72)
-        print(w.get("body"))
+        print(w.get("post_text"))

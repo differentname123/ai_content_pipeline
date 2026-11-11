@@ -5,11 +5,11 @@
 ================================================================================
 【使用说明（直接在 IDE 点击运行即可，无需命令行参数）】
 1. 本总控将 Step 1 入库 (`harvested_social_posts`) 之后的三大核心环节串联执行：
-   - Step 2 (`step2_comprehension.py`)：单帖「图文+热评」多模态完整语义还原
-   - Step 3 (`step3_topic_grouping.py`)：全局单窗口按短编号归堆与爆款选题（零自由标签）
-   - Step 4 (`step4_creation.py` + `visual_studio.py`)：高网感原创正文 + 智能选图/改图/生图
+   - Step 2 (`step2_comprehension.py`)：单帖「主帖图文+热评」忠实语义还原与自洽性体检
+   - Step 3 (`step3_topic_grouping.py`)：跨平台公平单窗口按短编号归堆与选题
+   - Step 4 (`step4_creation.py` + `visual_studio.py`)：X 原生推文创作 + 真实原图复用/裁剪/拼接/去边角水印
 2. 调整风格或参数：直接修改 `content_pipeline/pipeline_config.py` 中的 `ACTIVE_PROFILE`、
-   `STAGE_SWITCHES` 或 `prompt/pipeline_v2/*.md` 提示词文件，无需改动引擎逻辑。
+   `STAGE_SWITCHES`、`preset_model_group` 或 `prompt/pipeline_v2/*.md` 提示词文件。
 3. 可观测性与调优闭环：
    - 精炼高密度执行报告：输出至控制台与 `logs/content_pipeline.log`
    - 100% 完整全链路追踪档案：自动写入 `logs/runtime/pipeline_traces/` 与 `pipeline_run_traces` 集合
@@ -17,8 +17,9 @@
 """
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,18 +28,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from content_pipeline.pipeline_config import (
     ACTIVE_PROFILE,
-    CONTENT_PROFILES,
     SCHEDULE_CONFIG,
     STAGE_SWITCHES,
-    STEP2_CONFIG,
-    STEP3_CONFIG,
-    STEP4_CONFIG,
 )
 from content_pipeline.pipeline_db import PipelineDB
 from content_pipeline.pipeline_logger import (
+    TZ_CN,
     format_pipeline_execution_report,
     get_pipeline_logger,
-    now_bj_str,
     save_run_audit_bundle,
 )
 from content_pipeline.step2_comprehension import run_step2_comprehension
@@ -48,124 +45,109 @@ from content_pipeline.step4_creation import run_step4_creation
 
 def execute_pipeline_round(
     profile_name: str = ACTIVE_PROFILE,
-    stage_switches: Optional[Dict[str, bool]] = None,
-    step2_overrides: Optional[Dict[str, Any]] = None,
-    step3_overrides: Optional[Dict[str, Any]] = None,
-    step4_overrides: Optional[Dict[str, Any]] = None,
+    switches: Optional[Dict[str, bool]] = None,
+    step2_override: Optional[Dict[str, Any]] = None,
+    step3_override: Optional[Dict[str, Any]] = None,
+    step4_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """执行完整一轮（或按开关指定阶段）的内容理解、选题归堆与图文创作流水线。"""
+    """执行完整一轮（或按开关指定子阶段）的原创内容生产流水线，并持久化全链路追踪报告。"""
     logger = get_pipeline_logger()
     db = PipelineDB()
+    active_switches = dict(STAGE_SWITCHES)
+    if switches:
+        active_switches.update(switches)
 
-    switches = dict(STAGE_SWITCHES)
-    if stage_switches:
-        switches.update(stage_switches)
-
-    profile_cfg = CONTENT_PROFILES.get(profile_name) or CONTENT_PROFILES[ACTIVE_PROFILE]
-    run_id = uuid4().hex
     started_ts = int(time.time())
-    started_perf = time.perf_counter()
+    t0 = time.perf_counter()
+    run_id = f"run_{datetime.now(TZ_CN).strftime('%H%M%S')}_{uuid4().hex[:6]}"
 
     logger.info(
-        f"==================== [流水线启动] RunID={run_id[:12]} | Profile={profile_name} | 开关={switches} ===================="
+        f"▶ [流水线启动] RunID={run_id} | Profile={profile_name} | 阶段开关={active_switches}"
     )
 
     step2_summary = None
-    step2_digests = []
-    if switches.get("step2_comprehension", True):
-        step2_summary, step2_digests = run_step2_comprehension(
+    newly_digested: List[Dict[str, Any]] = []
+    if active_switches.get("step2_comprehension", True):
+        step2_summary, newly_digested = run_step2_comprehension(
             db=db,
             profile_name=profile_name,
-            step2_cfg=step2_overrides,
+            step2_cfg=step2_override,
             run_id=run_id,
         )
 
     step3_summary = None
-    selected_topics = []
-    if switches.get("step3_topic_selection", True):
+    selected_topics: List[Dict[str, Any]] = []
+    if active_switches.get("step3_topic_selection", True):
         step3_summary, selected_topics = run_step3_topic_selection(
             db=db,
             profile_name=profile_name,
-            step3_cfg=step3_overrides,
+            step3_cfg=step3_override,
             run_id=run_id,
         )
 
     step4_summary = None
-    created_works = []
-    if switches.get("step4_creation", True):
-        topics_arg = selected_topics if switches.get("step3_topic_selection", True) else None
+    created_works: List[Dict[str, Any]] = []
+    if active_switches.get("step4_creation", True):
+        topics_input = selected_topics if active_switches.get("step3_topic_selection", True) else None
         step4_summary, created_works = run_step4_creation(
             db=db,
-            topics=topics_arg,
+            topics=topics_input,
             profile_name=profile_name,
-            step4_cfg=step4_overrides,
+            step4_cfg=step4_override,
             run_id=run_id,
         )
 
-    total_elapsed = round(time.perf_counter() - started_perf, 2)
+    total_elapsed = round(time.perf_counter() - t0, 2)
+    finished_bj = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 构建完整无损的可回溯运行档案（用于后续深度效果分析与提示词优化）
     run_record: Dict[str, Any] = {
         "run_id": run_id,
-        "started_at_ts": started_ts,
-        "finished_at_bj": now_bj_str(),
-        "total_elapsed_seconds": total_elapsed,
         "profile_name": profile_name,
-        "profile_display_name": profile_cfg.get("display_name"),
-        "stage_switches": switches,
-        "config_snapshot": {
-            "step2": {**STEP2_CONFIG, **(step2_overrides or {})},
-            "step3": {**STEP3_CONFIG, **(step3_overrides or {})},
-            "step4": {**STEP4_CONFIG, **(step4_overrides or {})},
-        },
+        "switches": active_switches,
+        "started_at_ts": started_ts,
+        "finished_at_bj": finished_bj,
+        "total_elapsed_seconds": total_elapsed,
         "step2_summary": step2_summary,
         "step3_summary": step3_summary,
         "step4_summary": step4_summary,
-        # 完整阶段明细：方便直接在一个归档 JSON 中查看每条帖子的理解结果、选题决策和生成全文
-        "details": {
-            "step2_digests": [
+        "audit_details": {
+            "digests": [
                 {
                     "post_key": d.get("post_key"),
-                    "status": d.get("status"),
+                    "source": d.get("source"),
                     "is_usable": d.get("is_usable"),
-                    "filter_reason": d.get("filter_reason"),
-                    "domain": d.get("domain"),
-                    "core_hook": d.get("core_hook"),
-                    "complete_summary": d.get("complete_summary"),
-                    "image_descriptions": d.get("image_descriptions"),
-                    "comment_essence": d.get("comment_essence"),
+                    "reject_reason": d.get("reject_reason"),
+                    "summary": d.get("summary"),
+                    "valuable_comments": d.get("valuable_comments"),
+                    "images": d.get("images"),
                     "model_used": (d.get("llm_trace") or {}).get("model_used"),
                     "prompt_sha1": (d.get("llm_trace") or {}).get("prompt_sha1"),
-                    "duration_seconds": (d.get("llm_trace") or {}).get("duration_seconds"),
                 }
-                for d in step2_digests
+                for d in newly_digested
             ],
-            "step3_topics": [
+            "selected_topics": [
                 {
                     "topic_id": t.get("topic_id"),
                     "rank": t.get("rank"),
-                    "topic_title": t.get("topic_title"),
-                    "domain": t.get("domain"),
+                    "topic_summary": t.get("topic_summary"),
                     "mode": t.get("mode"),
                     "post_keys": t.get("post_keys"),
-                    "selection_reason": t.get("selection_reason"),
-                    "creative_angle": t.get("creative_angle"),
+                    "why_selected": t.get("why_selected"),
                 }
                 for t in selected_topics
             ],
-            "step4_creations": [
+            "creations": [
                 {
                     "creation_id": c.get("creation_id"),
                     "topic_id": c.get("topic_id"),
+                    "topic_summary": c.get("topic_summary"),
                     "status": c.get("status"),
-                    "domain": c.get("domain"),
-                    "title": c.get("title"),
-                    "opening_hook": c.get("opening_hook"),
-                    "body": c.get("body"),
-                    "closing_question": c.get("closing_question"),
+                    "post_text": c.get("post_text"),
+                    "char_count": c.get("char_count"),
                     "source_post_keys": c.get("source_post_keys"),
                     "visual_plan": c.get("visual_plan"),
                     "visual_trace": c.get("visual_trace"),
+                    "final_image_paths": c.get("final_image_paths"),
                     "final_image_path": c.get("final_image_path"),
                     "text_model": (c.get("llm_trace") or {}).get("model_used"),
                     "prompt_sha1": (c.get("llm_trace") or {}).get("prompt_sha1"),

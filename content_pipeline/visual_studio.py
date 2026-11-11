@@ -1,269 +1,428 @@
 # -*- coding: utf-8 -*-
 """
-多模态视觉配图工作室 (`visual_studio.py`)
+真实像素视觉工作室 (`visual_studio.py`)
 
-支持 Step 4 的三条自适应视觉路径：
-1. `reuse`（精选原图复用）：直接选用干净高冲击力的原帖本地高清图，复制到独立成品视觉目录。
-2. `edit`（多模态 AI 图片编辑重制）：将原帖本地图 + 英文编辑指令输入多模态图像模型（如 `gemini-3.1-flash-image`），
-   去除社交平台杂边/水印并重构为清爽配图；若远端图像模型偶发超时，自动平滑降级为本地 Pillow 边缘微裁切优化。
-3. `generate`（多模态 AI 全新生图）：针对无图热帖（如 HackerNews / 纯文字突发帖），根据主题视觉提示词直接生成高点击率配图。
+核心红线与 80/20 实证原则：
+1. 严禁凭空 AI 生图 (`generate`) 与破坏原图像素的全图重绘——杜绝一眼假的 AI 插画。
+2. 100% 基于采集到的真实原帖图片，执行高可靠、零失真的确定性像素编辑：
+   - `none`  ：无合适真实原图时直接发纯文本推文（`final_image_paths = []`）；
+   - `reuse` ：直接复用 1~4 张画面干净的真实原图（零损复制）；
+   - `crop`  ：按多模态模型输出的归一化坐标 `[ymin, xmin, ymax, xmax]` (0..1000) 精准裁掉手机状态栏、
+               社交软件顶底栏、原作者昵称及边缘水印，100% 保留主体原始清晰像素；
+   - `stitch`：将 2~3 张强关联真实原图（支持先各自裁剪核心区）按等高横向或等宽纵向无损比例拼接，
+               自动规避极端细长条比例，适配 X 信息流最佳展示尺寸；
+   - `mask_boxes`（可选局部去小水印）：仅针对画面保留区内面积 `<= 8%` 的边角小水印执行平滑拉普拉斯边界插值消除，
+               内置面积硬护栏，绝不允许涂抹画面中心主体。
 """
-import base64
-import io
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from openai import OpenAI
-from PIL import Image, ImageEnhance
+import numpy as np
+from PIL import Image
 
-from app.ai_api.model_api import _build_content
-from common.common_utils import get_config
 from content_pipeline.pipeline_config import PIPELINE_VISUAL_DIR
 
+MAX_X_PUBLISH_IMAGES = 4
+MAX_MASK_AREA_RATIO = 0.08
+MAX_MASK_HEIGHT_RATIO = 0.22
+STITCH_GAP_PX = 8
+STITCH_BG_COLOR = (22, 24, 28)
 
-def _extract_data_url_bytes(raw_text: str) -> Optional[bytes]:
-    """
-    使用线性字符串定位（避免在百万字节级 base64 字符串上使用复杂正则回溯），
-    高效提取 `data:image/...;base64,...` 中的二进制图像载荷。
-    """
-    if not raw_text:
-        return None
-    marker = "data:image/"
-    idx = raw_text.find(marker)
-    if idx == -1:
-        return None
-    b64_sep = ";base64,"
-    sep_idx = raw_text.find(b64_sep, idx)
-    if sep_idx == -1:
-        return None
 
-    payload_start = sep_idx + len(b64_sep)
-    # 终止符通常是 ')' (Markdown 图片)、'"'、'\''、'>' 或空白字符
-    end_idx = len(raw_text)
-    for stop_ch in (")", '"', "'", ">", " ", "\n", "\r"):
-        pos = raw_text.find(stop_ch, payload_start)
-        if pos != -1 and pos < end_idx:
-            end_idx = pos
-
-    b64_str = raw_text[payload_start:end_idx].strip()
-    if len(b64_str) < 64:
+def _parse_norm_box(raw_box: Any) -> Optional[Tuple[float, float, float, float]]:
+    """解析并校准 `0..1000` 归一化坐标框 `[ymin, xmin, ymax, xmax]`。"""
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
         return None
-    # 补齐可能缺失的 '=' padding
-    pad = (-len(b64_str)) % 4
-    if pad:
-        b64_str += "=" * pad
     try:
-        return base64.b64decode(b64_str)
-    except Exception:
+        ymin, xmin, ymax, xmax = (float(v) for v in raw_box)
+    except (TypeError, ValueError):
         return None
+    ymin = max(0.0, min(1000.0, ymin))
+    xmin = max(0.0, min(1000.0, xmin))
+    ymax = max(0.0, min(1000.0, ymax))
+    xmax = max(0.0, min(1000.0, xmax))
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
+    if (ymax - ymin) < 10.0 or (xmax - xmin) < 10.0:
+        return None
+    return (ymin, xmin, ymax, xmax)
 
 
-def _save_validated_image_bytes(img_bytes: bytes, dest_path: Path) -> Dict[str, Any]:
-    """用 Pillow 校验解码后的图像完整性并统一保存为高质量 JPG。"""
-    with Image.open(io.BytesIO(img_bytes)) as im:
-        width, height = im.size
-        rgb = im.convert("RGB")
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        rgb.save(dest_path, format="JPEG", quality=93, optimize=True)
-    return {"width": width, "height": height, "size_bytes": dest_path.stat().st_size}
+def _norm_box_to_pixels(
+    norm_box: Tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> Tuple[int, int, int, int]:
+    """将 `(ymin, xmin, ymax, xmax)` 转换为 Pillow 像素框 `(left, top, right, bottom)`。"""
+    ymin, xmin, ymax, xmax = norm_box
+    left = max(0, min(width - 1, int(round(xmin / 1000.0 * width))))
+    top = max(0, min(height - 1, int(round(ymin / 1000.0 * height))))
+    right = max(left + 1, min(width, int(round(xmax / 1000.0 * width))))
+    bottom = max(top + 1, min(height, int(round(ymax / 1000.0 * height))))
+    return (left, top, right, bottom)
 
 
-def _pillow_clean_fallback(source_path: Path, dest_path: Path) -> Dict[str, Any]:
-    """当多模态改图接口不可用时的稳健本地降级：四周轻微内缩 3% 去边角杂讯 + 微调对比度刷新视觉指纹。"""
+def _is_full_frame_box(norm_box: Optional[Tuple[float, float, float, float]]) -> bool:
+    if norm_box is None:
+        return True
+    ymin, xmin, ymax, xmax = norm_box
+    return ymin <= 12.0 and xmin <= 12.0 and ymax >= 988.0 and xmax >= 988.0
+
+
+def _validate_crop_pixel_box(
+    px_box: Tuple[int, int, int, int],
+    orig_w: int,
+    orig_h: int,
+) -> Tuple[bool, str]:
+    """校验裁剪框物理尺寸与长宽比合理性，防止异常坐标把图裁成残缺细条。"""
+    left, top, right, bottom = px_box
+    cw, ch = right - left, bottom - top
+    if cw < 160 or ch < 120:
+        return False, f"裁剪后尺寸过小({cw}x{ch})"
+    orig_area = max(1, orig_w * orig_h)
+    if (cw * ch) / orig_area < 0.14:
+        return False, f"裁剪面积占比过低({(cw * ch) / orig_area:.1%})"
+    aspect = cw / max(1, ch)
+    if aspect < 0.22 or aspect > 4.5:
+        return False, f"裁剪长宽比极端({aspect:.2f})"
+    return True, ""
+
+
+def _heal_small_watermark_boxes(
+    img_rgb: Image.Image,
+    raw_mask_boxes: Sequence[Any],
+    kept_px_box: Tuple[int, int, int, int],
+) -> Tuple[Image.Image, List[str]]:
+    """
+    使用边界中值初始化 + 向量化拉普拉斯谐波插值（Laplace Harmonic Inpainting），
+    平滑消除画面边角的小尺寸文字/台标水印。
+    严格护栏：单框面积不得超过保留画面面积的 8%，高度不得超过保留高度的 22%。
+    """
+    notes: List[str] = []
+    if not raw_mask_boxes:
+        return img_rgb, notes
+
+    w, h = img_rgb.size
+    k_left, k_top, k_right, k_bottom = kept_px_box
+    kept_w = max(1, k_right - k_left)
+    kept_h = max(1, k_bottom - k_top)
+    kept_area = float(kept_w * kept_h)
+
+    arr = np.asarray(img_rgb, dtype=np.float32).copy()
+    modified = False
+
+    for idx, raw_mb in enumerate(raw_mask_boxes):
+        nb = _parse_norm_box(raw_mb)
+        if nb is None:
+            continue
+        x1, y1, x2, y2 = _norm_box_to_pixels(nb, w, h)
+        # 计算与保留裁剪区的交集，若该水印本就已被裁剪框切掉则无需涂抹
+        ix1, iy1 = max(x1, k_left), max(y1, k_top)
+        ix2, iy2 = min(x2, k_right), min(y2, k_bottom)
+        if ix2 - ix1 < 4 or iy2 - iy1 < 4:
+            notes.append(f"mask#{idx + 1}:outside_crop_skipped")
+            continue
+
+        box_area = float((ix2 - ix1) * (iy2 - iy1))
+        if (box_area / kept_area) > MAX_MASK_AREA_RATIO or (iy2 - iy1) > (kept_h * MAX_MASK_HEIGHT_RATIO):
+            notes.append(f"mask#{idx + 1}:oversized_skipped({box_area / kept_area:.1%})")
+            continue
+
+        # 微扩 2px 覆盖文字抗锯齿边缘
+        pad_inner = 2
+        mx1 = max(0, x1 - pad_inner)
+        my1 = max(0, y1 - pad_inner)
+        mx2 = min(w, x2 + pad_inner)
+        my2 = min(h, y2 + pad_inner)
+
+        ring = 4
+        px1 = max(0, mx1 - ring)
+        py1 = max(0, my1 - ring)
+        px2 = min(w, mx2 + ring)
+        py2 = min(h, my2 + ring)
+
+        patch = arr[py1:py2, px1:px2].copy()
+        mask = np.zeros((py2 - py1, px2 - px1), dtype=bool)
+        mask[(my1 - py1):(my2 - py1), (mx1 - px1):(mx2 - px1)] = True
+
+        border_pixels = patch[~mask]
+        if border_pixels.size == 0:
+            continue
+
+        init_color = np.median(border_pixels, axis=0)
+        patch[mask] = init_color
+
+        # 60 次向量化四邻域拉普拉斯松弛，毫秒级无缝过渡背景渐变或纯色底板
+        for _ in range(60):
+            up = np.vstack([patch[0:1, :], patch[:-1, :]])
+            down = np.vstack([patch[1:, :], patch[-1:, :]])
+            left = np.hstack([patch[:, 0:1], patch[:, :-1]])
+            right = np.hstack([patch[:, 1:], patch[:, -1:]])
+            patch[mask] = 0.25 * (up + down + left + right)[mask]
+
+        arr[py1:py2, px1:px2] = patch
+        modified = True
+        notes.append(f"mask#{idx + 1}:healed({mx2 - mx1}x{my2 - my1}px)")
+
+    if not modified:
+        return img_rgb, notes
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB"), notes
+
+
+def _save_crisp_image(img: Image.Image, dest_base: Path, prefer_png: bool = False) -> Tuple[Path, Dict[str, Any]]:
+    """
+    高保真保存：截图/表格类 PNG 保持无损 PNG（防止小字边缘出现 JPEG 噪点），照片类保存为 95 质量无色度抽样 JPG。
+    """
+    dest_base.parent.mkdir(parents=True, exist_ok=True)
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if prefer_png:
+        final_path = dest_base.with_suffix(".png")
+        rgb.save(final_path, format="PNG", optimize=True)
+    else:
+        final_path = dest_base.with_suffix(".jpg")
+        rgb.save(final_path, format="JPEG", quality=95, subsampling=0, optimize=True)
+    return final_path, {"width": w, "height": h, "size_bytes": final_path.stat().st_size}
+
+
+def _process_single_panel(
+    source_path: Path,
+    raw_crop_box: Any,
+    raw_mask_boxes: Sequence[Any],
+) -> Tuple[Image.Image, bool, List[str]]:
+    """对单张真实原图执行可选局部去水印与裁剪，返回 `(处理后RGB图像, 是否发生了实质修改, 审计说明列表)`。"""
+    notes: List[str] = []
     with Image.open(source_path) as im:
         rgb = im.convert("RGB")
-        w, h = rgb.size
-        if w >= 200 and h >= 200:
-            dx, dy = int(w * 0.03), int(h * 0.03)
-            rgb = rgb.crop((dx, dy, w - dx, h - dy))
-        rgb = ImageEnhance.Contrast(rgb).enhance(1.02)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        rgb.save(dest_path, format="JPEG", quality=93, optimize=True)
-        final_w, final_h = rgb.size
-    return {"width": final_w, "height": final_h, "size_bytes": dest_path.stat().st_size}
+
+    orig_w, orig_h = rgb.size
+    norm_crop = _parse_norm_box(raw_crop_box)
+    kept_px = (0, 0, orig_w, orig_h)
+    did_crop = False
+
+    if norm_crop is not None and not _is_full_frame_box(norm_crop):
+        cand_px = _norm_box_to_pixels(norm_crop, orig_w, orig_h)
+        ok, err_reason = _validate_crop_pixel_box(cand_px, orig_w, orig_h)
+        if ok:
+            kept_px = cand_px
+            did_crop = True
+            notes.append(f"crop:{cand_px[0]},{cand_px[1]}->{cand_px[2]},{cand_px[3]}")
+        else:
+            notes.append(f"crop_skipped({err_reason})")
+
+    healed_rgb, mask_notes = _heal_small_watermark_boxes(rgb, raw_mask_boxes or [], kept_px)
+    notes.extend(mask_notes)
+    did_heal = any(":healed" in n for n in mask_notes)
+
+    if did_crop:
+        healed_rgb = healed_rgb.crop(kept_px)
+
+    return healed_rgb, (did_crop or did_heal), notes
 
 
-def _call_gateway_image_model(
-    prompt: str,
-    image_models: Sequence[str],
-    source_image_path: Optional[Path] = None,
-    timeout: int = 90,
-) -> Dict[str, Any]:
-    """通过本地统一 OpenAI 兼容网关调用多模态生图或带原图输入的改图模型。"""
-    base_url = get_config("local_api_url")
-    api_key = get_config("local_api_key")
-    if not base_url or not api_key:
-        return {"ok": False, "error": "缺少 local_api_url 或 local_api_key 配置", "errors": []}
+def _stitch_panels(
+    panels: List[Image.Image],
+    requested_layout: str = "auto",
+) -> Tuple[Image.Image, str]:
+    """
+    将 2~3 张真实画面按原比例无变形拼接为一张高可读性组合图：
+    - 竖屏/方图默认横向并排 (`horizontal`)，横屏宽图默认纵向叠放 (`vertical`)；
+    - 若纵向叠放会导致总高宽比 `> 2.5`（在 X 信息流会被严重上下截断），自动转为横向并排。
+    """
+    layout = str(requested_layout or "auto").strip().lower()
+    avg_aspect = sum(im.size[0] / max(1, im.size[1]) for im in panels) / len(panels)
 
-    file_list = [str(source_image_path)] if (source_image_path and source_image_path.is_file()) else []
-    msg_content: Any = _build_content(prompt, file_list) if file_list else prompt
+    if layout not in ("horizontal", "vertical"):
+        layout = "horizontal" if avg_aspect < 1.18 else "vertical"
 
-    errors: List[str] = []
-    client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout)
-    try:
-        for model_name in image_models:
-            t0 = time.perf_counter()
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": msg_content}],
-                    stream=False,
-                )
-                cost = round(time.perf_counter() - t0, 2)
-                if not resp.choices:
-                    raise ValueError("无 choices 返回")
-                raw_msg = resp.choices[0].message.content
-                if isinstance(raw_msg, list):
-                    raw_str = "\n".join(str(part) for part in raw_msg)
-                else:
-                    raw_str = str(raw_msg or "")
+    if layout == "vertical":
+        target_w = min(1400, max(im.size[0] for im in panels))
+        projected_h = sum(int(round(im.size[1] * (target_w / max(1, im.size[0])))) for im in panels) + STITCH_GAP_PX * (len(panels) - 1)
+        if projected_h / max(1, target_w) > 2.5:
+            layout = "horizontal"
 
-                img_bytes = _extract_data_url_bytes(raw_str)
-                if not img_bytes:
-                    raise ValueError(f"响应中未解析出有效 base64 图像数据 (长度={len(raw_str)})")
+    if layout == "horizontal":
+        target_h = min(1350, max(im.size[1] for im in panels))
+        resized = [
+            im.resize((max(1, int(round(im.size[0] * (target_h / max(1, im.size[1]))))), target_h), Image.Resampling.LANCZOS)
+            for im in panels
+        ]
+        total_w = sum(r.size[0] for r in resized) + STITCH_GAP_PX * (len(resized) - 1)
+        canvas = Image.new("RGB", (total_w, target_h), color=STITCH_BG_COLOR)
+        x_cursor = 0
+        for r in resized:
+            canvas.paste(r, (x_cursor, 0))
+            x_cursor += r.size[0] + STITCH_GAP_PX
+        return canvas, "horizontal"
 
-                return {
-                    "ok": True,
-                    "img_bytes": img_bytes,
-                    "model_used": resp.model or model_name,
-                    "duration_seconds": cost,
-                    "errors": errors,
-                }
-            except Exception as exc:
-                cost = round(time.perf_counter() - t0, 2)
-                errors.append(f"{model_name}({cost}s): {type(exc).__name__}: {str(exc)[:140]}")
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-
-    return {"ok": False, "error": " | ".join(errors[-3:]), "errors": errors}
+    target_w = min(1400, max(im.size[0] for im in panels))
+    resized = [
+        im.resize((target_w, max(1, int(round(im.size[1] * (target_w / max(1, im.size[0])))))), Image.Resampling.LANCZOS)
+        for im in panels
+    ]
+    total_h = sum(r.size[1] for r in resized) + STITCH_GAP_PX * (len(resized) - 1)
+    canvas = Image.new("RGB", (target_w, total_h), color=STITCH_BG_COLOR)
+    y_cursor = 0
+    for r in resized:
+        canvas.paste(r, (0, y_cursor))
+        y_cursor += r.size[1] + STITCH_GAP_PX
+    return canvas, "vertical"
 
 
 def produce_visual_asset(
     creation_id: str,
     visual_plan: Dict[str, Any],
     candidate_image_map: Dict[str, Dict[str, Any]],
-    fallback_topic_title: str,
-    image_models: Sequence[str],
-    timeout: int = 90,
     output_dir: Path = PIPELINE_VISUAL_DIR,
 ) -> Dict[str, Any]:
     """
-    根据 Step 4 创作模型给出的 `visual_plan` 执行配图生产，并返回完整的 `visual_trace`。
+    根据 Step 4 输出的 `visual_plan` 执行确定性真实原图加工，绝不调用任何 AI 生图接口。
+    返回完整的 `visual_trace`（含 `final_image_paths` 列表与首图 `final_image_path`）。
     """
     started = time.perf_counter()
-    requested_action = str((visual_plan or {}).get("action") or "").strip().lower()
-    selected_id = str((visual_plan or {}).get("selected_image_id") or "").strip()
-    image_prompt = str((visual_plan or {}).get("image_prompt") or "").strip()
-    visual_reason = str((visual_plan or {}).get("visual_reason") or "").strip()
-
-    # 智能校准动作：若请求 reuse/edit 但没有对应的有效本地原图，则若有候选图取第一张，否则自动转 generate
-    source_entry = candidate_image_map.get(selected_id)
-    if requested_action in ("reuse", "edit") and not source_entry:
-        if candidate_image_map:
-            first_key = next(iter(candidate_image_map.keys()))
-            selected_id = first_key
-            source_entry = candidate_image_map[first_key]
-        else:
-            requested_action = "generate"
-
-    if requested_action not in ("reuse", "edit", "generate"):
-        requested_action = "reuse" if source_entry else "generate"
-
-    source_path = Path(source_entry["local_path"]) if source_entry and source_entry.get("local_path") else None
-    output_dir.mkdir(parents=True, exist_ok=True)
+    plan = visual_plan if isinstance(visual_plan, dict) else {}
+    requested_action = str(plan.get("action") or "none").strip().lower()
+    raw_items = plan.get("items") if isinstance(plan.get("items"), list) else []
+    stitch_layout = str(plan.get("stitch_layout") or "auto").strip().lower()
+    reason = str(plan.get("reason") or plan.get("visual_reason") or "").strip()
 
     trace: Dict[str, Any] = {
-        "requested_action": (visual_plan or {}).get("action"),
-        "executed_action": requested_action,
-        "selected_image_id": selected_id or None,
-        "source_image_path": str(source_path) if source_path else None,
-        "visual_reason": visual_reason,
-        "image_prompt": image_prompt,
-        "image_model_used": None,
+        "requested_action": requested_action,
+        "executed_action": "none",
+        "reason": reason,
+        "selected_image_ids": [],
+        "source_image_paths": [],
+        "final_image_paths": [],
         "final_image_path": None,
-        "image_meta": None,
-        "fallback_triggered": False,
-        "error_history": [],
+        "image_metas": [],
+        "operation_notes": [],
         "duration_seconds": 0.0,
     }
 
-    # 路径 A：直接复用干净原图
-    if requested_action == "reuse" and source_path and source_path.is_file():
-        suffix = source_path.suffix.lower() or ".jpg"
-        dest = output_dir / f"{creation_id}_reuse{suffix}"
-        shutil.copy2(source_path, dest)
-        with Image.open(dest) as im:
-            w, h = im.size
-        trace["final_image_path"] = str(dest)
-        trace["image_meta"] = {"width": w, "height": h, "size_bytes": dest.stat().st_size}
-        trace["duration_seconds"] = round(time.perf_counter() - started, 2)
+    if not candidate_image_map or requested_action == "none":
+        trace["duration_seconds"] = round(time.perf_counter() - started, 3)
         return trace
 
-    # 路径 B：多模态 AI 改图重制（带本地 Pillow 兜底）
-    if requested_action == "edit" and source_path and source_path.is_file():
-        effective_edit_prompt = image_prompt or (
-            "Keep the core subject and factual visual elements of this image intact, "
-            "remove any social media UI borders, watermarks, or cluttered overlays, "
-            "and refine it into a clean, high-clarity editorial illustration."
+    # 解析有效的候选图条目（按请求顺序去重，最多 4 张）
+    valid_specs: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        img_id = str(it.get("image_id") or "").strip()
+        if not img_id or img_id in seen_ids or img_id not in candidate_image_map:
+            continue
+        src_p = Path(candidate_image_map[img_id]["local_path"])
+        if not src_p.is_file():
+            continue
+        try:
+            with Image.open(src_p) as im_chk:
+                sw, sh = im_chk.size
+            if min(sw, sh) < 120 or max(sw, sh) < 240:
+                trace["operation_notes"].append(f"{img_id}:tiny_thumbnail_skipped({sw}x{sh})")
+                continue
+        except Exception:
+            continue
+        seen_ids.add(img_id)
+        valid_specs.append(
+            {
+                "image_id": img_id,
+                "source_path": src_p,
+                "crop_box": it.get("crop_box"),
+                "mask_boxes": it.get("mask_boxes") if isinstance(it.get("mask_boxes"), list) else [],
+            }
         )
-        trace["image_prompt"] = effective_edit_prompt
-        dest = output_dir / f"{creation_id}_edited.jpg"
-        gw_res = _call_gateway_image_model(
-            prompt=effective_edit_prompt,
-            image_models=image_models,
-            source_image_path=source_path,
-            timeout=timeout,
+        if len(valid_specs) >= MAX_X_PUBLISH_IMAGES:
+            break
+
+    if not valid_specs:
+        # 若模型动作非 none 但未正确填写 items，安全回退为不配图（绝不乱塞无关图或 AI 生图）
+        trace["operation_notes"].append("no_valid_items_matched_fallback_to_none")
+        trace["duration_seconds"] = round(time.perf_counter() - started, 3)
+        return trace
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trace["selected_image_ids"] = [s["image_id"] for s in valid_specs]
+    trace["source_image_paths"] = [str(s["source_path"]) for s in valid_specs]
+
+    # 路径 1：多图拼接 (`stitch`，需至少 2 张有效图；若仅 1 张则自动平滑转为单图 `crop` / `reuse`)
+    if requested_action == "stitch" and len(valid_specs) >= 2:
+        panels: List[Image.Image] = []
+        prefer_png = False
+        for s in valid_specs[:3]:
+            if s["source_path"].suffix.lower() == ".png":
+                prefer_png = True
+            panel_im, _, p_notes = _process_single_panel(
+                s["source_path"],
+                s["crop_box"],
+                s["mask_boxes"],
+            )
+            panels.append(panel_im)
+            trace["operation_notes"].extend(f"{s['image_id']}:{n}" for n in p_notes)
+
+        stitched_im, used_layout = _stitch_panels(panels, requested_layout=stitch_layout)
+        dest_path, meta = _save_crisp_image(
+            stitched_im,
+            output_dir / f"{creation_id}_stitch_{used_layout}",
+            prefer_png=prefer_png,
         )
-        trace["error_history"] = gw_res.get("errors") or []
-        if gw_res.get("ok"):
-            meta = _save_validated_image_bytes(gw_res["img_bytes"], dest)
-            trace["image_model_used"] = gw_res.get("model_used")
-            trace["final_image_path"] = str(dest)
-            trace["image_meta"] = meta
+        trace["executed_action"] = f"stitch_{used_layout}"
+        trace["final_image_paths"] = [str(dest_path)]
+        trace["final_image_path"] = str(dest_path)
+        trace["image_metas"] = [meta]
+        trace["duration_seconds"] = round(time.perf_counter() - started, 3)
+        return trace
+
+    # 路径 2：单图或多图独立复用/裁剪/去边角水印 (`reuse` / `crop`)
+    final_paths: List[str] = []
+    metas: List[Dict[str, Any]] = []
+    any_modified = False
+
+    for idx, s in enumerate(valid_specs, 1):
+        src_path: Path = s["source_path"]
+        wants_crop = requested_action in ("crop", "stitch") and s["crop_box"] is not None
+        wants_mask = bool(s["mask_boxes"])
+
+        if not wants_crop and not wants_mask:
+            suffix = src_path.suffix.lower() or ".jpg"
+            dest = output_dir / f"{creation_id}_reuse_{idx}{suffix}"
+            shutil.copy2(src_path, dest)
+            with Image.open(dest) as im:
+                w, h = im.size
+            final_paths.append(str(dest))
+            metas.append({"width": w, "height": h, "size_bytes": dest.stat().st_size})
+            trace["operation_notes"].append(f"{s['image_id']}:lossless_copy")
         else:
-            # 平滑降级到本地 Pillow 边缘清洗优化，确保成品必定有干净配图
-            trace["fallback_triggered"] = True
-            trace["executed_action"] = "edit_pillow_fallback"
-            trace["image_model_used"] = "local_pillow_clean"
-            meta = _pillow_clean_fallback(source_path, dest)
-            trace["final_image_path"] = str(dest)
-            trace["image_meta"] = meta
-        trace["duration_seconds"] = round(time.perf_counter() - started, 2)
-        return trace
+            processed_im, modified, p_notes = _process_single_panel(
+                src_path,
+                s["crop_box"] if wants_crop else None,
+                s["mask_boxes"],
+            )
+            trace["operation_notes"].extend(f"{s['image_id']}:{n}" for n in p_notes)
+            if modified:
+                any_modified = True
+                dest, meta = _save_crisp_image(
+                    processed_im,
+                    output_dir / f"{creation_id}_clean_{idx}",
+                    prefer_png=(src_path.suffix.lower() == ".png"),
+                )
+            else:
+                suffix = src_path.suffix.lower() or ".jpg"
+                dest = output_dir / f"{creation_id}_reuse_{idx}{suffix}"
+                shutil.copy2(src_path, dest)
+                with Image.open(dest) as im:
+                    w, h = im.size
+                meta = {"width": w, "height": h, "size_bytes": dest.stat().st_size}
+            final_paths.append(str(dest))
+            metas.append(meta)
 
-    # 路径 C：多模态 AI 全新生图
-    effective_gen_prompt = image_prompt or (
-        f"Create a striking, high-contrast editorial hero illustration representing: {fallback_topic_title}. "
-        "Clean modern digital art style, cinematic lighting, 16:9 aspect ratio, no text clutter."
-    )
-    trace["executed_action"] = "generate"
-    trace["image_prompt"] = effective_gen_prompt
-    dest = output_dir / f"{creation_id}_generated.jpg"
-    gw_res = _call_gateway_image_model(
-        prompt=effective_gen_prompt,
-        image_models=image_models,
-        source_image_path=None,
-        timeout=timeout,
-    )
-    trace["error_history"] = gw_res.get("errors") or []
-    if gw_res.get("ok"):
-        meta = _save_validated_image_bytes(gw_res["img_bytes"], dest)
-        trace["image_model_used"] = gw_res.get("model_used")
-        trace["final_image_path"] = str(dest)
-        trace["image_meta"] = meta
-    elif source_path and source_path.is_file():
-        # 若生图所有模型均超时但恰有原帖图，兜底使用原图清洗版
-        trace["fallback_triggered"] = True
-        trace["executed_action"] = "generate_fallback_to_source"
-        trace["image_model_used"] = "local_pillow_clean"
-        meta = _pillow_clean_fallback(source_path, dest)
-        trace["final_image_path"] = str(dest)
-        trace["image_meta"] = meta
-
-    trace["duration_seconds"] = round(time.perf_counter() - started, 2)
+    trace["executed_action"] = "crop" if any_modified else "reuse"
+    trace["final_image_paths"] = final_paths
+    trace["final_image_path"] = final_paths[0] if final_paths else None
+    trace["image_metas"] = metas
+    trace["duration_seconds"] = round(time.perf_counter() - started, 3)
     return trace

@@ -1,6 +1,9 @@
 # AI Content Pipeline (欧易 OKX / 币安 Binance / X 帖子采集、清洗、AI生成与多平台发布系统)
 
-本项目是**多平台内容采集、多模态 AI 生成与自动化发布流水线**，包含完整的多平台帖子拉取、图片感知哈希去重、AI 初筛与 MLU 论据提取、单币分析/娱乐爆款文章生成、Playwright 自动发布、评论区互动以及历史帖子清理工具，支持 Windows / Linux / macOS 跨平台独立运行。
+本项目是**多平台内容采集、多模态 AI 理解与原创图文自动化生产/发布系统**，支持 Windows / Linux / macOS 跨平台独立运行。
+
+> [!IMPORTANT]
+> **开发与维护必读宪章**：任何后续参与本项目开发、修改数据结构、调优提示词或新增渠道的人员与 AI 代理，动手前请务必先阅读 **[《项目核心工程与内容架构准则 (`PROJECT_PRINCIPLES.md`)》](PROJECT_PRINCIPLES.md)**（涵盖第一性原理阶段职责、关键信息零丢失与反注水、最小必要字段与防 AI 注意力分散、双向过滤审计、真实原图编辑红线及集中模型组调度规范）。
 
 ---
 
@@ -8,10 +11,22 @@
 
 ```text
 ai_content_pipeline/
+├── PROJECT_PRINCIPLES.md           # 【核心必读】项目第一性原理、字段打磨与反脆弱工程准则
 ├── config/
 │   └── config.json                 # 核心配置文件（MongoDB、AI网关、代理、浏览器会话目录）
 ├── prompt/
-│   └── 内容生成方案_*.txt            # 分析类/娱乐爆款类全套 Prompt 模板
+│   ├── pipeline_v2/                # 新一代四阶段流水线专用外部提示词模板（.md）
+│   └── 内容生成方案_*.txt            # 旧版分析类/娱乐爆款类 Prompt 模板
+├── content_pipeline/               # 新一代全领域多模态内容理解与原创图文生产流水线（与旧版物理隔离）
+│   ├── pipeline_config.py          # 全局配置中心（Profile 切换、阶段开关、循环调度、模型组配置）
+│   ├── pipeline_runner.py          # 四阶段串联总控入口（IDE 直接运行）
+│   ├── step2_comprehension.py      # Step 2：单帖「图文+评论」多模态忠实还原与自洽性体检
+│   ├── step3_topic_grouping.py     # Step 3：单窗口全局视野按短编号归堆与爆款选题
+│   ├── step4_creation.py           # Step 4：平台原生短平快文案创作与配图决策
+│   ├── visual_studio.py            # 基于真实原图的配图处理模块（复用/裁剪/拼接/去水印）
+│   ├── llm_gateway.py              # 提示词版本指纹（SHA1）渲染与统一模型组网关封装
+│   ├── pipeline_db.py              # 独立 MongoDB 集合读写层（pipeline_*）
+│   └── pipeline_logger.py          # 高信噪比主日志与全链路可回溯 Trace 归档
 ├── common/
 │   ├── common_utils.py             # 统一配置缓存、路径解析、跨平台常量/Schema契约、图片dHash、媒体下载
 │   └── mongo_db/
@@ -19,8 +34,10 @@ ai_content_pipeline/
 │       └── mongo_manager.py        # UniversalPostManager & GeneratedArticleManager
 ├── app/
 │   └── ai_api/
-│       └── model_api.py            # OpenAI 兼容网关调用、重试降级与并发配额管理
+│       └── model_api.py            # OpenAI 兼容网关调用、preset_model_group 权重模型组与自动降级
 ├── platforms/
+│   ├── harvester_runner.py         # Step 1：多平台纯粹无损采集常驻调度器（存入 harvested_social_posts）
+│   ├── harvesters/                 # X / Reddit / HackerNews / Binance / OKX 标准化采集器实现
 │   ├── playwright_base.py          # Playwright 跨平台共享自动化底座（可重入目录锁、浮层免疫、编辑器控制、故障取证）
 │   ├── binance_api.py              # 币安广场推荐流/热榜/评论拉取、点赞收藏、API删帖、CCXT行情与涨跌榜
 │   ├── binance_playwright.py       # 币安广场 Playwright 自动发帖、评论、鉴权提取
@@ -29,11 +46,13 @@ ai_content_pipeline/
 │   ├── x_api.py                    # X (Twitter) GraphQL 监控采集、精选筛选与标准Schema转换
 │   └── x_playwright.py             # X (Twitter) Playwright 自动发帖（图文/纯文本）、评论回复与点赞互动
 ├── parser/
-│   └── article_format_logical.py   # 主控调度流水线（支持独立启停采集、生成、发布、互动、清理任务）
+│   └── article_format_logical.py   # 旧版主控调度流水线（支持独立启停采集、生成、发布、互动、清理任务）
 └── logs/
-    ├── app_YYYY-MM-DD.log          # 统一运行日志
+    ├── harvester.log               # Step 1 多平台无损采集精炼运维日志
+    ├── content_pipeline.log        # 新一代内容理解与创作流水线主日志
+    ├── app_YYYY-MM-DD.log          # 旧版统一运行日志
     ├── forensics/                  # Playwright 故障现场截图/HTML/诊断JSON
-    └── runtime/                    # 运行时状态文件（account_publish_state.json、model_usage.json 等）
+    └── runtime/                    # 运行时状态与全量审计档案（latest_harvester_report.json、pipeline_traces/ 等）
 ```
 
 ---
@@ -58,10 +77,8 @@ playwright install chromium
 - **浏览器内核 (`browser_channel`)**：
   - 默认 `"chrome"`；若服务器未安装系统级 Chrome，会自动回退至 Playwright 内置的 `"chromium"`。
 
-### 3. 启动主流水线
+### 3. 运行入口
 
-在项目根目录下直接运行（可在 `parser/article_format_logical.py` 的 `TASK_SWITCHES` 与 `main()` 中独立控制各子任务启停）：
-
-```bash
-python parser/article_format_logical.py
-```
+- **新一代无损采集器（Step 1）**：直接在 IDE 运行 `platforms/harvester_runner.py`（配置见顶部 `HARVESTER_CONFIG`）。
+- **新一代多模态理解与原创生产流水线（Step 2 ~ Step 4）**：直接在 IDE 运行 `content_pipeline/pipeline_runner.py`（或单独运行各阶段模块调试，配置见 `content_pipeline/pipeline_config.py`）。
+- **旧版全流程调度脚本**：直接运行 `parser/article_format_logical.py`（可在 `TASK_SWITCHES` 与 `main()` 中独立控制各子任务启停）。

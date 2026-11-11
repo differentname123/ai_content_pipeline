@@ -3,13 +3,15 @@
 通用提示词模板渲染与结构化大模型调用网关 (`llm_gateway.py`)
 
 核心职责：
-1. 从 `prompt/pipeline_v2/` 加载外部提示词模板，计算 `prompt_sha1` 版本指纹（当你修改提示词后，轨迹里能精确区分版本）。
-2. 基于 `app.ai_api.model_api.generate_content` 发起文本或多模态（带本地图片附件）调用。
-3. 使用 `common.common_utils.string_to_object` 解析 JSON 字典，并产出完整的 `llm_trace` 审计对象，便于全链路问题定位与提示词调优。
+1. 从 `prompt/pipeline_v2/` 加载外部提示词模板，计算 `prompt_sha1` 版本指纹。
+2. 默认保持 `model=None` 并透传 `preset_model_group`（`"low"` / `"medium"` / `"high"`），
+   完全复用 `app.ai_api.model_api.generate_content` 的加权负载均衡、重试与跨渠道自动降级机制。
+3. 使用 `common.common_utils.string_to_object` 解析 JSON 字典，并支持轻量级字段契约校验 (`validator`)
+   自动重试自愈，同时输出完整的 `llm_trace` 审计对象。
 """
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.ai_api.model_api import generate_content
 from common.common_utils import read_file_to_str, string_to_object
@@ -53,60 +55,78 @@ def call_llm_json(
     model: Optional[str] = None,
     fallback_models: Optional[List[str]] = None,
     file_paths: Optional[Sequence[str]] = None,
-    timeout: int = 150,
+    timeout: int = 600,
     preset_model_group: str = "medium",
+    validator: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+    schema_retries: int = 2,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """
-    发起大模型调用并将输出解析为 Python `dict`。
-    返回 `(parsed_dict_or_None, llm_trace)`，任何异常均被安全捕获并记录于 `llm_trace` 中。
+    发起大模型调用并将输出解析校验为 Python `dict`。
+    - 默认 `model=None` + `timeout=600`，交由 `model_api.py` 的 `preset_model_group` 统一选模与降级。
+    - 若传入 `validator(parsed_dict) -> error_str_or_None`，当 JSON 缺失关键字段时自动重调修复（最多 `schema_retries` 次）。
     """
     valid_files: List[str] = []
     for fp in file_paths or []:
         if fp and Path(fp).is_file():
             valid_files.append(str(Path(fp).resolve()))
 
-    resp = generate_content(
-        prompt=prompt,
-        model=model,
-        file_paths=valid_files if valid_files else None,
-        fallback_model_list=fallback_models,
-        max_retries_per_model=2,
-        timeout=timeout,
-        preset_model_group=preset_model_group,
-    )
+    normalized_model = model.strip() if isinstance(model, str) and model.strip() else None
+    max_outer = max(1, int(schema_retries))
+    accumulated_errors: List[str] = []
+    last_trace: Dict[str, Any] = {}
 
-    metrics = resp.get("metrics") or {}
-    raw_content = str(resp.get("content") or "").strip()
-    call_ok = resp.get("status") == "✅ 成功"
+    for outer_attempt in range(1, max_outer + 1):
+        resp = generate_content(
+            prompt=prompt,
+            model=normalized_model,
+            file_paths=valid_files if valid_files else None,
+            fallback_model_list=fallback_models if normalized_model else None,
+            max_retries_per_model=3,
+            timeout=timeout,
+            preset_model_group=preset_model_group,
+        )
 
-    llm_trace: Dict[str, Any] = {
-        "call_status": "ok" if call_ok else "failed",
-        "trace_id": resp.get("trace_id"),
-        "prompt_file": prompt_meta.get("prompt_file"),
-        "prompt_sha1": prompt_meta.get("prompt_sha1"),
-        "model_requested": model or f"group:{preset_model_group}",
-        "model_used": metrics.get("model_used"),
-        "account_used": metrics.get("account_used"),
-        "duration_seconds": metrics.get("total_time_seconds", 0.0),
-        "attempts": metrics.get("attempts", 0),
-        "attachment_count": len(valid_files),
-        "attachment_paths": valid_files,
-        "error_history": list(resp.get("error_history") or []),
-        "parse_error": None,
-        "raw_response": raw_content,
-    }
+        metrics = resp.get("metrics") or {}
+        raw_content = str(resp.get("content") or "").strip()
+        call_ok = resp.get("status") == "✅ 成功"
 
-    if not call_ok:
-        return None, llm_trace
+        last_trace = {
+            "call_status": "ok" if call_ok else "failed",
+            "trace_id": resp.get("trace_id"),
+            "prompt_file": prompt_meta.get("prompt_file"),
+            "prompt_sha1": prompt_meta.get("prompt_sha1"),
+            "model_requested": normalized_model or f"group:{preset_model_group}",
+            "preset_model_group": preset_model_group,
+            "model_used": metrics.get("model_used"),
+            "duration_seconds": metrics.get("total_time_seconds", 0.0),
+            "attempts": metrics.get("attempts", 0),
+            "schema_attempt": outer_attempt,
+            "attachment_count": len(valid_files),
+            "attachment_paths": valid_files,
+            "error_history": accumulated_errors + list(resp.get("error_history") or []),
+            "parse_error": None,
+            "raw_response": raw_content,
+        }
 
-    try:
-        parsed = string_to_object(raw_content)
-        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
-            parsed = parsed[0]
-        if not isinstance(parsed, dict):
-            raise ValueError(f"期望返回 JSON 对象(dict)，实际得到 {type(parsed).__name__}")
-        return parsed, llm_trace
-    except Exception as parse_exc:
-        llm_trace["call_status"] = "parse_failed"
-        llm_trace["parse_error"] = f"{type(parse_exc).__name__}: {parse_exc}"
-        return None, llm_trace
+        if not call_ok:
+            return None, last_trace
+
+        try:
+            parsed = string_to_object(raw_content)
+            if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+                parsed = parsed[0]
+            if not isinstance(parsed, dict):
+                raise ValueError(f"期望返回 JSON 对象(dict)，实际得到 {type(parsed).__name__}")
+            if validator is not None:
+                schema_err = validator(parsed)
+                if schema_err:
+                    raise ValueError(f"Schema校验未通过: {schema_err}")
+            return parsed, last_trace
+        except Exception as parse_exc:
+            err_msg = f"[Schema尝试{outer_attempt}] {last_trace['model_used']}: {type(parse_exc).__name__}: {parse_exc}"
+            accumulated_errors.append(err_msg)
+            last_trace["call_status"] = "parse_failed"
+            last_trace["parse_error"] = err_msg
+            last_trace["error_history"] = accumulated_errors + list(resp.get("error_history") or [])
+
+    return None, last_trace

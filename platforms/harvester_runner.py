@@ -128,7 +128,7 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
         "tweets_per_handle": 5,
         "include_home_feed": False,
         "home_feed_count": 20,
-        "fetch_comments_for_top_n": 5,
+        "fetch_comments_for_top_n": 10,
     },
     "reddit": {
         "subreddits": [
@@ -152,7 +152,7 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
         "front_page_count": 12,
         "keywords": ["AI", "OpenAI", "Nvidia", "crypto", "billion"],
         "per_keyword_count": 3,
-        "fetch_comments_for_top_n": 5,
+        "fetch_comments_for_top_n": 20,
     },
     "binance": {
         "recommend_count": 15,

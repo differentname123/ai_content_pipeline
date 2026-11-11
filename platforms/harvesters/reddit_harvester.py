@@ -115,8 +115,65 @@ class _RedditHTMLParser(HTMLParser):
             self.text_parts.append(data)
 
 
+def _strip_reddit_prefix(raw: str) -> str:
+    s = str(raw or "").strip()
+    for prefix in ("/u/", "u/", "/r/", "r/"):
+        if s.lower().startswith(prefix):
+            return s[len(prefix):].strip()
+    return s
+
+
+def _deduplicate_reddit_image_urls(urls: List[str]) -> List[str]:
+    """
+    Reddit Atom HTML 往往对同一张图输出 `<img src="https://preview.redd.it/xxx.png?width=140&height=51...">`
+    低清缩略图（有时内嵌图甚至不带 `<a href="https://i.redd.it/xxx.png">` 链接）。
+    1) 对 `preview.redd.it/<asset>.(png|jpg|jpeg|webp|gif)` 顶层用户原图，直接无损升级为 `https://i.redd.it/<asset>` 原始高清图；
+    2) 按底层资源文件名去重，优先保留 `i.redd.it` 原图或非 `crop=1:1` 的高清大图，彻底杜绝 140px 邮票缩略图入库。
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    def _upgrade_preview_url(u: str) -> str:
+        sp = urlsplit(u)
+        if (
+            sp.netloc.lower() == "preview.redd.it"
+            and sp.path.count("/") == 1
+            and sp.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+        ):
+            return f"https://i.redd.it{sp.path}"
+        return u
+
+    def _score_url(u: str) -> int:
+        sp = urlsplit(u)
+        qs = parse_qs(sp.query)
+        if "i.redd.it" in sp.netloc:
+            return 100_000
+        if "crop" in qs:
+            return 10
+        widths = qs.get("width") or ["0"]
+        try:
+            return max(100, int(widths[0]))
+        except ValueError:
+            return 500
+
+    best_by_asset: Dict[str, str] = {}
+    asset_order: List[str] = []
+    for raw_u in urls:
+        u = _upgrade_preview_url(raw_u)
+        sp = urlsplit(u)
+        asset_name = sp.path.rsplit("/", 1)[-1].lower() if ("redd.it" in sp.netloc) else u
+        if not asset_name:
+            asset_name = u
+        if asset_name not in best_by_asset:
+            asset_order.append(asset_name)
+            best_by_asset[asset_name] = u
+        elif _score_url(u) > _score_url(best_by_asset[asset_name]):
+            best_by_asset[asset_name] = u
+
+    return [best_by_asset[k] for k in asset_order]
+
+
 def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str]]:
-    """从 Reddit Atom HTML 内容中提取纯文本与图片列表，剔除固定页脚。"""
+    """从 Reddit Atom HTML 内容中提取纯文本与去重后的高清图片列表，剔除固定页脚。"""
     if not raw_html:
         return "", []
     parser = _RedditHTMLParser()
@@ -127,7 +184,7 @@ def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str]]:
     footer_idx = raw_text.lower().rfind("submitted by")
     if footer_idx != -1 and ("[link]" in raw_text[footer_idx:].lower() or "[comments]" in raw_text[footer_idx:].lower()):
         raw_text = raw_text[:footer_idx]
-    return clean_post_text(raw_text), parser.image_urls
+    return clean_post_text(raw_text), _deduplicate_reddit_image_urls(parser.image_urls)
 
 
 class RedditHarvester(BasePlatformHarvester):
@@ -162,9 +219,9 @@ class RedditHarvester(BasePlatformHarvester):
             link_el = ent.find("atom:link", ns)
             post_url = link_el.attrib.get("href", "") if link_el is not None else ""
             cat_el = ent.find("atom:category", ns)
-            sub_name = cat_el.attrib.get("term", "reddit") if cat_el is not None else "reddit"
+            sub_name = _strip_reddit_prefix(cat_el.attrib.get("term", "reddit")) if cat_el is not None else "reddit"
             author_el = ent.find("atom:author/atom:name", ns)
-            author_name = (author_el.text or "").lstrip("/u/") if author_el is not None else "redditor"
+            author_name = _strip_reddit_prefix(author_el.text or "") if author_el is not None else "redditor"
             updated_str = ent.find("atom:updated", ns).text if ent.find("atom:updated", ns) is not None else ""
 
             content_el = ent.find("atom:content", ns)
@@ -224,7 +281,7 @@ class RedditHarvester(BasePlatformHarvester):
         `time_filter` 可选: "hour" | "day" | "week" | "month"
         """
         subs = subreddits or DEFAULT_GOLDMINE_SUBREDDITS
-        combined = "+".join(s.strip().lstrip("r/") for s in subs if s.strip())
+        combined = "+".join(_strip_reddit_prefix(s) for s in subs if _strip_reddit_prefix(s))
         url = f"https://www.reddit.com/r/{combined}/{sort}/.rss?t={time_filter}&limit={max(count, 25)}"
         try:
             resp = self.session.get(url, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
@@ -239,7 +296,7 @@ class RedditHarvester(BasePlatformHarvester):
 
     def fetch_user_posts(self, user_id: str, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
         """原语 2：免登拉取指定 Reddit 用户 (`/u/username`) 发布的帖子"""
-        clean_user = str(user_id).lstrip("/u/").lstrip("u/").strip()
+        clean_user = _strip_reddit_prefix(user_id)
         if not clean_user:
             return []
         url = f"https://www.reddit.com/user/{clean_user}/submitted/.rss?limit={count}"
@@ -308,7 +365,7 @@ class RedditHarvester(BasePlatformHarvester):
             for ent in entries[1:]:
                 c_id = (ent.find("atom:id", ns).text or "").replace("t1_", "") if ent.find("atom:id", ns) is not None else ""
                 author_el = ent.find("atom:author/atom:name", ns)
-                author = (author_el.text or "").lstrip("/u/") if author_el is not None else "redditor"
+                author = _strip_reddit_prefix(author_el.text or "") if author_el is not None else "redditor"
                 if author.lower() in ("automoderator", "visualmod"):
                     continue
                 updated_str = ent.find("atom:updated", ns).text if ent.find("atom:updated", ns) is not None else ""
