@@ -32,6 +32,7 @@ from openai import OpenAI
 from app.ai_api.antigravity_client import (
     MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
     get_client as get_antigravity_client,
+    set_sub_account,
 )
 from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
@@ -40,7 +41,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-__all__ = ["generate_content", "probe_models", "ANTIGRAVITY_MODEL_ALIASES"]
+__all__ = ["generate_content", "probe_models", "ANTIGRAVITY_MODEL_ALIASES", "set_sub_account"]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -49,6 +50,7 @@ API_KEY = get_config("local_api_key")
 HIGH_MODEL_LIST = [
     # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
     {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
+    {"model_name": "antigravity-argon-high", "权重": 0.43, "备注": "来源antigravity 本地客户端 (占组内总权重 30%)"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
@@ -60,8 +62,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
-
-
+    {"model_name": "antigravity-3.8-flash-high", "权重": 11.14, "备注": "来源antigravity 本地客户端 (占组内总权重 30%，其余启用项合计=26)"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
@@ -93,7 +94,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 0.94, "备注": "来源antigravity 本地客户端 (占组内总权重 30%，其余启用项合计=2.2)"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
@@ -450,13 +451,18 @@ def _atomic_write_model_usage(path, data):
 
 
 def _format_usage_summary(usage):
-    """将 OpenAI usage 字典提炼为紧凑易读的输入/输出/总计 Token 摘要。"""
+    """将 OpenAI usage 字典提炼为紧凑易读的输入/输出/总计 Token 摘要（若含小号沙箱信息则一并展示）。"""
     if not isinstance(usage, dict):
         return "未知"
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
-    return f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
+    base = f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
+    account_email = usage.get("account_email")
+    if account_email:
+        port = usage.get("sandbox_port")
+        return f"{base} | 账号:{account_email}" + (f"(Port:{port})" if port else "")
+    return base
 
 
 def _save_model_usage(events):
@@ -632,6 +638,8 @@ def generate_content(
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
                     metrics["model_used"] = response_model_name
+                    if isinstance(usage, dict) and usage.get("account_email"):
+                        metrics["account_used"] = usage.get("account_email")
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
                     req_cost = time.perf_counter() - request_started
@@ -646,14 +654,24 @@ def generate_content(
                     request_event["response_model"] = response_model_name
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None) or status_code
+                    failed_account = getattr(exc, "account_email", None)
+                    failed_port = getattr(exc, "sandbox_port", None)
+                    if failed_account:
+                        metrics["account_used"] = failed_account
+                    acc_tag = (
+                        f" | 账号: [{failed_account}" + (f"(Port:{failed_port})]" if failed_port else "]")
+                        if failed_account
+                        else ""
+                    )
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
-                                    f" | Error: {type(exc).__name__}: {exc}")
+                                    + (f" | account: {failed_account}" if failed_account else "")
+                                    + f" | Error: {type(exc).__name__}: {exc}")
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
                     terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                     if attempt < max_retries_per_model:
-                        action = f"等待 {delay:g}s 后重试同模型"
+                        action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
                     elif not terminal:
                         action = f"切换备用模型 {models[model_index + 1]}"
                     else:
@@ -668,7 +686,7 @@ def generate_content(
                     req_cost = time.perf_counter() - request_started
                     if terminal:
                         completion_log = (
-                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]"
+                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]{acc_tag}"
                             f" | 累计尝试: [{metrics['attempts']}] | HTTP: [{status_code or 'N/A'}]"
                             f" | 总耗时: [{time.perf_counter() - started:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 160)}]"
@@ -677,7 +695,7 @@ def generate_content(
                         level = logging.ERROR
                     else:
                         completion_log = (
-                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]"
+                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{acc_tag}"
                             f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
                             f" | HTTP: [{status_code or 'N/A'}] | 耗时: [{req_cost:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
