@@ -117,34 +117,31 @@ class BinanceHarvester(BasePlatformHarvester):
         coins = cfg.get("coins") or []
         download_media = bool(cfg.get("download_media", True))
 
-        logger.info(
-            f"📋 [运维状态/Binance] 账号状态: [免登录模式 (0账号公开接口 + 已启用自营号过滤)] "
-            f"| 采集范围: [推荐流({recommend_count}条) + 关键词({', '.join(keywords)}) + 币种({', '.join(coins)})]"
-        )
-
+        self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
 
         # 1. 首页推荐流
         if recommend_count > 0:
-            for p in self.fetch_hot_or_recommended(count=recommend_count):
+            rec_posts = self.fetch_hot_or_recommended(count=recommend_count)
+            self.last_channel_stats["推荐流"] = len(rec_posts)
+            for p in rec_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
         # 2. 关键词搜索流
         for kw in keywords:
-            for p in self.search_or_topic_posts(query=kw, count=safe_int(cfg.get("per_keyword_count"), 10), is_coin_token=False):
+            kw_posts = self.search_or_topic_posts(query=kw, count=safe_int(cfg.get("per_keyword_count"), 10), is_coin_token=False)
+            self.last_channel_stats[f"关键词:{kw}"] = len(kw_posts)
+            for p in kw_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
         # 3. 热门币种流
         for coin in coins:
-            for p in self.search_or_topic_posts(query=coin, count=safe_int(cfg.get("per_coin_count"), 10), is_coin_token=True):
+            c_posts = self.search_or_topic_posts(query=coin, count=safe_int(cfg.get("per_coin_count"), 6), is_coin_token=True)
+            self.last_channel_stats[f"币种:{coin}"] = len(c_posts)
+            for p in c_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        final_posts = self.normalize_batch(list(by_id.values()), download_media=download_media)
-        logger.info(
-            f"[币安适配器] 本轮采集完成 | 推荐流: [{recommend_count}] | 关键词: [{len(keywords)}] | 币种: [{len(coins)}] "
-            f"| 最终入库候选: [{len(final_posts)}条]"
-        )
-        return final_posts
+        return self.normalize_batch(list(by_id.values()), download_media=download_media)

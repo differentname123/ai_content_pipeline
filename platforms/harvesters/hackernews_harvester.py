@@ -148,14 +148,12 @@ class HackerNewsHarvester(BasePlatformHarvester):
     def fetch_hot_or_recommended(
         self,
         count: int = 15,
-        min_points: int = 40,
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        """原语 1：拉取 HackerNews 首页 (`front_page`) 高赞热帖"""
+        """原语 1：拉取 HackerNews 首页 (`front_page`) 帖子（不做赞数门槛过滤）"""
         url = "https://hn.algolia.com/api/v1/search"
         params = {
             "tags": "front_page",
-            "numericFilters": f"points>={min_points}",
             "hitsPerPage": max(count, 20),
         }
         try:
@@ -164,7 +162,6 @@ class HackerNewsHarvester(BasePlatformHarvester):
                 return []
             hits = resp.json().get("hits") or []
             posts = [self._convert_hit(h) for h in hits if h.get("objectID")]
-            posts.sort(key=lambda x: x["engagement"]["like_count"], reverse=True)
             return posts[:count]
         except Exception as e:
             logger.warning(f"[HN适配器] 拉取首页热榜异常: {e}")
@@ -174,7 +171,6 @@ class HackerNewsHarvester(BasePlatformHarvester):
         self,
         user_id: str,
         count: int = 15,
-        min_points: int = 10,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """原语 2：拉取指定硅谷极客/创始人 (`author_{username}`) 发布的帖子"""
@@ -184,7 +180,6 @@ class HackerNewsHarvester(BasePlatformHarvester):
         url = "https://hn.algolia.com/api/v1/search_by_date"
         params = {
             "tags": f"story,author_{clean_user}",
-            "numericFilters": f"points>={min_points}",
             "hitsPerPage": count,
         }
         try:
@@ -201,13 +196,11 @@ class HackerNewsHarvester(BasePlatformHarvester):
         self,
         query: str,
         count: int = 15,
-        min_points: int = 40,
         hours_back: int = 72,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期高赞科技/商业热帖。
-        自动拆分多关键词并按 `post_id` 去重，避开 Algolia 不支持 `OR` 语法的坑。
+        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期故事（不做赞数过滤）。
         """
         raw_q = str(query or "").replace(",", "|")
         keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
@@ -221,8 +214,8 @@ class HackerNewsHarvester(BasePlatformHarvester):
         for kw in keywords:
             params = {
                 "tags": "story",
-                "numericFilters": f"points>={min_points},created_at_i>={min_ts}",
-                "hitsPerPage": max(10, count),
+                "numericFilters": f"created_at_i>={min_ts}",
+                "hitsPerPage": max(5, count),
             }
             if kw:
                 params["query"] = kw
@@ -236,8 +229,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
             except Exception as e:
                 logger.debug(f"[HN适配器] 搜索关键词 {kw!r} 异常: {e}")
 
-        posts = sorted(by_id.values(), key=lambda x: x["engagement"]["like_count"], reverse=True)
-        return posts[:count]
+        return list(by_id.values())[:count]
 
     def fetch_post_comments(
         self,
@@ -245,7 +237,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         max_comments: int = 8,
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        """原语 4：拉取指定 HN 帖子底下的前排高信息密度神评"""
+        """原语 4：拉取指定 HN 帖子底下的前排评论"""
         clean_id = str(post_id or "").replace("hn_", "").strip()
         if not clean_id:
             return []
@@ -281,29 +273,28 @@ class HackerNewsHarvester(BasePlatformHarvester):
     # ==========================================================================
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         cfg = config or {}
-        limit = safe_int(cfg.get("limit"), 12)
-        min_points = safe_int(cfg.get("min_points"), 50)
+        front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 12)
+        per_keyword_count = safe_int(cfg.get("per_keyword_count"), 3)
         keywords = cfg.get("keywords") or []
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 6)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 5)
 
-        logger.info(
-            f"📋 [运维状态/HackerNews] 账号状态: [免登录模式 (0账号官方Algolia API)] "
-            f"| 采集范围: [首页front_page + 关键词({', '.join(keywords) if isinstance(keywords, list) else keywords})] "
-            f"| 门槛: [points>={min_points}] | 神评富化: [Top {top_n_comments}帖]"
-        )
-
+        self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
-        for p in self.fetch_hot_or_recommended(count=limit, min_points=min_points):
+
+        fp_posts = self.fetch_hot_or_recommended(count=front_page_count)
+        self.last_channel_stats["首页front_page"] = len(fp_posts)
+        for p in fp_posts:
             if self.is_valuable_post(p, cfg):
                 by_id[p["post_id"]] = p
 
-        if keywords:
-            query_str = "|".join(keywords) if isinstance(keywords, list) else str(keywords)
-            for p in self.search_or_topic_posts(query=query_str, count=limit, min_points=max(30, min_points // 2)):
+        for kw in keywords:
+            kw_posts = self.search_or_topic_posts(query=str(kw), count=per_keyword_count)
+            self.last_channel_stats[f"关键词:{kw}"] = len(kw_posts)
+            for p in kw_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        all_posts = sorted(by_id.values(), key=lambda x: x["engagement"]["like_count"], reverse=True)[:limit]
+        all_posts = list(by_id.values())
 
         if top_n_comments > 0 and all_posts:
             for item in all_posts[:top_n_comments]:
@@ -311,9 +302,4 @@ class HackerNewsHarvester(BasePlatformHarvester):
                 if comments:
                     item["comments"] = comments
 
-        final_posts = self.normalize_batch(all_posts, download_media=False)
-        logger.info(
-            f"[HN适配器] 本轮采集完成 | 最低赞数门槛: [{min_points}] | 神评富化: [{min(top_n_comments, len(all_posts))}帖] "
-            f"| 最终入库候选: [{len(final_posts)}条]"
-        )
-        return final_posts
+        return self.normalize_batch(all_posts, download_media=False)

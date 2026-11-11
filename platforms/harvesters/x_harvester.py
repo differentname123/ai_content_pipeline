@@ -769,17 +769,14 @@ class XHarvester(BasePlatformHarvester):
         top_n_for_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 5)
         download_media = bool(cfg.get("download_media", True))
 
-        logger.info(
-            f"📋 [运维状态/X] 账号状态: [{self.burner_account_summary}] "
-            f"| 监控大V({len(handles)}个): [{', '.join('@' + str(h).lstrip('@') for h in handles[:8])}{'...' if len(handles) > 8 else ''}] "
-            f"| 主页推荐流: [{'开启' if (self.has_burner_account and include_home_feed) else '关闭(纯垂直大V采集)'}]"
-        )
-
+        self.last_channel_stats: Dict[str, int] = {}
         collected_by_id: Dict[str, Dict[str, Any]] = {}
 
         # 1. 忠实拉取并记录配置的顶流大 V 时间线（不做主观阈值筛除，交由下游判断）
         for handle in handles:
-            posts = self.fetch_user_posts(handle, count=tweets_per_handle)
+            clean_h = str(handle).lstrip("@").strip()
+            posts = self.fetch_user_posts(clean_h, count=tweets_per_handle)
+            self.last_channel_stats[f"@{clean_h}"] = len(posts)
             for p in posts:
                 if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
@@ -788,17 +785,14 @@ class XHarvester(BasePlatformHarvester):
         # 2. 若开启了小号推荐流或 List 列表流，直接合并记录
         if self.has_burner_account and (include_home_feed or list_id):
             feed_posts = self.fetch_hot_or_recommended(count=safe_int(cfg.get("home_feed_count"), 25), list_id=list_id)
+            self.last_channel_stats["主页/列表流"] = len(feed_posts)
             for p in feed_posts:
                 if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
 
-        all_posts = sorted(
-            collected_by_id.values(),
-            key=lambda x: x["engagement"]["like_count"],
-            reverse=True,
-        )
+        all_posts = list(collected_by_id.values())
 
-        # 3. 为点赞最高的前 N 条推文补充评论树
+        # 3. 为前 N 条推文补充评论树
         if self.has_burner_account and top_n_for_comments > 0:
             for top_p in all_posts[:top_n_for_comments]:
                 comments = self.fetch_post_comments(top_p["post_id"], max_comments=10)
@@ -806,9 +800,4 @@ class XHarvester(BasePlatformHarvester):
                     top_p["comments"] = comments
 
         # 4. 统一抹平差异并并发下载配图至本地 `media_downloads/`
-        final_posts = self.normalize_batch(all_posts, download_media=download_media)
-        logger.info(
-            f"[X适配器] 本轮采集完成 | 扫描大V: [{len(handles)}个] | 账号: [{self.burner_account_summary}] "
-            f"| 记录入库: [{len(final_posts)}条]"
-        )
-        return final_posts
+        return self.normalize_batch(all_posts, download_media=download_media)

@@ -347,12 +347,7 @@ class RedditHarvester(BasePlatformHarvester):
         keywords = cfg.get("keywords")
         download_media = bool(cfg.get("download_media", True))
 
-        logger.info(
-            f"📋 [运维状态/Reddit] 账号状态: [免登录模式 (0账号单请求多板块聚合RSS)] "
-            f"| 监控板块({len(subreddits)}个): [{', '.join('r/' + str(s).lstrip('r/') for s in subreddits[:6])}{'...' if len(subreddits) > 6 else ''}] "
-            f"| 排序: [{sort}/{time_filter}] | 上限: [{limit}条]"
-        )
-
+        self.last_channel_stats: Dict[str, int] = {}
         if keywords:
             query_str = "|".join(keywords) if isinstance(keywords, list) else str(keywords)
             posts = self.search_or_topic_posts(query=query_str, count=limit, subreddits=subreddits, time_filter=time_filter)
@@ -360,8 +355,10 @@ class RedditHarvester(BasePlatformHarvester):
             posts = self.fetch_hot_or_recommended(count=limit, subreddits=subreddits, sort=sort, time_filter=time_filter)
 
         valuable_posts = [p for p in posts if self.is_valuable_post(p, cfg)]
+        for p in valuable_posts:
+            sub = str(((p.get("metadata") or {}).get("platform_extra") or {}).get("subreddit") or "r/reddit")
+            self.last_channel_stats[sub] = self.last_channel_stats.get(sub, 0) + 1
 
-        # 为前 N 条爆款帖拉取高赞神评树
         if top_n_comments > 0 and valuable_posts:
             for item in valuable_posts[:top_n_comments]:
                 post_url = (item.get("metadata") or {}).get("url") or item["post_id"]
@@ -371,9 +368,4 @@ class RedditHarvester(BasePlatformHarvester):
                     item["engagement"]["comment_count"] = max(item["engagement"].get("comment_count", 0), len(comments))
                 time.sleep(0.3)
 
-        final_posts = self.normalize_batch(valuable_posts, download_media=download_media)
-        logger.info(
-            f"[Reddit适配器] 本轮采集完成 | 聚合板块: [{len(subreddits)}个] | 神评富化: [{min(top_n_comments, len(valuable_posts))}帖] "
-            f"| 最终入库候选: [{len(final_posts)}条]"
-        )
-        return final_posts
+        return self.normalize_batch(valuable_posts, download_media=download_media)

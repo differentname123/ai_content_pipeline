@@ -92,31 +92,28 @@ class OkxHarvester(BasePlatformHarvester):
         author_ids = cfg.get("author_ids") or []
         download_media = bool(cfg.get("download_media", True))
 
-        logger.info(
-            f"📋 [运维状态/OKX] 账号状态: [免登录模式 (0账号公开接口 + 已启用自营号过滤)] "
-            f"| 采集范围: [推荐流({recommend_count}条) + 币种({', '.join(coins)}) + 指定博主({len(author_ids)}个)]"
-        )
-
+        self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
 
         if recommend_count > 0:
-            for p in self.fetch_hot_or_recommended(count=recommend_count):
+            rec_posts = self.fetch_hot_or_recommended(count=recommend_count)
+            self.last_channel_stats["推荐流"] = len(rec_posts)
+            for p in rec_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
         for coin in coins:
-            for p in self.search_or_topic_posts(query=coin, count=safe_int(cfg.get("per_coin_count"), 8)):
+            c_posts = self.search_or_topic_posts(query=coin, count=safe_int(cfg.get("per_coin_count"), 5))
+            self.last_channel_stats[f"币种:{coin}"] = len(c_posts)
+            for p in c_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
         for uid in author_ids:
-            for p in self.fetch_user_posts(user_id=uid, count=safe_int(cfg.get("per_user_count"), 8)):
+            u_posts = self.fetch_user_posts(user_id=uid, count=safe_int(cfg.get("per_user_count"), 8))
+            self.last_channel_stats[f"博主:{uid}"] = len(u_posts)
+            for p in u_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        final_posts = self.normalize_batch(list(by_id.values()), download_media=download_media)
-        logger.info(
-            f"[欧易适配器] 本轮采集完成 | 推荐流: [{recommend_count}] | 币种: [{len(coins)}] | 指定博主: [{len(author_ids)}] "
-            f"| 最终入库候选: [{len(final_posts)}条]"
-        )
-        return final_posts
+        return self.normalize_batch(list(by_id.values()), download_media=download_media)

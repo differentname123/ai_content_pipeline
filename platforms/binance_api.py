@@ -904,6 +904,8 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
         return []
 
     clean_feed_list = clean_universal_posts(filtered_feed_list)
+    if count and len(clean_feed_list) > int(count):
+        clean_feed_list = clean_feed_list[: int(count)]
     enrich_stats = {}
     enriched_list = update_posts_in_place(clean_feed_list, _stats_out=enrich_stats)
     logger.info(
