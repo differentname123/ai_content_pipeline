@@ -186,10 +186,11 @@ class HarvestedPostManager(UniversalPostManager):
     def upsert_posts(self, data_list):
         """
         将清洗后的通用 Schema 数据批量安全入库，并自动计算互动历史快照 (`engagement_history`) 与蹿升斜率指标。
+        返回入库统计字典: {"total": int, "new_count": int, "updated_count": int, "cost_ms": float}
         """
         if not data_list:
             logger.debug("[数据库/入库] HarvestedPostManager.upsert_posts 收到空列表，已跳过")
-            return
+            return {"total": 0, "new_count": 0, "updated_count": 0, "cost_ms": 0.0}
 
         source_counter = {}
         ids_by_source = {}
@@ -263,28 +264,7 @@ class HarvestedPostManager(UniversalPostManager):
                 updated_count += 1
                 item["first_seen_at"] = old_doc.get("first_seen_at") or old_doc.get("db_update_time") or now_dt
 
-                # 恢复并追加 engagement_history
                 history = list(old_doc.get("engagement_history") or [])
-                old_eng = old_doc.get("engagement") or {}
-                if not history and old_eng:
-                    old_dt = old_doc.get("db_update_time") or item["first_seen_at"]
-                    old_ts = int(old_dt.timestamp()) if hasattr(old_dt, "timestamp") else (now_ts - 60)
-                    old_str = (
-                        old_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                        if hasattr(old_dt, "strftime")
-                        else now_str
-                    )
-                    history.append({
-                        "ts": old_ts,
-                        "time_str": old_str,
-                        "view_count": int(old_eng.get("view_count") or 0),
-                        "like_count": int(old_eng.get("like_count") or 0),
-                        "comment_count": int(old_eng.get("comment_count") or 0),
-                        "share_count": int(old_eng.get("share_count") or 0),
-                        "bookmark_count": int(old_eng.get("bookmark_count") or 0),
-                        "viral_score": float(old_eng.get("viral_score") or 0.0),
-                    })
-
                 prev_snap = history[-1] if history else cur_snap
                 delta_likes = cur_likes - int(prev_snap.get("like_count") or 0)
                 delta_views = cur_views - int(prev_snap.get("view_count") or 0)
@@ -355,6 +335,12 @@ class HarvestedPostManager(UniversalPostManager):
             f"[数据库/入库] harvested_social_posts 批量写入完成 | 总数: [{len(data_list)}] "
             f"(新增: [{new_count}], 复抓更新快照: [{updated_count}]) | 平台分布: [{source_counter}] | 耗时: [{cost_ms:.1f}ms]"
         )
+        return {
+            "total": len(data_list),
+            "new_count": new_count,
+            "updated_count": updated_count,
+            "cost_ms": round(cost_ms, 1),
+        }
 
 
 

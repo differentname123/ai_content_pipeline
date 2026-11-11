@@ -52,11 +52,11 @@ Reddit 平台专用采集与差异抹平适配器 (RedditHarvester)
 ================================================================================
 """
 import html
+from html.parser import HTMLParser
 import logging
-import re
 import time
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -87,10 +87,47 @@ DEFAULT_GOLDMINE_SUBREDDITS = [
     "antiwork",             # 裁员、高管荒诞邮件与职场金钱冲突
 ]
 
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_HREF_IMG_RE = re.compile(r'href=["\'](https?://(?:i\.redd\.it|preview\.redd\.it|i\.imgur\.com)/[^"\']+)["\']', re.I)
-_IMG_SRC_RE = re.compile(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', re.I)
-_CASHTAG_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
+
+class _RedditHTMLParser(HTMLParser):
+    """使用 Python 标准库 HTMLParser 解析 Reddit Atom `<content>`，零正则提取正文与配图 URL。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_parts: List[str] = []
+        self.image_urls: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attr_dict = dict(attrs)
+        candidate_url = ""
+        if tag == "a":
+            candidate_url = attr_dict.get("href") or ""
+        elif tag == "img":
+            candidate_url = attr_dict.get("src") or ""
+        if candidate_url.startswith(("http://", "https://")):
+            clean_u = html.unescape(candidate_url)
+            if ("i.redd.it" in clean_u or "preview.redd.it" in clean_u or "imgur.com" in clean_u) and clean_u not in self.image_urls:
+                self.image_urls.append(clean_u)
+        if tag in ("p", "br", "div", "li", "tr"):
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.text_parts.append(data)
+
+
+def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str]]:
+    """从 Reddit Atom HTML 内容中提取纯文本与图片列表，剔除固定页脚。"""
+    if not raw_html:
+        return "", []
+    parser = _RedditHTMLParser()
+    parser.feed(raw_html)
+    parser.close()
+    raw_text = "".join(parser.text_parts)
+    # 剥离 Reddit RSS 固定页脚 "submitted by /u/... [link] [comments]"
+    footer_idx = raw_text.lower().rfind("submitted by")
+    if footer_idx != -1 and ("[link]" in raw_text[footer_idx:].lower() or "[comments]" in raw_text[footer_idx:].lower()):
+        raw_text = raw_text[:footer_idx]
+    return clean_post_text(raw_text), parser.image_urls
 
 
 class RedditHarvester(BasePlatformHarvester):
@@ -132,15 +169,8 @@ class RedditHarvester(BasePlatformHarvester):
 
             content_el = ent.find("atom:content", ns)
             raw_html = html.unescape(content_el.text or "") if content_el is not None else ""
+            body_txt, imgs = _parse_reddit_html(raw_html)
 
-            imgs = []
-            for m_img in _HREF_IMG_RE.findall(raw_html) + _IMG_SRC_RE.findall(raw_html):
-                clean_u = html.unescape(m_img)
-                if clean_u not in imgs and ("redd.it" in clean_u or "imgur.com" in clean_u):
-                    imgs.append(clean_u)
-
-            body_txt = clean_post_text(_HTML_TAG_RE.sub(" ", raw_html))
-            body_txt = re.sub(r"submitted by\s+/u/\S+\s+\[link\]\s+\[comments\]", "", body_txt, flags=re.I).strip()
             full_text = f"【Reddit r/{sub_name}】{title}\n{body_txt}".strip() if body_txt else f"【Reddit r/{sub_name}】{title}"
 
             item = self.create_empty_post(card_type="BUZZ_LONG" if len(body_txt) > 500 else "BUZZ_SHORT")
@@ -156,17 +186,16 @@ class RedditHarvester(BasePlatformHarvester):
                 "title": title,
                 "text_content": full_text,
                 "hashtags": [sub_name] if sub_name else [],
-                "mentioned_coins": sorted(set(m.upper() for m in _CASHTAG_RE.findall(full_text))),
+                "mentioned_coins": [],
             })
             item["media"].update({
                 "cover_image": imgs[0] if imgs else None,
                 "images": imgs,
             })
-            # 根据在 24h 热榜中的排名赋予初始梯度热度，便于排序选优
-            rank_bonus = max(30 - idx, 1)
+            # 忠实记录原始值（Reddit Atom RSS 不返回精确赞数/浏览量，在 platform_extra 中记录热榜排名 rank_in_feed）
             item["engagement"].update({
-                "view_count": rank_bonus * 2500,
-                "like_count": rank_bonus * 45,
+                "view_count": 0,
+                "like_count": 0,
                 "comment_count": 0,
             })
             item["metadata"].update({
@@ -235,7 +264,8 @@ class RedditHarvester(BasePlatformHarvester):
         原语 3：按关键词或垂直板块搜索高价值帖子。
         注：为避开 `/search.rss` 的 403/429 封锁，直接单次拉取目标板块 `top` 大池并在本地做多关键词匹配（支持 `|` 分隔）。
         """
-        keywords = [w.strip().lower() for w in re.split(r"[|,]", query or "") if w.strip()]
+        raw_q = str(query or "").replace(",", "|")
+        keywords = [w.strip().lower() for w in raw_q.split("|") if w.strip()]
         pool = self.fetch_hot_or_recommended(
             count=50,
             subreddits=subreddits,
@@ -275,7 +305,7 @@ class RedditHarvester(BasePlatformHarvester):
             entries = root.findall("atom:entry", ns)
             raw_comments = []
             # 第 0 个 entry 是主帖本身，后续 entry 为按热度排序的评论
-            for idx, ent in enumerate(entries[1:]):
+            for ent in entries[1:]:
                 c_id = (ent.find("atom:id", ns).text or "").replace("t1_", "") if ent.find("atom:id", ns) is not None else ""
                 author_el = ent.find("atom:author/atom:name", ns)
                 author = (author_el.text or "").lstrip("/u/") if author_el is not None else "redditor"
@@ -284,13 +314,8 @@ class RedditHarvester(BasePlatformHarvester):
                 updated_str = ent.find("atom:updated", ns).text if ent.find("atom:updated", ns) is not None else ""
                 content_el = ent.find("atom:content", ns)
                 raw_html = html.unescape(content_el.text or "") if content_el is not None else ""
-                c_imgs = []
-                for m_img in _HREF_IMG_RE.findall(raw_html) + _IMG_SRC_RE.findall(raw_html):
-                    clean_u = html.unescape(m_img)
-                    if clean_u not in c_imgs and ("redd.it" in clean_u or "imgur.com" in clean_u):
-                        c_imgs.append(clean_u)
-                txt = clean_post_text(_HTML_TAG_RE.sub(" ", raw_html))
-                if (not txt and not c_imgs) or "[deleted]" in txt or "[removed]" in txt or "I am a bot" in txt:
+                txt, c_imgs = _parse_reddit_html(raw_html)
+                if not txt and not c_imgs:
                     continue
                 raw_comments.append({
                     "reply_id": c_id,
@@ -299,7 +324,7 @@ class RedditHarvester(BasePlatformHarvester):
                     "author_uid": author,
                     "author_name": author,
                     "content": txt,
-                    "likes": max(50 - idx * 5, 5),
+                    "likes": 0,
                     "images": c_imgs,
                 })
                 if len(raw_comments) >= max_comments:

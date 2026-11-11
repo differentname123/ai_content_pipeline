@@ -119,8 +119,7 @@ class BinanceHarvester(BasePlatformHarvester):
 
         logger.info(
             f"📋 [运维状态/Binance] 账号状态: [免登录模式 (0账号公开接口 + 已启用自营号过滤)] "
-            f"| 采集范围: [推荐流({recommend_count}条) + 关键词({', '.join(keywords)}) + 币种({', '.join(coins)})] "
-            f"| 门槛: [赞>={cfg.get('min_likes', 3)} 或 阅>={cfg.get('min_views', 300)}]"
+            f"| 采集范围: [推荐流({recommend_count}条) + 关键词({', '.join(keywords)}) + 币种({', '.join(coins)})]"
         )
 
         by_id: Dict[str, Dict[str, Any]] = {}

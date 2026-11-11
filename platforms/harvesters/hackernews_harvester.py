@@ -41,10 +41,10 @@ HackerNews (硅谷科技/AI/商业热榜) 平台专用采集与差异抹平适�
 ================================================================================
 """
 import html
+from html.parser import HTMLParser
 import logging
-import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -59,7 +59,31 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 15
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+class _SimpleHTMLStripper(HTMLParser):
+    """使用标准库 HTMLParser 将 HN HTML 段落与链接还原为纯文本，零正则。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag in ("p", "br", "pre", "div", "li"):
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+
+def _strip_hn_html(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    stripper = _SimpleHTMLStripper()
+    stripper.feed(html.unescape(raw_html))
+    stripper.close()
+    return clean_post_text("".join(stripper.parts))
 
 
 class HackerNewsHarvester(BasePlatformHarvester):
@@ -79,7 +103,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         """内部核心：将 Algolia hit 节点转换为统一标准 Schema"""
         oid = str(hit.get("objectID") or hit.get("id") or "").strip()
         title = clean_post_text(hit.get("title") or "")
-        story_text = clean_post_text(_HTML_TAG_RE.sub(" ", html.unescape(hit.get("story_text") or "")))
+        story_text = _strip_hn_html(hit.get("story_text") or "")
         story_url = hit.get("url") or f"https://news.ycombinator.com/item?id={oid}"
         points = safe_int(hit.get("points"), 0)
         num_comments = safe_int(hit.get("num_comments"), 0)
@@ -107,7 +131,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
             "mentioned_coins": [],
         })
         item["engagement"].update({
-            "view_count": points * 120 + num_comments * 150,
+            "view_count": 0,
             "like_count": points,
             "comment_count": num_comments,
         })
@@ -185,7 +209,8 @@ class HackerNewsHarvester(BasePlatformHarvester):
         原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期高赞科技/商业热帖。
         自动拆分多关键词并按 `post_id` 去重，避开 Algolia 不支持 `OR` 语法的坑。
         """
-        keywords = [w.strip() for w in re.split(r"[|,]", query or "") if w.strip()]
+        raw_q = str(query or "").replace(",", "|")
+        keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
         min_ts = int(time.time() - hours_back * 3600)
         url = "https://hn.algolia.com/api/v1/search_by_date"
 
@@ -231,9 +256,8 @@ class HackerNewsHarvester(BasePlatformHarvester):
                 return []
             children = resp.json().get("children") or []
             raw_comments = []
-            for idx, c in enumerate(children):
-                raw_c = c.get("text") or ""
-                clean_c = clean_post_text(_HTML_TAG_RE.sub(" ", html.unescape(raw_c)))
+            for c in children:
+                clean_c = _strip_hn_html(c.get("text") or "")
                 if not clean_c:
                     continue
                 raw_comments.append({
@@ -243,7 +267,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
                     "author_uid": str(c.get("author") or "hn_commenter"),
                     "author_name": str(c.get("author") or "hn_commenter"),
                     "content": clean_c[:500],
-                    "likes": max(30 - idx * 3, 3),
+                    "likes": 0,
                 })
                 if len(raw_comments) >= max_comments:
                     break

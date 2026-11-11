@@ -964,6 +964,8 @@ def fetch_okx_user_timeline(
     end_ts=None,
     cookies="",
     extra_headers=None,
+    count=None,
+    full_schema=False,
 ):
     """拉取 OKX 指定用户主页的动态时间线帖子列表 (/priapi/v5/content/public/timeline/1, type=3)"""
     clean_uid = str(author_id or "").strip()
@@ -973,6 +975,7 @@ def fetch_okx_user_timeline(
     url = "https://www.okx.com/priapi/v5/content/public/timeline/1"
     referer = f"https://www.okx.com/zh-hans/orbit/user/{clean_uid}"
     results = []
+    raw_wrappers = []
     seen_ids = set()
     cursor = ""
     page_index = 1
@@ -982,7 +985,7 @@ def fetch_okx_user_timeline(
         while page_index <= max_pages:
             now_ms = str(int(time.time() * 1000))
             params = {
-                "size": 50,
+                "size": min(50, max(10, int(count))) if count else 50,
                 "queryName": clean_uid,
                 "type": 3,
                 "cursor": cursor,
@@ -1031,11 +1034,17 @@ def fetch_okx_user_timeline(
                         reached_older_than_start = True
                         continue
 
+                    raw_wrappers.append(item)
                     results.append({
                         "post_id": cid,
                         "publish_time": pub_ts,
                         "title": str(c_data.get("title") or "")[:80],
                     })
+                    if count and len(results) >= int(count):
+                        break
+
+                if count and len(results) >= int(count):
+                    break
 
                 next_cursor = str(data_obj.get("nextCursor") or "")
                 if (
@@ -1062,6 +1071,9 @@ def fetch_okx_user_timeline(
                     break
                 time.sleep(random.uniform(0.8, 1.5))
 
+    if full_schema or count is not None:
+        cleaned = clean_okx_posts(raw_wrappers[: int(count)] if count else raw_wrappers)
+        return update_okx_posts_in_place(cleaned, cookies=cookies, extra_headers=extra_headers, download_media=False)
     return results
 
 

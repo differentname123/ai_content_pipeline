@@ -68,11 +68,10 @@ import json
 import logging
 import os
 import random
-import re
 import time
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 import requests
 
@@ -170,45 +169,54 @@ X_USER_FEATURES_2026 = {
     "responsive_web_graphql_timeline_navigation_enabled": True,
 }
 
-# 经实测验证的高价值英文大 V 映射表 (guest_realtime=True 表示免登直接拿今日新帖，False 表示需小号拿今日实时流)
+# 经 UserByScreenName 实测验证的高价值英文大 V 映射表 (guest_realtime=True 表示免登直接拿今日新帖，False 表示需小号拿今日实时流)
 VERIFIED_X_ACCOUNTS = {
     # 疯狂赌局与赔率吃瓜
-    "Polymarket": {"uid": "1453319149017255940", "guest_realtime": True, "category": "insane_bets"},
-    "Kalshi": {"uid": "1231667029639028737", "guest_realtime": True, "category": "insane_bets"},
-    "wallstreetbets": {"uid": "2258820554", "guest_realtime": True, "category": "money_drama"},
+    "Polymarket": {"uid": "1261335549215989760", "guest_realtime": True, "category": "insane_bets"},
+    "Kalshi": {"uid": "1071484733543079936", "guest_realtime": True, "category": "insane_bets"},
+    "wallstreetbets": {"uid": "588569122", "guest_realtime": True, "category": "money_drama"},
     # 宏观金钱、国会山内幕与暴富暴负奇闻
-    "KobeissiLetter": {"uid": "928461665529368576", "guest_realtime": True, "category": "macro_money"},
+    "KobeissiLetter": {"uid": "3316376038", "guest_realtime": True, "category": "macro_money"},
     "WatcherGuru": {"uid": "1387497871751196672", "guest_realtime": True, "category": "breaking_money"},
-    "MorningBrew": {"uid": "3256499119", "guest_realtime": True, "category": "biz_story"},
-    "StockMKTNewz": {"uid": "1093569083786420224", "guest_realtime": True, "category": "macro_money"},
-    "Barchart": {"uid": "25574396", "guest_realtime": True, "category": "macro_money"},
-    "charliebilello": {"uid": "188996105", "guest_realtime": True, "category": "macro_money"},
+    "MorningBrew": {"uid": "3092541736", "guest_realtime": True, "category": "biz_story"},
+    "StockMKTNewz": {"uid": "1250830691824283648", "guest_realtime": True, "category": "macro_money"},
+    "Barchart": {"uid": "28212513", "guest_realtime": True, "category": "macro_money"},
+    "charliebilello": {"uid": "1413027896", "guest_realtime": True, "category": "macro_money"},
     # 科技商业暗黑吃瓜与全球猎奇
-    "Dexerto": {"uid": "63566960", "guest_realtime": True, "category": "internet_drama"},
-    "MarioNawfal": {"uid": "1319287761048920064", "guest_realtime": True, "category": "viral_news"},
+    "Dexerto": {"uid": "76766018", "guest_realtime": True, "category": "internet_drama"},
+    "MarioNawfal": {"uid": "1319287761048723458", "guest_realtime": True, "category": "viral_news"},
     "OpenAI": {"uid": "4398626122", "guest_realtime": True, "category": "ai_tech"},
-    "NoContextHumans": {"uid": "1346909976506368001", "guest_realtime": True, "category": "viral_hook"},
-    "historyinmemes": {"uid": "817158724667981825", "guest_realtime": True, "category": "viral_hook"},
-    "buitengebieden": {"uid": "1163913067536416770", "guest_realtime": True, "category": "viral_hook"},
+    "NoContextHumans": {"uid": "1138842105856573445", "guest_realtime": True, "category": "viral_hook"},
+    "historyinmemes": {"uid": "855481986290524160", "guest_realtime": True, "category": "viral_hook"},
+    "buitengebieden": {"uid": "1130021685351079938", "guest_realtime": True, "category": "viral_hook"},
     # 链上巨鲸与清算实锤
-    "CoinGlass_com": {"uid": "1345384116441341954", "guest_realtime": True, "category": "liquidation_drama"},
-    "arkham": {"uid": "1225777832935723009", "guest_realtime": True, "category": "whale_tracker"},
+    "CoinGlass_com": {"uid": "1169095068164050945", "guest_realtime": True, "category": "liquidation_drama"},
+    "arkham": {"uid": "1123403704323805184", "guest_realtime": True, "category": "whale_tracker"},
     "whale_alert": {"uid": "1039833297751302144", "guest_realtime": True, "category": "whale_tracker"},
-    "DefiLlama": {"uid": "1322229621811675137", "guest_realtime": True, "category": "defi_data"},
-    "WuBlockchain": {"uid": "1199257826043527169", "guest_realtime": True, "category": "crypto_scoop"},
+    "DefiLlama": {"uid": "1321585610654687241", "guest_realtime": True, "category": "defi_data"},
+    "WuBlockchain": {"uid": "111533746", "guest_realtime": True, "category": "crypto_scoop"},
     # 重度发帖大V（免登返回历史Top100，小号登录态返回今日实时流）
     "unusual_whales": {"uid": "1200616796295847936", "guest_realtime": False, "category": "insider_money"},
-    "AutismCapital": {"uid": "1531750834167205889", "guest_realtime": False, "category": "tech_drama"},
-    "litcapital": {"uid": "1319101500031975425", "guest_realtime": False, "category": "wallstreet_humor"},
-    "TechEmails": {"uid": "1379886259827257350", "guest_realtime": False, "category": "tech_drama"},
-    "vxunderground": {"uid": "1156027196833292288", "guest_realtime": False, "category": "cyber_drama"},
+    "AutismCapital": {"uid": "1297651178256257024", "guest_realtime": False, "category": "tech_drama"},
+    "litcapital": {"uid": "932630991298007041", "guest_realtime": False, "category": "wallstreet_humor"},
+    "TechEmails": {"uid": "1396491776739905542", "guest_realtime": False, "category": "tech_drama"},
+    "vxunderground": {"uid": "1158139840866791424", "guest_realtime": False, "category": "cyber_drama"},
     "ZeroHedge": {"uid": "18856867", "guest_realtime": False, "category": "macro_money"},
-    "lookonchain": {"uid": "1525093496861532161", "guest_realtime": False, "category": "whale_story"},
+    "lookonchain": {"uid": "1462727797135216641", "guest_realtime": False, "category": "whale_story"},
 }
 
-_TCO_URL_RE = re.compile(r"https?://t\.co/\S+")
-_CASHTAG_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
-_HASHTAG_RE = re.compile(r"#(\w+)")
+def _clean_x_text_with_entities(raw_text: str, legacy: dict) -> str:
+    """利用 X 原生 entities 结构替换或剔除短链 t.co，不依赖脆弱正则"""
+    txt = str(raw_text or "")
+    entities = legacy.get("entities") or {}
+    ext_entities = legacy.get("extended_entities") or {}
+    for u_obj in entities.get("urls") or []:
+        if isinstance(u_obj, dict) and u_obj.get("url"):
+            txt = txt.replace(u_obj["url"], u_obj.get("expanded_url") or "")
+    for m_obj in (ext_entities.get("media") or []) + (entities.get("media") or []):
+        if isinstance(m_obj, dict) and m_obj.get("url"):
+            txt = txt.replace(m_obj["url"], "")
+    return clean_post_text(txt)
 
 
 def _parse_cookie_dict(cookie_str: str) -> dict:
@@ -221,11 +229,14 @@ def _parse_cookie_dict(cookie_str: str) -> dict:
 
 
 def _extract_gql_tweet_objects(data) -> list:
-    """递归提取 GraphQL 响应树中的所有 Tweet 节点（自动解包 TweetWithVisibilityResults）"""
+    """提取 GraphQL 响应树中的 Tweet 节点（自动解包 TweetWithVisibilityResults 并跳过官方 Promoted 广告容器）"""
     found = []
 
     def walk(obj):
         if isinstance(obj, dict):
+            # 跳过 X 官方广告容器节点 (TimelineTimelineItem.itemContent.promotedMetadata)
+            if "promotedMetadata" in obj:
+                return
             tname = obj.get("__typename")
             if tname == "TweetWithVisibilityResults" and isinstance(obj.get("tweet"), dict):
                 walk(obj["tweet"])
@@ -278,10 +289,11 @@ class XHarvester(BasePlatformHarvester):
 
     @property
     def burner_account_uid(self) -> str:
-        """从 Cookie `twid` (如 `u%3D2018873530429698048`) 中提取当前登录小号的数字 UID"""
-        twid = self.cookie_dict.get("twid", "")
-        m = re.search(r"(\d{5,25})", twid)
-        return m.group(1) if m else "未知UID"
+        """从 Cookie `twid` (如 `u%3D903261369499127808`) 中直接解码提取数字 UID"""
+        raw_twid = unquote(self.cookie_dict.get("twid", "")).strip().strip('"')
+        if raw_twid.startswith("u="):
+            return raw_twid[2:]
+        return raw_twid or "未知UID"
 
     @property
     def burner_account_summary(self) -> str:
@@ -293,7 +305,7 @@ class XHarvester(BasePlatformHarvester):
         return f"已启用只读小号 (UID={self.burner_account_uid}, Session={session_dir_name}, token尾号=...{auth_tail})"
 
     def _load_uid_cache(self) -> Dict[str, str]:
-        cache = {k.lower(): v["uid"] for k, v in VERIFIED_X_ACCOUNTS.items()}
+        cache = {}
         if os.path.exists(self.uid_cache_path):
             try:
                 loaded = read_json(self.uid_cache_path)
@@ -301,6 +313,9 @@ class XHarvester(BasePlatformHarvester):
                     cache.update({k.lower(): str(v) for k, v in loaded.items() if v})
             except Exception:
                 pass
+        # 权威校验表覆盖旧缓存，防止历史错误 UID 残留
+        for k, v in VERIFIED_X_ACCOUNTS.items():
+            cache[k.lower()] = v["uid"]
         return cache
 
     def _save_uid_cache(self):
@@ -402,9 +417,21 @@ class XHarvester(BasePlatformHarvester):
 
         note_text = (((tw.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}).get("text")
         raw_text = note_text or legacy.get("full_text") or ""
-        clean_txt = clean_post_text(_TCO_URL_RE.sub("", raw_text))
+        clean_txt = _clean_x_text_with_entities(raw_text, legacy)
 
-        ext_media = (legacy.get("extended_entities") or {}).get("media") or (legacy.get("entities") or {}).get("media") or []
+        entities = legacy.get("entities") or {}
+        hashtags = [
+            str(h.get("text")).strip()
+            for h in (entities.get("hashtags") or [])
+            if isinstance(h, dict) and h.get("text")
+        ]
+        mentioned_coins = [
+            str(s.get("text")).strip().upper()
+            for s in (entities.get("symbols") or [])
+            if isinstance(s, dict) and s.get("text")
+        ]
+
+        ext_media = (legacy.get("extended_entities") or {}).get("media") or entities.get("media") or []
         images = []
         video_url = None
         video_duration = 0
@@ -431,7 +458,7 @@ class XHarvester(BasePlatformHarvester):
         if isinstance(quoted_res, dict) and quoted_res.get("legacy"):
             q_leg = quoted_res["legacy"]
             q_user = (((quoted_res.get("core") or {}).get("user_results") or {}).get("result") or {}).get("legacy") or {}
-            q_txt = clean_post_text(_TCO_URL_RE.sub("", q_leg.get("full_text") or ""))
+            q_txt = _clean_x_text_with_entities(q_leg.get("full_text") or "", q_leg)
             quoted_data = {
                 "post_id": str(quoted_res.get("rest_id") or ""),
                 "username": q_user.get("screen_name", ""),
@@ -457,8 +484,8 @@ class XHarvester(BasePlatformHarvester):
         item["content"].update({
             "title": None,
             "text_content": clean_txt,
-            "hashtags": sorted(set(_HASHTAG_RE.findall(clean_txt))),
-            "mentioned_coins": sorted(set(m.upper() for m in _CASHTAG_RE.findall(clean_txt))),
+            "hashtags": hashtags,
+            "mentioned_coins": mentioned_coins,
         })
         item["media"].update({
             "cover_image": images[0] if images else None,
@@ -478,7 +505,7 @@ class XHarvester(BasePlatformHarvester):
             "url": f"https://x.com/{screen_name}/status/{rest_id}",
             "lang": legacy.get("lang"),
             "category": category,
-            "is_retweet": (legacy.get("full_text") or "").startswith("RT @"),
+            "is_retweet": bool(legacy.get("retweeted_status_result")),
             "quoted_post": quoted_data,
         })
         return self.normalize_post(item, download_media=False)
@@ -549,11 +576,13 @@ class XHarvester(BasePlatformHarvester):
             raw_nodes = _extract_gql_tweet_objects(resp.json())
             by_id = {}
             for node in raw_nodes:
+                legacy_node = node.get("legacy") or {}
+                if exclude_retweets and legacy_node.get("retweeted_status_result"):
+                    continue
+                node_uid = str(legacy_node.get("user_id_str") or "")
+                if node_uid and node_uid != str(uid):
+                    continue
                 item = self._convert_raw_tweet(node, fallback_screen_name=clean_name, category=category)
-                if not clean_name.isdigit() and item["author"]["username"].lower() != clean_name.lower():
-                    continue
-                if exclude_retweets and item["metadata"].get("is_retweet"):
-                    continue
                 by_id[item["post_id"]] = item
 
             posts = sorted(by_id.values(), key=lambda x: int(x["post_id"]), reverse=True)
@@ -606,9 +635,10 @@ class XHarvester(BasePlatformHarvester):
                     nodes = _extract_gql_tweet_objects(resp.json())
                     by_id = {}
                     for node in nodes:
+                        if (node.get("legacy") or {}).get("retweeted_status_result"):
+                            continue
                         item = self._convert_raw_tweet(node, category=f"x_{op.lower()}")
-                        if not item["metadata"].get("is_retweet"):
-                            by_id[item["post_id"]] = item
+                        by_id[item["post_id"]] = item
                     return sorted(by_id.values(), key=lambda x: x["engagement"]["like_count"], reverse=True)[:count]
             except Exception as e:
                 logger.warning(f"[X适配器] 小号 {op} 拉取异常，自动降级免登流: {e}")
@@ -629,10 +659,10 @@ class XHarvester(BasePlatformHarvester):
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词、币种或话题检索高价值推文。
-        注：避开必返 404 的 `SearchTimeline`，直接从目标赛道大 V 池 + 推荐流中聚合匹配关键词（支持以 `|` 分隔多个词）。
+        原语 3：按关键词、币种或话题检索推文。
         """
-        keywords = [w.strip().lower() for w in re.split(r"[|,]", query or "") if w.strip()]
+        raw_q = str(query or "").replace(",", "|")
+        keywords = [w.strip().lower() for w in raw_q.split("|") if w.strip()]
         pool = self.fetch_hot_or_recommended(count=35, fallback_handles=handles)
         if handles:
             for h in handles:
@@ -643,11 +673,10 @@ class XHarvester(BasePlatformHarvester):
         if not keywords:
             return list(by_id.values())[:count]
 
-        matched = []
-        for p in by_id.values():
-            txt = ((p.get("content") or {}).get("text_content") or "").lower()
-            if any(k in txt for k in keywords):
-                matched.append(p)
+        matched = [
+            p for p in by_id.values()
+            if any(k in ((p.get("content") or {}).get("text_content") or "").lower() for k in keywords)
+        ]
         matched.sort(key=lambda x: x["engagement"]["like_count"], reverse=True)
         return matched[:count]
 
@@ -692,6 +721,8 @@ class XHarvester(BasePlatformHarvester):
                 rid = str(node.get("rest_id") or "")
                 if not rid or rid == str(post_id) or rid in seen:
                     continue
+                if not (node.get("legacy") or {}).get("in_reply_to_status_id_str"):
+                    continue
                 seen.add(rid)
                 parsed = self._convert_raw_tweet(node)
                 raw_replies.append({
@@ -732,34 +763,33 @@ class XHarvester(BasePlatformHarvester):
             "unusual_whales",
             "AutismCapital",
         ]
-        tweets_per_handle = safe_int(cfg.get("tweets_per_handle"), 6)
-        include_home_feed = bool(cfg.get("include_home_feed", True))
+        tweets_per_handle = safe_int(cfg.get("tweets_per_handle"), 5)
+        include_home_feed = bool(cfg.get("include_home_feed", False))
         list_id = cfg.get("list_id")
-        top_n_for_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 4)
+        top_n_for_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 5)
         download_media = bool(cfg.get("download_media", True))
 
         logger.info(
             f"📋 [运维状态/X] 账号状态: [{self.burner_account_summary}] "
             f"| 监控大V({len(handles)}个): [{', '.join('@' + str(h).lstrip('@') for h in handles[:8])}{'...' if len(handles) > 8 else ''}] "
-            f"| 主页推荐流: [{'开启' if (self.has_burner_account and include_home_feed) else '关闭'}] "
-            f"| 价值门槛: [赞>={cfg.get('min_likes', 20)} 或 阅>={cfg.get('min_views', 1000)}]"
+            f"| 主页推荐流: [{'开启' if (self.has_burner_account and include_home_feed) else '关闭(纯垂直大V采集)'}]"
         )
 
         collected_by_id: Dict[str, Dict[str, Any]] = {}
 
-        # 1. 拉取配置的顶流大 V 时间线（自动按大 V 特性走免登或小号实时流）
+        # 1. 忠实拉取并记录配置的顶流大 V 时间线（不做主观阈值筛除，交由下游判断）
         for handle in handles:
             posts = self.fetch_user_posts(handle, count=tweets_per_handle)
             for p in posts:
-                if self.is_valuable_post(p, cfg):
+                if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
             time.sleep(random.uniform(0.2, 0.4))
 
-        # 2. 若启用了小号推荐流或 List 列表流，补充全网算法爆款
+        # 2. 若开启了小号推荐流或 List 列表流，直接合并记录
         if self.has_burner_account and (include_home_feed or list_id):
             feed_posts = self.fetch_hot_or_recommended(count=safe_int(cfg.get("home_feed_count"), 25), list_id=list_id)
             for p in feed_posts:
-                if self.is_valuable_post(p, cfg):
+                if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
 
         all_posts = sorted(
@@ -768,17 +798,17 @@ class XHarvester(BasePlatformHarvester):
             reverse=True,
         )
 
-        # 3. 为点赞最高的前 N 条爆款推文拉取高赞神评树（按赞数倒序）
+        # 3. 为点赞最高的前 N 条推文补充评论树
         if self.has_burner_account and top_n_for_comments > 0:
             for top_p in all_posts[:top_n_for_comments]:
                 comments = self.fetch_post_comments(top_p["post_id"], max_comments=10)
                 if comments:
                     top_p["comments"] = comments
 
-        # 4. 统一抹平差异并并发下载配图（含主帖配图与热评配图）至本地 `media_downloads/`
+        # 4. 统一抹平差异并并发下载配图至本地 `media_downloads/`
         final_posts = self.normalize_batch(all_posts, download_media=download_media)
         logger.info(
             f"[X适配器] 本轮采集完成 | 扫描大V: [{len(handles)}个] | 账号: [{self.burner_account_summary}] "
-            f"| 价值过滤后入库候选: [{len(final_posts)}条]"
+            f"| 记录入库: [{len(final_posts)}条]"
         )
         return final_posts

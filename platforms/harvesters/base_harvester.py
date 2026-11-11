@@ -108,43 +108,19 @@ class BasePlatformHarvester(ABC):
             out.append(nc)
         return out
 
-    def is_valuable_post(self, post: Dict[str, Any], config: Dict[str, Any]) -> bool:
+    def is_valuable_post(self, post: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> bool:
         """
-        通用质量守门员：拒绝无意义水帖，确保入库素材具备真实创作价值。
-        支持按 `min_text_length`、`min_likes`、`min_views`、`require_media` 过滤。
+        基础数据有效性校验（仅做非空结构判断，不做主观阈值筛除，把深度质量判断留给下游）：
+        只要包含合法的 `post_id` 且具备正文、标题或媒体（图片/视频）之一，即忠实记录入库。
         """
-        if not isinstance(post, dict) or not post.get("post_id"):
+        if not isinstance(post, dict) or not str(post.get("post_id") or "").strip():
             return False
 
-        text = clean_post_text((post.get("content") or {}).get("text_content") or "")
-        images = (post.get("media") or {}).get("images") or []
-        min_len = safe_int(config.get("min_text_length"), 15)
-
-        # 无图且文字极短的纯水帖直接淘汰
-        if not images and len(text) < min_len:
-            return False
-
-        if config.get("require_media") and not images:
-            return False
-
-        eng = post.get("engagement") or {}
-        likes = safe_int(eng.get("like_count"), 0)
-        views = safe_int(eng.get("view_count"), 0)
-        comments = safe_int(eng.get("comment_count"), 0)
-
-        min_likes = safe_int(config.get("min_likes"), 0)
-        min_views = safe_int(config.get("min_views"), 0)
-        min_comments = safe_int(config.get("min_comments"), 0)
-
-        # 只要满足最低点赞、最低浏览或最低评论之一（或均未设严苛门槛）即放行
-        if min_likes > 0 and likes < min_likes and views < max(min_views, min_likes * 50):
-            return False
-        if min_views > 0 and views < min_views and likes < max(min_likes, 20):
-            return False
-        if min_comments > 0 and comments < min_comments and likes < max(min_likes, 30):
-            return False
-
-        return True
+        content_obj = post.get("content") or {}
+        media_obj = post.get("media") or {}
+        has_text = bool(str(content_obj.get("text_content") or "").strip() or str(content_obj.get("title") or "").strip())
+        has_media = bool(media_obj.get("images") or media_obj.get("inline_images") or media_obj.get("cover_image") or media_obj.get("video_url"))
+        return has_text or has_media
 
     # ==========================================================================
     # 标准调度入口：供上层定时任务统一调用

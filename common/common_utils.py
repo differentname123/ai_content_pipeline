@@ -887,16 +887,14 @@ def compute_cross_platform_engagement(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    跨平台互动量纲对齐与初始蹿升速率计算器：
-    1. 为无原生曝光量字段的平台（Reddit / HackerNews）折算等效 `view_count`；
-    2. 计算跨平台统一的 `viral_score` (0~100)；
-    3. 计算自发布以来的平均每小时涨赞/涨曝光速率 (`likes_per_hour`, `views_per_hour`)。
+    真实互动指标记录与初始速率计算器：
+    1. 100% 忠实记录平台返回的原生互动数据（绝不虚构或乘系数伪造 `view_count` / `like_count`）；
+    2. 计算跨平台基础热度分 `viral_score` 与自发布以来的平均每小时速率 (`likes_per_hour`, `views_per_hour`)。
     """
     import math as _math
     import time as _time
 
     eng = dict(raw_engagement or {})
-    meta = metadata or {}
 
     views = safe_int(eng.get("view_count"), 0)
     likes = safe_int(eng.get("like_count"), 0)
@@ -905,31 +903,11 @@ def compute_cross_platform_engagement(
     quotes = safe_int(eng.get("quote_count"), 0)
     bookmarks = safe_int(eng.get("bookmark_count"), 0)
 
-    src = str(source or "").lower().strip()
-    if src == PLATFORM_REDDIT:
-        if views <= 0:
-            views = max(likes * 80 + comments * 200, 15000)
-        if likes <= 0 and comments > 0:
-            likes = comments * 8
-    elif src == PLATFORM_HACKERNEWS:
-        if views <= 0:
-            views = max(likes * 120 + comments * 150, 10000)
-    elif src == PLATFORM_POLYMARKET:
-        extra = (meta.get("platform_extra") or {}) if isinstance(meta, dict) else {}
-        vol_24h = float(meta.get("volume_24h_usd") or extra.get("volume_24h_usd") or views or 0.0)
-        if views <= 0:
-            views = max(int(vol_24h), 10000)
-        if likes <= 0 and vol_24h > 0:
-            likes = max(int(vol_24h / 200), 20)
-    else:
-        if views <= 0 and (likes > 0 or comments > 0):
-            views = likes * 50 + comments * 120 + shares * 150
-
     weighted_heat = views + likes * 25 + comments * 60 + bookmarks * 80 + shares * 50 + quotes * 70
-    viral_score = round(min(100.0, _math.log10(max(weighted_heat, 1)) * 14.5), 2)
+    viral_score = round(min(100.0, _math.log10(max(weighted_heat, 1)) * 14.5), 2) if weighted_heat > 0 else 0.0
 
     now_ts = int(_time.time())
-    age_hours = max((now_ts - publish_time) / 3600.0, 0.1) if publish_time > 0 else 1.0
+    age_hours = max((now_ts - publish_time) / 3600.0, 0.1) if (publish_time > 0 and now_ts > publish_time) else 1.0
     likes_per_hour = round(likes / age_hours, 2)
     views_per_hour = round(views / age_hours, 2)
 
@@ -941,8 +919,8 @@ def compute_cross_platform_engagement(
         "quote_count": quotes,
         "bookmark_count": bookmarks,
         "viral_score": viral_score,
-        "likes_per_hour": safe_int(eng.get("likes_per_hour"), 0) or likes_per_hour,
-        "views_per_hour": safe_int(eng.get("views_per_hour"), 0) or views_per_hour,
+        "likes_per_hour": float(eng.get("likes_per_hour") or likes_per_hour),
+        "views_per_hour": float(eng.get("views_per_hour") or views_per_hour),
         "delta_likes": safe_int(eng.get("delta_likes"), 0),
         "delta_views": safe_int(eng.get("delta_views"), 0),
         "poll_count": max(safe_int(eng.get("poll_count"), 1), 1),
@@ -971,8 +949,7 @@ def normalize_and_enrich_post_schema(
     base["post_id"] = str(raw_pid).strip() if raw_pid is not None else ""
     base["author_id"] = str(post.get("author_id")).strip() if post.get("author_id") is not None else None
 
-    raw_ts = post.get("publish_time") or post.get("publish_time_str")
-    pub_ts = normalize_publish_timestamp(raw_ts)
+    pub_ts = normalize_publish_timestamp(post.get("publish_time"))
     base["publish_time"] = pub_ts
 
     # 1. Author 严格通用字段提取
@@ -987,8 +964,6 @@ def normalize_and_enrich_post_schema(
     # 2. Metadata 严格通用字段提取 + 平台独有字段收敛至 `platform_extra`
     raw_meta = dict(post.get("metadata") or {}) if isinstance(post.get("metadata"), dict) else {}
     platform_extra = dict(raw_meta.pop("platform_extra", None) or {})
-    # 剔除临时传递用的 top_comments，其余非通用字段全部放入 platform_extra
-    meta_comments = list(raw_meta.pop("top_comments", None) or [])
     universal_meta_keys = {"url", "lang", "is_ai_generated"}
     for mk, mv in list(raw_meta.items()):
         if mk not in universal_meta_keys and mv is not None:
@@ -1001,11 +976,11 @@ def normalize_and_enrich_post_schema(
         "platform_extra": platform_extra,
     }
 
-    # 3. 统一评论列表：合并、保留评论区图片，并按点赞数 (`likes`) 从高到低（最热优先）排序
+    # 3. 统一评论列表：保留评论区图片，并按点赞数 (`likes`) 从高到低（最热优先）排序
     raw_comments = list(post.get("comments") or [])
     normalized_comments = []
     seen_comment_keys = set()
-    for c in raw_comments + meta_comments:
+    for c in raw_comments:
         nc = normalize_comment_item(c, parent_post_id=base["post_id"], default_ts=pub_ts)
         if not nc:
             continue

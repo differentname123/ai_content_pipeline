@@ -60,14 +60,14 @@ class OkxHarvester(BasePlatformHarvester):
 
     def fetch_hot_or_recommended(self, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
         """原语 1：拉取欧易 Orbit 广场推荐流"""
-        raw_posts = fetch_okx_feed(count=count) or []
+        raw_posts = fetch_okx_feed(count=count, download_media=False) or []
         return self.normalize_batch(raw_posts, download_media=False)
 
     def fetch_user_posts(self, user_id: str, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
         """原语 2：拉取指定 OKX 大 V (`author_id`) 主页时间线"""
         if not user_id:
             return []
-        raw_posts = fetch_okx_user_timeline(author_id=str(user_id).strip(), count=count) or []
+        raw_posts = fetch_okx_user_timeline(author_id=str(user_id).strip(), count=count, full_schema=True) or []
         return self.normalize_batch(raw_posts, download_media=False)
 
     def search_or_topic_posts(self, query: str, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
@@ -75,7 +75,7 @@ class OkxHarvester(BasePlatformHarvester):
         coin = str(query or "").strip().upper().lstrip("$")
         if not coin:
             return self.fetch_hot_or_recommended(count=count)
-        raw_posts = fetch_okx_feed(count=count, token=coin) or []
+        raw_posts = fetch_okx_feed(count=count, token=coin, download_media=False) or []
         return self.normalize_batch(raw_posts, download_media=False)
 
     def fetch_post_comments(self, post_id: str, max_comments: int = 10, **kwargs) -> List[Dict[str, Any]]:
@@ -94,8 +94,7 @@ class OkxHarvester(BasePlatformHarvester):
 
         logger.info(
             f"📋 [运维状态/OKX] 账号状态: [免登录模式 (0账号公开接口 + 已启用自营号过滤)] "
-            f"| 采集范围: [推荐流({recommend_count}条) + 币种({', '.join(coins)}) + 指定博主({len(author_ids)}个)] "
-            f"| 门槛: [赞>={cfg.get('min_likes', 2)} 或 阅>={cfg.get('min_views', 200)}]"
+            f"| 采集范围: [推荐流({recommend_count}条) + 币种({', '.join(coins)}) + 指定博主({len(author_ids)}个)]"
         )
 
         by_id: Dict[str, Dict[str, Any]] = {}
