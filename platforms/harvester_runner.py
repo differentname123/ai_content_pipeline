@@ -162,6 +162,9 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
     "xiaohongshu": {},
 }
 
+# 兼容别名
+HARVESTER_CONFIG = PLATFORM_HARVEST_CONFIGS
+
 
 # ==============================================================================
 # 四、核心执行引擎（支持单轮运行 & 常驻定时任务守护）
@@ -315,6 +318,9 @@ def run_harvest_daemon(interval_seconds: Optional[int] = None):
         round_no += 1
         logger.info(f"💤 [定时拉取守护] 本轮结束，休眠 {interval} 秒后进入下一轮...")
         time.sleep(interval)
+
+
+run_continuous_daemon = run_harvest_daemon
 
 
 if __name__ == "__main__":

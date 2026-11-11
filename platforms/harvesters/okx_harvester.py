@@ -11,8 +11,8 @@
 
 2. 当前到底在拉取谁？
    - ① 欧易广场推荐流：`recommend_count` 条（默认 12 条）；
-   - ② 热门币种讨论流：`HARVESTER_CONFIG["okx"]["coins"]`（默认 `["BTC", "ETH", "SOL"]`）；
-   - ③ 指定交易员时间线：`HARVESTER_CONFIG["okx"]["author_ids"]` 中的博主数字 ID。
+   - ② 热门币种讨论流：`PLATFORM_HARVEST_CONFIGS["okx"]["coins"]`（默认 `["BTC", "ETH", "SOL"]`）；
+   - ③ 指定交易员时间线：`PLATFORM_HARVEST_CONFIGS["okx"]["author_ids"]` 中的博主数字 ID。
 
 3. 平常想修改应该怎么改？
    - 【增删监控币种或指定交易员】：直接修改 `platforms/harvester_runner.py` 中 `"okx"` 配置下的 `"coins"` 或 `"author_ids"` 列表。

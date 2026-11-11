@@ -12,7 +12,7 @@ X (Twitter) 平台专用采集与差异抹平适配器 (XHarvester)
    - 若小号未配置或失效，系统会自动降级为纯免登 Guest Token 通道，不会崩溃。
 
 2. 当前到底在拉取谁？
-   - ① 指定大 V 时间线：拉取 `harvester_runner.py` -> `HARVESTER_CONFIG["x"]["kol_handles"]` 中的大 V；
+   - ① 指定大 V 时间线：拉取 `harvester_runner.py` -> `PLATFORM_HARVEST_CONFIGS["x"]["kol_handles"]` 中的大 V；
    - ② 小号算法推荐流：当 `include_home_feed=True` 时，额外拉取小号主页 `HomeTimeline` 爆款；
    - ③ 爆款前排神评：为点赞最高的前 `fetch_comments_for_top_n` 条推文拉取高赞神评（按赞数倒序）。
 

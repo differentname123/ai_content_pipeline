@@ -9,7 +9,7 @@ Reddit 平台专用采集与差异抹平适配器 (RedditHarvester)
    - **否（100% 免登录 / 0 账号模式）**。无需准备任何 Reddit 账号或 Cookie，零封号风险。
 
 2. 当前到底在拉取谁？
-   - 使用 `+` 号单请求聚合拉取 `harvester_runner.py` -> `HARVESTER_CONFIG["reddit"]["subreddits"]`
+   - 使用 `+` 号单请求聚合拉取 `harvester_runner.py` -> `PLATFORM_HARVEST_CONFIGS["reddit"]["subreddits"]`
      配置的 10 个核心英文板块（默认：`r/wallstreetbets`, `r/CryptoCurrency`, `r/stocks`, `r/options`,
      `r/FluentInFinance`, `r/technology`, `r/singularity`, `r/algotrading`, `r/PersonalFinance`, `r/antiwork`）
      过去 24 小时最高赞热帖 (`sort="top"`, `time_filter="day"`)。

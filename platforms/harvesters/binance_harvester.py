@@ -11,8 +11,8 @@
 
 2. 当前到底在拉取谁？
    - ① 首页算法推荐爆款流：`recommend_count` 条（默认 15 条）；
-   - ② 关键词情绪流：`HARVESTER_CONFIG["binance"]["keywords"]`（如 `["爆仓", "实盘", "巨鲸"]`）；
-   - ③ 指定币种讨论流：`HARVESTER_CONFIG["binance"]["coins"]`（如 `["BTC", "ETH", "SOL"]`）；
+   - ② 关键词情绪流：`PLATFORM_HARVEST_CONFIGS["binance"]["keywords"]`（如 `["爆仓", "实盘", "巨鲸"]`）；
+   - ③ 指定币种讨论流：`PLATFORM_HARVEST_CONFIGS["binance"]["coins"]`（如 `["BTC", "ETH", "SOL"]`）；
    - ④ 自动富化：每条入选帖自动拉取完整长文、前 10 条热评 (`sort_by=1` 最热排序) 并下载图片至 `media_downloads/`。
 
 3. 平常想修改应该怎么改？

@@ -10,12 +10,18 @@
 请直接运行或引用 `platforms/harvester_runner.py`。本文件保留别名导出以兼容旧脚本调用。
 """
 from platforms.harvester_runner import (
+    GLOBAL_SCHEDULE_CONFIG,
     HARVESTER_CONFIG,
+    PLATFORM_HARVEST_CONFIGS,
+    PLATFORM_SWITCHES,
+    create_harvester_instance,
     run_continuous_daemon,
+    run_harvest_daemon,
     run_harvest_once,
 )
 from platforms.harvesters import (
     HARVESTER_REGISTRY,
+    NEW_HARVESTED_COLLECTION_NAME,
     BasePlatformHarvester,
     BinanceHarvester,
     HackerNewsHarvester,
@@ -24,12 +30,15 @@ from platforms.harvesters import (
     XiaohongshuHarvester,
     XHarvester,
     ZhihuHarvester,
-    create_harvester,
 )
 
 __all__ = [
+    "PLATFORM_SWITCHES",
+    "GLOBAL_SCHEDULE_CONFIG",
+    "PLATFORM_HARVEST_CONFIGS",
     "HARVESTER_CONFIG",
     "HARVESTER_REGISTRY",
+    "NEW_HARVESTED_COLLECTION_NAME",
     "BasePlatformHarvester",
     "XHarvester",
     "RedditHarvester",
@@ -38,10 +47,11 @@ __all__ = [
     "OkxHarvester",
     "ZhihuHarvester",
     "XiaohongshuHarvester",
-    "create_harvester",
+    "create_harvester_instance",
     "run_harvest_once",
+    "run_harvest_daemon",
     "run_continuous_daemon",
 ]
 
 if __name__ == "__main__":
-    run_harvest_once(save_to_db=True)
+    run_harvest_once()

@@ -10,7 +10,7 @@ HackerNews (硅谷科技/AI/商业热榜) 平台专用采集与差异抹平适�
 
 2. 当前到底在拉取谁？
    - ① 硅谷首页顶流热榜：`tags=front_page` 且赞数 `points >= min_points`（默认 50 赞以上）；
-   - ② 垂直关键词热帖：检索 `harvester_runner.py` -> `HARVESTER_CONFIG["hackernews"]["keywords"]`
+   - ② 垂直关键词热帖：检索 `harvester_runner.py` -> `PLATFORM_HARVEST_CONFIGS["hackernews"]["keywords"]`
      （默认：`["AI", "OpenAI", "Nvidia", "crypto", "million", "lawsuit"]`）近期高赞故事；
    - ③ 前排极客神评：为前 `fetch_comments_for_top_n` 条热帖拉取一级高赞评论树。
 
