@@ -610,14 +610,7 @@ def _enrich_single_post(item, session):
         urls_to_download = set()
         if media_info.get("cover_image"):
             urls_to_download.add(media_info["cover_image"])
-        if media_info.get("video_url"):
-            video_duration = media_info.get("video_duration", 0)
-            if video_duration < 300:
-                urls_to_download.add(media_info["video_url"])
-            else:
-                logger.debug(
-                    f"[币安富化/视频] 视频超长跳过下载 | 帖子ID: [{post_id}] | 时长: [{video_duration}s]"
-                )
+        # 仅下载图片资产（封面图/配图/插图），不下载视频文件到本地，视频仅保留 media.video_url 链接
         for img_url in media_info.get("images", []):
             if img_url:
                 urls_to_download.add(img_url)
@@ -981,6 +974,15 @@ def clean_binance_replies(raw_replies):
             translated_text = translated_data.get("content") or ""
             content = translated_text if translated_text else original_text
 
+        reply_images = []
+        for img_item in (item.get("images") or item.get("imageList") or []):
+            if isinstance(img_item, str) and img_item.strip():
+                reply_images.append(img_item.strip())
+            elif isinstance(img_item, dict):
+                u = img_item.get("url") or img_item.get("imageUrl") or ""
+                if u:
+                    reply_images.append(str(u).strip())
+
         cleaned_data.append({
             "reply_id": item.get("id"),
             "parent_id": item.get("parentContentId"),
@@ -991,6 +993,7 @@ def clean_binance_replies(raw_replies):
             "likes": item.get("likeCount", 0),
             "replies": item.get("replyCount", 0),
             "views": item.get("viewCount", 0),
+            "images": reply_images,
         })
     return cleaned_data
 

@@ -686,6 +686,15 @@ def _format_single_okx_comment(item, default_parent_id):
     reply_root_id = str(item.get("replyRootId") or "0")
     parent_id = default_parent_id if reply_root_id == "0" else reply_root_id
 
+    reply_images = []
+    for img_item in (item.get("imageList") or item.get("images") or []):
+        if isinstance(img_item, str) and img_item.strip():
+            reply_images.append(img_item.strip())
+        elif isinstance(img_item, dict):
+            u = img_item.get("url") or img_item.get("imageUrl") or ""
+            if u:
+                reply_images.append(str(u).strip())
+
     return {
         "reply_id": str(item.get("commentId") or ""),
         "parent_id": str(parent_id),
@@ -696,6 +705,7 @@ def _format_single_okx_comment(item, default_parent_id):
         "likes": _safe_int(item.get("likeNum"), 0),
         "replies": _safe_int(item.get("commentNum"), 0),
         "views": 0,
+        "images": reply_images,
     }
 
 

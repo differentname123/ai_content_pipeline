@@ -31,11 +31,11 @@ class UniversalPostManager:
     COLLECTION_NAME = "social_media_posts"
     UNIQUE_KEYS = ["source", "post_id"]
 
-    def __init__(self, db_instance):
+    def __init__(self, db_instance, collection_name: str = None):
         if not db_instance:
             raise ValueError("必须提供一个有效的 MongoBase 实例")
         self.db = db_instance
-        self.collection_name = self.COLLECTION_NAME
+        self.collection_name = (collection_name or self.COLLECTION_NAME).strip()
         self._ensure_indexes()
 
     @property
@@ -152,6 +152,210 @@ class UniversalPostManager:
     def delete_posts(self, query: dict) -> int:
         """根据查询条件批量删除帖子记录。"""
         return self.db.delete_many(self.collection_name, query)
+
+
+class HarvestedPostManager(UniversalPostManager):
+    """
+    全新独立的多平台高价值帖子入库管理器（使用独立集合 `harvested_social_posts`）。
+    与历史旧集合 `social_media_posts` 100% 物理隔离，互不干扰。
+    支持 X、Reddit、HackerNews、Binance、OKX 以及后续扩展的知乎 (`zhihu`)、小红书 (`xiaohongshu`) 等全部社区帖子。
+
+    核心增强特性：
+    1. 历史数据表现追踪 (`engagement_history`)：每次复抓同一帖子时，自动追加带时间戳的互动快照（最多保留最近 48 个快照点），绝不丢失历史轨迹。
+    2. 蹿升速度计算 (`delta_likes`, `delta_views`, `likes_per_hour`, `views_per_hour`, `poll_count`)：直接赋能下游「潜力黑马帖 / 爆发斜率」识别。
+    3. 非破坏性合并：复抓时保留首次发现时间 `first_seen_at`，并智能合并已下载的本地图片映射 (`media.local_mapping`) 与热评列表 (`comments`)。
+    """
+
+    COLLECTION_NAME = "harvested_social_posts"
+    UNIQUE_KEYS = ["source", "post_id"]
+    MAX_HISTORY_SNAPSHOTS = 48
+
+    def _ensure_indexes(self):
+        super()._ensure_indexes()
+        index_tag = f"{self.collection_name}::surge_idx"
+        if index_tag in _INDEXED_COLLECTIONS:
+            return
+        with _INDEX_LOCK:
+            if index_tag in _INDEXED_COLLECTIONS:
+                return
+            self.db.create_index(self.collection_name, [("engagement.viral_score", -1)], unique=False)
+            self.db.create_index(self.collection_name, [("engagement.likes_per_hour", -1)], unique=False)
+            self.db.create_index(self.collection_name, [("engagement.poll_count", -1)], unique=False)
+            _INDEXED_COLLECTIONS.add(index_tag)
+
+    def upsert_posts(self, data_list):
+        """
+        将清洗后的通用 Schema 数据批量安全入库，并自动计算互动历史快照 (`engagement_history`) 与蹿升斜率指标。
+        """
+        if not data_list:
+            logger.debug("[数据库/入库] HarvestedPostManager.upsert_posts 收到空列表，已跳过")
+            return
+
+        source_counter = {}
+        ids_by_source = {}
+        for i, item in enumerate(data_list):
+            post_id = str(item.get("post_id") or "").strip()
+            source = str(item.get("source") or "").strip()
+            if not post_id or not source:
+                raise ValueError(f"索引 {i} 数据错误: 必须包含完整的 'post_id' 和 'source'")
+            item["post_id"] = post_id
+            item["source"] = source
+            source_counter[source] = source_counter.get(source, 0) + 1
+            ids_by_source.setdefault(source, []).append(post_id)
+
+        # 1. 批量查询库中已存在的同源帖子，用于构建历史快照与计算增量
+        existing_map = {}
+        projection = {
+            "source": 1,
+            "post_id": 1,
+            "publish_time": 1,
+            "first_seen_at": 1,
+            "db_update_time": 1,
+            "engagement": 1,
+            "engagement_history": 1,
+            "media.local_mapping": 1,
+            "comments": 1,
+        }
+        for src, pids in ids_by_source.items():
+            existing_docs = self.db.find_many(
+                self.collection_name,
+                query={"source": src, "post_id": {"$in": list(set(pids))}},
+                projection=projection,
+                limit=len(pids) + 10,
+            )
+            for doc in existing_docs or []:
+                existing_map[(doc.get("source"), str(doc.get("post_id")))] = doc
+
+        now_dt = datetime.now(timezone.utc)
+        now_ts = int(now_dt.timestamp())
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        new_count = 0
+        updated_count = 0
+
+        for item in data_list:
+            key = (item["source"], item["post_id"])
+            old_doc = existing_map.get(key)
+
+            eng = item.setdefault("engagement", {})
+            cur_views = int(eng.get("view_count") or 0)
+            cur_likes = int(eng.get("like_count") or 0)
+            cur_comments = int(eng.get("comment_count") or 0)
+            cur_shares = int(eng.get("share_count") or 0)
+            cur_bookmarks = int(eng.get("bookmark_count") or 0)
+            cur_viral = float(eng.get("viral_score") or 0.0)
+
+            cur_snap = {
+                "ts": now_ts,
+                "time_str": now_str,
+                "view_count": cur_views,
+                "like_count": cur_likes,
+                "comment_count": cur_comments,
+                "share_count": cur_shares,
+                "bookmark_count": cur_bookmarks,
+                "viral_score": cur_viral,
+            }
+
+            pub_ts = int(item.get("publish_time") or 0)
+            age_hours = max((now_ts - pub_ts) / 3600.0, 0.1) if (pub_ts > 0 and now_ts > pub_ts) else 1.0
+
+            if old_doc:
+                updated_count += 1
+                item["first_seen_at"] = old_doc.get("first_seen_at") or old_doc.get("db_update_time") or now_dt
+
+                # 恢复并追加 engagement_history
+                history = list(old_doc.get("engagement_history") or [])
+                old_eng = old_doc.get("engagement") or {}
+                if not history and old_eng:
+                    old_dt = old_doc.get("db_update_time") or item["first_seen_at"]
+                    old_ts = int(old_dt.timestamp()) if hasattr(old_dt, "timestamp") else (now_ts - 60)
+                    old_str = (
+                        old_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        if hasattr(old_dt, "strftime")
+                        else now_str
+                    )
+                    history.append({
+                        "ts": old_ts,
+                        "time_str": old_str,
+                        "view_count": int(old_eng.get("view_count") or 0),
+                        "like_count": int(old_eng.get("like_count") or 0),
+                        "comment_count": int(old_eng.get("comment_count") or 0),
+                        "share_count": int(old_eng.get("share_count") or 0),
+                        "bookmark_count": int(old_eng.get("bookmark_count") or 0),
+                        "viral_score": float(old_eng.get("viral_score") or 0.0),
+                    })
+
+                prev_snap = history[-1] if history else cur_snap
+                delta_likes = cur_likes - int(prev_snap.get("like_count") or 0)
+                delta_views = cur_views - int(prev_snap.get("view_count") or 0)
+
+                elapsed_sec = max(now_ts - int(prev_snap.get("ts") or now_ts), 0)
+                if elapsed_sec >= 60 and (delta_likes > 0 or delta_views > 0):
+                    window_hours = elapsed_sec / 3600.0
+                    likes_per_hour = round(delta_likes / window_hours, 2)
+                    views_per_hour = round(delta_views / window_hours, 2)
+                elif delta_likes > 0 or delta_views > 0:
+                    window_hours = max(elapsed_sec / 3600.0, 1.0 / 60.0)
+                    likes_per_hour = round(delta_likes / window_hours, 2)
+                    views_per_hour = round(delta_views / window_hours, 2)
+                else:
+                    likes_per_hour = round(cur_likes / age_hours, 2)
+                    views_per_hour = round(cur_views / age_hours, 2)
+
+                history.append(cur_snap)
+                if len(history) > self.MAX_HISTORY_SNAPSHOTS:
+                    history = history[-self.MAX_HISTORY_SNAPSHOTS :]
+
+                item["engagement_history"] = history
+                eng["poll_count"] = len(history)
+                eng["delta_likes"] = delta_likes
+                eng["delta_views"] = delta_views
+                eng["likes_per_hour"] = likes_per_hour
+                eng["views_per_hour"] = views_per_hour
+
+                # 非破坏性合并本地图片映射与已拉取的热评
+                old_mapping = (old_doc.get("media") or {}).get("local_mapping") or {}
+                if old_mapping:
+                    cur_media = item.setdefault("media", {})
+                    cur_mapping = cur_media.setdefault("local_mapping", {})
+                    for k_url, v_path in old_mapping.items():
+                        cur_mapping.setdefault(k_url, v_path)
+
+                old_comments = old_doc.get("comments") or []
+                cur_comments_list = item.get("comments") or []
+                if not cur_comments_list and old_comments:
+                    item["comments"] = old_comments
+                elif cur_comments_list and old_comments:
+                    merged_by_id = {str(c.get("reply_id") or ""): c for c in old_comments if isinstance(c, dict)}
+                    for c in cur_comments_list:
+                        if isinstance(c, dict):
+                            rid = str(c.get("reply_id") or "")
+                            if rid in merged_by_id and merged_by_id[rid].get("local_mapping") and not c.get("local_mapping"):
+                                c["local_mapping"] = merged_by_id[rid]["local_mapping"]
+                            merged_by_id[rid] = c
+                    merged_list = list(merged_by_id.values())
+                    merged_list.sort(key=lambda x: int(x.get("likes") or 0), reverse=True)
+                    item["comments"] = merged_list[:30]
+            else:
+                new_count += 1
+                item["first_seen_at"] = now_dt
+                item["engagement_history"] = [cur_snap]
+                eng["poll_count"] = 1
+                eng["delta_likes"] = 0
+                eng["delta_views"] = 0
+                eng["likes_per_hour"] = round(cur_likes / age_hours, 2)
+                eng["views_per_hour"] = round(cur_views / age_hours, 2)
+
+            item["db_update_time"] = now_dt
+
+        start = datetime.now(timezone.utc)
+        self.db.bulk_upsert(self.collection_name, data_list, self.UNIQUE_KEYS)
+        cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+        logger.info(
+            f"[数据库/入库] harvested_social_posts 批量写入完成 | 总数: [{len(data_list)}] "
+            f"(新增: [{new_count}], 复抓更新快照: [{updated_count}]) | 平台分布: [{source_counter}] | 耗时: [{cost_ms:.1f}ms]"
+        )
+
 
 
 class GeneratedArticleManager:
