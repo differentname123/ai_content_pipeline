@@ -30,7 +30,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 from openai import OpenAI
 
 from app.ai_api.antigravity_client import (
+    DEFAULT_QUEUE_TIMEOUT_SECONDS as ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS,
     MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
+    AntigravityQueueBusyError,
     get_client as get_antigravity_client,
     set_sub_account,
 )
@@ -597,10 +599,15 @@ def generate_content(
             # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
             client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
 
-        # : 沿用所有普通请求异常均重试/降级的规则，包括鉴权失败和无有效文本响应。
+        # : 沿用所有普通请求异常均重试/降级的规则；若本地 Antigravity 排队超过 5 秒且有后续非本地模型，则 0 延迟立即切换其他模型。
+        antigravity_pool_busy = False
         for model_index, current_model in enumerate(models):
+            has_non_ag_after = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models[model_index + 1:])
+            if antigravity_pool_busy and current_model in ANTIGRAVITY_MODEL_ALIASES and has_non_ag_after:
+                continue
             delay = 2.0
             for attempt in range(1, max_retries_per_model + 1):
+                fast_switch_model = False
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
                 _log(
@@ -615,11 +622,17 @@ def generate_content(
                 usage_events.append(request_event)
                 try:
                     if current_model in ANTIGRAVITY_MODEL_ALIASES:
+                        ag_queue_timeout = (
+                            ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS
+                            if has_non_ag_after
+                            else min(float(timeout), 30.0)
+                        )
                         reply, usage = get_antigravity_client().ask_with_usage(
                             prompt=ag_prompt,
                             model=current_model,
                             media=ag_media,
                             timeout=timeout,
+                            queue_timeout=ag_queue_timeout,
                         )
                         status_code = 200
                         response_model_name = current_model
@@ -669,13 +682,21 @@ def generate_content(
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
-                    terminal = attempt == max_retries_per_model and model_index == len(models) - 1
-                    if attempt < max_retries_per_model:
-                        action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
-                    elif not terminal:
-                        action = f"切换备用模型 {models[model_index + 1]}"
+                    is_queue_busy = isinstance(exc, AntigravityQueueBusyError)
+                    if is_queue_busy and has_non_ag_after:
+                        antigravity_pool_busy = True
+                        fast_switch_model = True
+                        next_non_ag = next(m for m in models[model_index + 1:] if m not in ANTIGRAVITY_MODEL_ALIASES)
+                        terminal = False
+                        action = f"本地槽位繁忙(排队>{ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS:g}s)，0延迟立即切换模型 {next_non_ag}"
                     else:
-                        action = "所有候选模型尝试耗尽，返回失败结果"
+                        terminal = attempt == max_retries_per_model and model_index == len(models) - 1
+                        if attempt < max_retries_per_model:
+                            action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
+                        elif not terminal:
+                            action = f"切换备用模型 {models[model_index + 1]}"
+                        else:
+                            action = "所有候选模型尝试耗尽，返回失败结果"
                     hint = {
                         400: "请求格式或附件类型不被模型接受，请检查网关协议和附件支持",
                         401: "密钥无效或过期，请检查 local_api_key",
@@ -701,7 +722,7 @@ def generate_content(
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
                             f" | 后续动作: [{action}]"
                         )
-                        level = logging.WARNING
+                        level = logging.INFO if fast_switch_model else logging.WARNING
                 except BaseException as exc:
                     request_event["status"] = "⚠️ 中断"
                     request_event["error"] = _redact(f"[请求中断] {type(exc).__name__}: {exc}")
@@ -713,6 +734,8 @@ def generate_content(
                 _log(completion_log, level)
                 if result["status"] == "✅ 成功":
                     return result
+                if fast_switch_model:
+                    break
                 if attempt < max_retries_per_model:
                     time.sleep(delay)
                     delay = min(delay * 2, 600.0)

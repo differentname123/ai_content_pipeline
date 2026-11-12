@@ -167,19 +167,23 @@ def round_robin_interleave_by_source(
 
 
 class PipelineDB:
-    """统一管理新流水线的只读源查询、确定性入口过滤与各阶段产物持久化。"""
+    """统一管理新流水线的原帖查询、确定性入口过滤与各独立模块产物持久化。"""
+
+    # 绝对禁止触碰的历史旧集合保护名单
+    FORBIDDEN_LEGACY_COLLECTIONS = frozenset({"social_media_posts", "generated_articles"})
 
     def __init__(self, db_instance: Optional[MongoBase] = None):
         self.db: MongoBase = db_instance or gen_db_object()
         self.raw_col = PIPELINE_COLLECTIONS["raw_posts"]
         self.digest_col = PIPELINE_COLLECTIONS["post_digests"]
+        self.direction_col = PIPELINE_COLLECTIONS["directions"]
         self.topic_col = PIPELINE_COLLECTIONS["topic_clusters"]
         self.creation_col = PIPELINE_COLLECTIONS["creations"]
         self.trace_col = PIPELINE_COLLECTIONS["run_traces"]
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
-        tag = f"{self.digest_col}|{self.topic_col}|{self.creation_col}|{self.trace_col}"
+        tag = f"{self.digest_col}|{self.direction_col}|{self.topic_col}|{self.creation_col}|{self.trace_col}"
         if tag in _INDEX_READY:
             return
         with _INDEX_LOCK:
@@ -190,11 +194,16 @@ class PipelineDB:
             self.db.create_index(self.digest_col, [("is_usable", 1), ("publish_time", -1)], unique=False)
             self.db.create_index(self.digest_col, [("digested_at_ts", -1)], unique=False)
 
+            self.db.create_index(self.direction_col, [("direction_id", 1)], unique=True)
+            self.db.create_index(self.direction_col, [("run_id", 1)], unique=False)
+            self.db.create_index(self.direction_col, [("status", 1), ("created_at_ts", -1)], unique=False)
+
             self.db.create_index(self.topic_col, [("topic_id", 1)], unique=True)
             self.db.create_index(self.topic_col, [("run_id", 1)], unique=False)
             self.db.create_index(self.topic_col, [("status", 1), ("created_at_ts", -1)], unique=False)
 
             self.db.create_index(self.creation_col, [("creation_id", 1)], unique=True)
+            self.db.create_index(self.creation_col, [("direction_id", 1)], unique=False)
             self.db.create_index(self.creation_col, [("topic_id", 1)], unique=False)
             self.db.create_index(self.creation_col, [("profile_name", 1), ("created_at_ts", -1)], unique=False)
             self.db.create_index(self.creation_col, [("publish_status", 1), ("created_at_ts", -1)], unique=False)
@@ -205,7 +214,7 @@ class PipelineDB:
             _INDEX_READY.add(tag)
 
     # --------------------------------------------------------------------------
-    # Step 1 -> Step 2 确定性入口过滤查询（严格 publish_time 窗口 + 一刀切排除视频帖）
+    # 模块 1 -> 模块 2 确定性入口过滤查询（严格 publish_time 窗口 + 一刀切排除视频帖）
     # --------------------------------------------------------------------------
     def fetch_recent_raw_posts_with_stats(
         self,
@@ -277,7 +286,7 @@ class PipelineDB:
         return posts
 
     def fetch_raw_posts_by_keys(self, post_keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-        """按 `source:post_id` 列表精确批量取回最新原帖（含最新实时互动快照与本地图片映射）。"""
+        """按 `source:post_id` 列表精确批量取回最新原帖（含最新抓取评论、外链正文与本地图片映射）。"""
         grouped_ids: Dict[str, List[str]] = {}
         for pk in post_keys or []:
             src, pid = split_post_key(pk)
@@ -296,19 +305,48 @@ class PipelineDB:
         return out
 
     # --------------------------------------------------------------------------
-    # Step 2 单帖档案读写 (`pipeline_post_digests`)
+    # 模块 2 单帖档案读写 (`pipeline_post_digests`)
     # --------------------------------------------------------------------------
-    def get_existing_digest_keys(self, post_keys: Sequence[str]) -> Set[str]:
-        """查询哪些 `post_key` 已经成功完成 Step 2 理解，支持幂等增量复用缓存。"""
+    def get_existing_digest_keys(self, post_keys: Sequence[str], max_attempts: int = 3) -> Set[str]:
+        """
+        查询哪些 `post_key` 已经无需再理解：
+        1) `status == "ok"`（已成功理解）；
+        2) `status == "abandoned"` 或累计失败次数 `fail_count >= max_attempts`（满 3 次失败不再死磕重试）。
+        """
         if not post_keys:
             return set()
         docs = self.db.find_many(
             self.digest_col,
-            query={"post_key": {"$in": list(set(post_keys))}, "status": "ok"},
+            query={
+                "post_key": {"$in": list(set(post_keys))},
+                "$or": [
+                    {"status": {"$in": ["ok", "abandoned"]}},
+                    {"fail_count": {"$gte": max(1, int(max_attempts))}},
+                ],
+            },
             projection={"post_key": 1},
             limit=len(post_keys) + 5,
         )
         return {str(d.get("post_key")) for d in (docs or []) if d.get("post_key")}
+
+    def get_digest_fail_counts(self, post_keys: Sequence[str]) -> Dict[str, int]:
+        """读取待重试帖子的历史失败次数 `fail_count`，用于控制最多重试 N 次后自动放弃。"""
+        if not post_keys:
+            return {}
+        docs = self.db.find_many(
+            self.digest_col,
+            query={"post_key": {"$in": list(set(post_keys))}},
+            projection={"post_key": 1, "fail_count": 1, "status": 1},
+            limit=len(post_keys) + 5,
+        )
+        out: Dict[str, int] = {}
+        for d in docs or []:
+            pk = str(d.get("post_key") or "")
+            if not pk:
+                continue
+            fc = int(d.get("fail_count") or (1 if d.get("status") == "failed" else 0))
+            out[pk] = fc
+        return out
 
     def upsert_digests(self, digests: List[Dict[str, Any]]) -> None:
         if not digests:
@@ -318,7 +356,7 @@ class PipelineDB:
             item["updated_at"] = now_dt
         self.db.bulk_upsert(self.digest_col, digests, ["source", "post_id"])
 
-    def fetch_usable_digests(self, lookback_hours: float = 36.0, limit: int = 500) -> List[Dict[str, Any]]:
+    def fetch_usable_digests(self, lookback_hours: float = 48.0, limit: int = 1000) -> List[Dict[str, Any]]:
         """严格按真实发布时间 `publish_time >= cutoff_ts` 获取窗口内全部 `is_usable=True` 的单帖档案。"""
         cutoff_ts = int(time.time() - max(lookback_hours, 1.0) * 3600)
         query = {
@@ -345,30 +383,60 @@ class PipelineDB:
         return {str(d.get("post_key")): d for d in (docs or []) if d.get("post_key")}
 
     # --------------------------------------------------------------------------
-    # Step 3 话题归堆读写 (`pipeline_topic_clusters`)
+    # 模块 3~5 热点方向发现与素材精选读写 (`pipeline_directions`)
     # --------------------------------------------------------------------------
-    def upsert_topics(self, topics: List[Dict[str, Any]]) -> None:
-        if not topics:
+    def upsert_directions(self, directions: List[Dict[str, Any]]) -> None:
+        if not directions:
             return
         now_dt = datetime.now(timezone.utc)
-        for t in topics:
-            t["updated_at"] = now_dt
-        self.db.bulk_upsert(self.topic_col, topics, ["topic_id"])
+        for d in directions:
+            d["updated_at"] = now_dt
+        self.db.bulk_upsert(self.direction_col, directions, ["direction_id"])
 
-    def fetch_pending_topics(self, run_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {"status": "pending_creation"}
+    def fetch_directions_by_status(
+        self,
+        status: str,
+        run_id: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"status": status}
         if run_id:
             query["run_id"] = run_id
         return self.db.find_many(
-            self.topic_col,
+            self.direction_col,
             query=query,
             sort=[("rank", 1), ("created_at_ts", -1)],
             limit=limit,
         ) or []
 
     # --------------------------------------------------------------------------
-    # Step 4 & Step 5 成品读写 (`pipeline_creations`)
+    # 模块 6~7 成品读写与近期已写话题参考 (`pipeline_creations`)
     # --------------------------------------------------------------------------
+    def fetch_recent_created_summaries(self, lookback_hours: float = 72.0, limit: int = 30) -> List[str]:
+        """获取近期已成功产出的创作话题摘要，供热点方向发现模块避免连续重复选同一旧题。"""
+        if lookback_hours <= 0:
+            return []
+        cutoff_ts = int(time.time() - lookback_hours * 3600)
+        docs = self.db.find_many(
+            self.creation_col,
+            query={
+                "created_at_ts": {"$gte": cutoff_ts},
+                "status": "ok",
+                "publish_status": {"$in": ["ready", "pending_review"]},
+            },
+            projection={"topic_summary": 1, "direction_summary": 1},
+            sort=[("created_at_ts", -1)],
+            limit=limit,
+        ) or []
+        summaries: List[str] = []
+        seen = set()
+        for d in docs:
+            s = str(d.get("direction_summary") or d.get("topic_summary") or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                summaries.append(s)
+        return summaries
+
     def fetch_creations_pending_review(self, run_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
         query: Dict[str, Any] = {"status": "ok", "publish_status": "pending_review"}
         if run_id:
@@ -389,7 +457,7 @@ class PipelineDB:
         self.db.bulk_upsert(self.creation_col, creations, ["creation_id"])
 
     # --------------------------------------------------------------------------
-    # 全链路运行轨迹审计 (`pipeline_run_traces`)
+    # 全链路运行轨迹审计 (`pipeline_run_traces`) & 安全隔离清库工具
     # --------------------------------------------------------------------------
     def save_run_trace(self, run_record: Dict[str, Any]) -> None:
         if not run_record or not run_record.get("run_id"):
@@ -397,3 +465,27 @@ class PipelineDB:
         record_copy = dict(run_record)
         record_copy["updated_at"] = datetime.now(timezone.utc)
         self.db.bulk_upsert(self.trace_col, [record_copy], ["run_id"])
+
+    def purge_all_pipeline_collections(self, include_raw_posts: bool = True) -> Dict[str, int]:
+        """
+        安全清空新流水线专属集合中的历史测试数据。
+        内置物理硬断言：100% 严禁触碰 `social_media_posts` 与 `generated_articles` 等旧业务集合。
+        """
+        target_cols = [
+            self.digest_col,
+            self.direction_col,
+            self.topic_col,
+            self.creation_col,
+            self.trace_col,
+        ]
+        if include_raw_posts:
+            target_cols.insert(0, self.raw_col)
+
+        deleted_counts: Dict[str, int] = {}
+        for col_name in target_cols:
+            if col_name in self.FORBIDDEN_LEGACY_COLLECTIONS:
+                raise RuntimeError(f"安全拦截：严禁清理旧版集合 {col_name}!")
+            col_obj = self.db.get_collection(col_name)
+            res = col_obj.delete_many({})
+            deleted_counts[col_name] = int(getattr(res, "deleted_count", 0))
+        return deleted_counts

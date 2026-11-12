@@ -74,17 +74,12 @@ def _validate_crop_pixel_box(
     orig_w: int,
     orig_h: int,
 ) -> Tuple[bool, str]:
-    """仅做基础非退化数学防呆校验（防止异常坐标裁出零尺寸或极端一条线），不设硬编码分辨率门槛。"""
+    """仅做基础非退化数学防呆校验（防止异常坐标裁出零尺寸），不设任何面积比例或长宽比主观拦截。"""
+    _ = (orig_w, orig_h)
     left, top, right, bottom = px_box
     cw, ch = right - left, bottom - top
     if cw < 16 or ch < 16:
         return False, f"裁剪框退化过小({cw}x{ch})"
-    orig_area = max(1, orig_w * orig_h)
-    if (cw * ch) / orig_area < 0.08:
-        return False, f"裁剪面积占比过低({(cw * ch) / orig_area:.1%})"
-    aspect = cw / max(1, ch)
-    if aspect < 0.15 or aspect > 6.0:
-        return False, f"裁剪长宽比极端({aspect:.2f})"
     return True, ""
 
 
@@ -219,18 +214,11 @@ def _stitch_panels(
     panels: List[Image.Image],
     requested_layout: str = "auto",
 ) -> Tuple[Image.Image, str]:
-    """将 2~3 张真实画面按原比例无变形拼接为一张高可读性组合图。"""
+    """将多张真实画面按原比例无变形拼接为一张高可读性组合图。"""
     layout = str(requested_layout or "auto").strip().lower()
-    avg_aspect = sum(im.size[0] / max(1, im.size[1]) for im in panels) / len(panels)
-
     if layout not in ("horizontal", "vertical"):
+        avg_aspect = sum(im.size[0] / max(1, im.size[1]) for im in panels) / len(panels)
         layout = "horizontal" if avg_aspect < 1.18 else "vertical"
-
-    if layout == "vertical":
-        target_w = min(1400, max(im.size[0] for im in panels))
-        projected_h = sum(int(round(im.size[1] * (target_w / max(1, im.size[0])))) for im in panels) + STITCH_GAP_PX * (len(panels) - 1)
-        if projected_h / max(1, target_w) > 2.5:
-            layout = "horizontal"
 
     if layout == "horizontal":
         target_h = min(1350, max(im.size[1] for im in panels))
@@ -267,7 +255,7 @@ def produce_visual_asset(
     output_dir: Path = PIPELINE_VISUAL_DIR,
 ) -> Dict[str, Any]:
     """
-    根据 Step 4 输出的 `visual_plan` 执行确定性真实原图加工，绝不调用任何 AI 生图接口。
+    根据创作模块输出的 `visual_plan` 执行确定性真实原图加工，绝不调用任何 AI 生图接口。
     返回完整的 `visual_trace`（含 `final_image_paths` 列表与首图 `final_image_path`）。
     """
     started = time.perf_counter()
@@ -334,7 +322,7 @@ def produce_visual_asset(
     if requested_action == "stitch" and len(valid_specs) >= 2:
         panels: List[Image.Image] = []
         prefer_png = False
-        for s in valid_specs[:3]:
+        for s in valid_specs:
             if s["source_path"].suffix.lower() == ".png":
                 prefer_png = True
             panel_im, _, p_notes = _process_single_panel(

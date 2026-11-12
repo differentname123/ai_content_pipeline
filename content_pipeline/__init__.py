@@ -1,35 +1,104 @@
 # -*- coding: utf-8 -*-
 """
-独立、通用、提示词驱动的多模态内容理解与原创图文生产流水线 (`content_pipeline`)
+模块化多模态内容生产平台 (`content_pipeline`)
 
-核心设计原则：
-1. 物理隔离零冲突：仅只读消费 `harvested_social_posts`，产物独立存入 `pipeline_*` 系列集合与 `logs/content_pipeline.log`，绝不干扰旧版代码。
-2. 回归第一性原理的三步后处理架构（衔接 Step 1 拉取）：
-   - Step 2 (`step2_comprehension.py`)：单帖「文+图+热评」多模态完整理解，消除不看图盲筛，降维为自洽情报卡。
-   - Step 3 (`step3_topic_grouping.py`)：单窗口全局视野按编号归堆与爆款选题，彻底告别脆弱的自由标签匹配。
-   - Step 4 (`step4_creation.py` + `visual_studio.py`)：X 原生推文创作（无标题/无固定字数框框） + 确定性真实像素配图工坊（无损复用 / 坐标裁剪去外壳 / 原图拼接 / 小角标修复 / 纯文字，禁用 AI 生图与重绘）。
-3. 模型池轮询与提示词解耦：统一接入 `model_api.py` 的 `preset_model_group` 模型组自动容灾，新增或调整账号风格仅需修改 `pipeline_config.py` 或 `prompt/pipeline_v2/*.md`。
-4. 双层可观测性：控制台与主日志紧凑无冗余；数据库与 `logs/runtime/pipeline_traces/` 保留 100% 完整决策链路供复盘调优。
+高内聚 · 低耦合独立组件矩阵：
+- 模块 1 (`platforms.harvester_runner`)        : `harvest_broad_feeds()` / `harvest_by_keywords(keywords)`
+- 模块 2 (`content_pipeline.step2_comprehension`): `run_step2_comprehension()` / `comprehend_posts_by_keys(post_keys)`
+- 模块 3 (`content_pipeline.topic_radar`)        : `discover_hot_directions()` / `run_topic_radar()`
+- 模块 4 (`content_pipeline.direction_expander`) : `expand_direction_across_platforms(direction)`
+- 模块 5 (`content_pipeline.material_curator`)   : `curate_materials_for_direction(direction, digests)`
+- 模块 6 (`content_pipeline.content_creator`)    : `assemble_creation_materials(post_keys)` / `create_from_materials(bundle)`
+- 模块 7 (`content_pipeline.blind_reviewer`)     : `review_single_creation_blind(...)` / `review_and_polish_creation(...)`
+- 模块 8 (`content_pipeline.comment_creator`)    : `generate_comments_from_post(...)` / `generate_comments_for_x_post(...)`
 """
 
+from content_pipeline.blind_reviewer import (
+    review_and_polish_creation,
+    review_single_creation_blind,
+    run_blind_review_batch,
+)
+from content_pipeline.comment_creator import (
+    assemble_comment_bundle,
+    calc_x_weighted_length,
+    fetch_complete_x_post,
+    generate_comments_for_post_key,
+    generate_comments_for_x_post,
+    generate_comments_from_post,
+    get_default_x_session_dir,
+    publish_x_comment,
+)
+from content_pipeline.content_creator import (
+    assemble_creation_materials,
+    create_from_materials,
+    revise_creation_with_feedback,
+    run_content_creation_batch,
+)
+from content_pipeline.direction_expander import (
+    expand_direction_across_platforms,
+    run_direction_expansion_batch,
+)
+from content_pipeline.material_curator import (
+    curate_materials_for_direction,
+    run_material_curation_batch,
+)
 from content_pipeline.pipeline_config import (
     ACTIVE_PROFILE,
+    COMMENT_CREATOR_CONFIG,
     CONTENT_PROFILES,
+    CREATOR_CONFIG,
+    CURATOR_CONFIG,
+    EXPANDER_CONFIG,
     PIPELINE_COLLECTIONS,
+    RADAR_CONFIG,
+    REVIEWER_CONFIG,
     SCHEDULE_CONFIG,
     STAGE_SWITCHES,
     STEP2_CONFIG,
-    STEP3_CONFIG,
-    STEP4_CONFIG,
+)
+from content_pipeline.step2_comprehension import (
+    comprehend_posts_by_keys,
+    run_step2_comprehension,
+)
+from content_pipeline.topic_radar import (
+    discover_hot_directions,
+    run_topic_radar,
 )
 
 __all__ = [
     "ACTIVE_PROFILE",
+    "COMMENT_CREATOR_CONFIG",
     "CONTENT_PROFILES",
     "PIPELINE_COLLECTIONS",
     "SCHEDULE_CONFIG",
     "STAGE_SWITCHES",
     "STEP2_CONFIG",
-    "STEP3_CONFIG",
-    "STEP4_CONFIG",
+    "RADAR_CONFIG",
+    "EXPANDER_CONFIG",
+    "CURATOR_CONFIG",
+    "CREATOR_CONFIG",
+    "REVIEWER_CONFIG",
+    "run_step2_comprehension",
+    "comprehend_posts_by_keys",
+    "discover_hot_directions",
+    "run_topic_radar",
+    "expand_direction_across_platforms",
+    "run_direction_expansion_batch",
+    "curate_materials_for_direction",
+    "run_material_curation_batch",
+    "assemble_creation_materials",
+    "create_from_materials",
+    "revise_creation_with_feedback",
+    "run_content_creation_batch",
+    "review_single_creation_blind",
+    "review_and_polish_creation",
+    "run_blind_review_batch",
+    "assemble_comment_bundle",
+    "calc_x_weighted_length",
+    "fetch_complete_x_post",
+    "generate_comments_from_post",
+    "generate_comments_for_x_post",
+    "generate_comments_for_post_key",
+    "get_default_x_session_dir",
+    "publish_x_comment",
 ]

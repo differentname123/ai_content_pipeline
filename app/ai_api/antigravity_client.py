@@ -80,6 +80,15 @@ MODEL_ALIASES: Dict[str, str] = {
     "gemini-3.8-flash-medium": "MODEL_PLACEHOLDER_M319",
 }
 
+DEFAULT_QUEUE_TIMEOUT_SECONDS: float = 5.0
+FAILED_ACCOUNT_COOLDOWN_SECONDS: float = 90.0
+
+
+class AntigravityQueueBusyError(TimeoutError):
+    """本地 Antigravity 并发槽位已满且排队超过阈值（默认 5 秒）时抛出，供上层网关立即切换其他模型。"""
+
+    pass
+
 DEFAULT_LOG_PATH = Path(os.environ.get("APPDATA", "")) / "Antigravity" / "logs" / "language_server.log"
 HEADLESS_LOG_PATH = Path(os.environ.get("APPDATA", "")) / "Antigravity" / "logs" / "language_server_headless.log"
 DEFAULT_LS_BIN = (
@@ -344,9 +353,11 @@ class AntigravityClient:
         min_stagger_seconds: float = 0.8,
         max_stagger_seconds: float = 1.8,
         sub_account_email: Optional[str] = SUB_ACCOUNT_EMAIL,
+        queue_timeout: Optional[float] = DEFAULT_QUEUE_TIMEOUT_SECONDS,
     ) -> None:
         self.default_model = default_model
         self.timeout = timeout
+        self.queue_timeout = queue_timeout
         self.auto_start = auto_start
         self.sub_account_email = sub_account_email.strip().lower() if sub_account_email else None
         self._lock_key = _sanitize_email_dirname(self.sub_account_email) if self.sub_account_email else "default"
@@ -419,11 +430,15 @@ class AntigravityClient:
         return None
 
     @contextlib.contextmanager
-    def _acquire_account_slot(self, pre_acquired_fd: Optional[int] = None):
+    def _acquire_account_slot(
+        self,
+        pre_acquired_fd: Optional[int] = None,
+        queue_timeout: Optional[float] = None,
+    ):
         """
         获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=2 个跨进程并发槽位）：
         - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
-        - 否则在当前账号的槽位上等待直到空闲。
+        - 否则最多等待 `queue_timeout` 秒（默认 5 秒），若槽位仍全忙则立即抛出 `AntigravityQueueBusyError`。
         """
         if pre_acquired_fd is not None:
             try:
@@ -438,21 +453,41 @@ class AntigravityClient:
                 self._concurrency_sem.release()
             return
 
-        with self._concurrency_sem:
-            locked_fd: Optional[int] = None
+        eff_q_timeout = self.queue_timeout if queue_timeout is None else queue_timeout
+        wait_started = time.perf_counter()
+        if eff_q_timeout is not None and eff_q_timeout >= 0:
+            sem_ok = self._concurrency_sem.acquire(timeout=eff_q_timeout)
+            if not sem_ok:
+                raise AntigravityQueueBusyError(
+                    f"本地 Antigravity 账号 ({self.sub_account_email or 'default'}) 并发槽位已满，排队超过 {eff_q_timeout:.1f}s"
+                )
+        else:
+            self._concurrency_sem.acquire()
+
+        locked_fd: Optional[int] = None
+        try:
             while locked_fd is None:
                 locked_fd = self._try_acquire_os_slot_fd()
                 if locked_fd is None:
-                    time.sleep(random.uniform(0.08, 0.16))
-            try:
-                self._wait_for_stagger_slot()
-                yield
-            finally:
+                    elapsed = time.perf_counter() - wait_started
+                    if eff_q_timeout is not None and eff_q_timeout >= 0 and elapsed >= eff_q_timeout:
+                        raise AntigravityQueueBusyError(
+                            f"本地 Antigravity 账号 ({self.sub_account_email or 'default'}) 跨进程锁槽位繁忙，排队超过 {eff_q_timeout:.1f}s"
+                        )
+                    sleep_s = random.uniform(0.08, 0.15)
+                    if eff_q_timeout is not None and eff_q_timeout >= 0:
+                        sleep_s = min(sleep_s, max(0.01, eff_q_timeout - elapsed))
+                    time.sleep(sleep_s)
+            self._wait_for_stagger_slot()
+            yield
+        finally:
+            if locked_fd is not None:
                 self._unlock_fd(locked_fd)
                 try:
                     os.close(locked_fd)
                 except OSError:
                     pass
+            self._concurrency_sem.release()
 
     def try_claim_idle_slot(self) -> Optional[int]:
         """
@@ -1039,6 +1074,7 @@ class AntigravityClient:
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
         _pre_acquired_fd: Optional[int] = None,
+        queue_timeout: Optional[float] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """
         单账号的统一模型生成接口（走原生 Cascade 会话流，自动无痕清理，并在返回结果与异常上均绑定账号信息）。
@@ -1048,7 +1084,7 @@ class AntigravityClient:
         req_timeout = float(timeout) if timeout is not None else self.timeout
 
         try:
-            with self._acquire_account_slot(pre_acquired_fd=_pre_acquired_fd):
+            with self._acquire_account_slot(pre_acquired_fd=_pre_acquired_fd, queue_timeout=queue_timeout):
                 start_resp = self._post_rpc_inner(
                     "StartCascade",
                     {
@@ -1269,12 +1305,15 @@ class AntigravityPoolClient:
         max_concurrency_per_account: int = 2,
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
+        queue_timeout: Optional[float] = DEFAULT_QUEUE_TIMEOUT_SECONDS,
     ) -> None:
         self.default_model = default_model
         self.timeout = timeout
+        self.queue_timeout = queue_timeout
         self.max_concurrency_per_account = max(1, int(max_concurrency_per_account))
         self._pool_lock = threading.Lock()
         self._workers: Dict[str, AntigravityClient] = {}
+        self._worker_cooldown_until: Dict[str, float] = {}
         self._thread_local = threading.local()
 
         known_sandboxes = sync_all_known_accounts_to_sandboxes()
@@ -1302,6 +1341,7 @@ class AntigravityPoolClient:
                     timeout=self.timeout,
                     max_concurrency=self.max_concurrency_per_account,
                     sub_account_email=norm,
+                    queue_timeout=self.queue_timeout,
                 )
                 self._workers[norm] = worker
             return worker
@@ -1317,22 +1357,40 @@ class AntigravityPoolClient:
         system_prompt: Optional[str] = None,
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
+        queue_timeout: Optional[float] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """
-        从账号池中自动随机挑选支持目标模型且有空闲并发槽位的小号执行请求。
+        从账号池中自动随机挑选支持目标模型且有空闲并发槽位的小号执行请求：
+        - 若所有健康小号并发槽位均繁忙且排队超过 `queue_timeout`（默认 5.0 秒），立即抛出 `AntigravityQueueBusyError`；
+        - 若某个小号发生超时或 RPC 异常，自动对该小号施加短期异常冷却（90 秒），避免后续请求反复卡死在同一故障小号。
         返回 `(reply_text, usage_dict)`，其中 `usage_dict["account_email"]` 为本次实际执行的小号邮箱。
         """
         target_model = AntigravityClient.resolve_model_enum(model or self.default_model)
         candidates = self.get_eligible_workers(target_model)
+        eff_q_timeout = self.queue_timeout if queue_timeout is None else queue_timeout
 
         # 如果同一线程刚刚在某个小号上失败过，优先将其排到队尾，确保重试时自动换号
         last_failed = getattr(self._thread_local, "last_failed_email", None)
 
         chosen_worker: Optional[AntigravityClient] = None
         claimed_fd: Optional[int] = None
+        wait_started = time.perf_counter()
 
         while chosen_worker is None:
-            shuffled = list(candidates)
+            now_ts = time.perf_counter()
+            with self._pool_lock:
+                active_candidates = [
+                    w for w in candidates
+                    if self._worker_cooldown_until.get(w.sub_account_email or "", 0.0) <= now_ts
+                ]
+            if not active_candidates:
+                if eff_q_timeout is not None and eff_q_timeout >= 0:
+                    raise AntigravityQueueBusyError(
+                        "本地 Antigravity 账号池所有小号均处于异常冷却期，立即切换其他模型"
+                    )
+                active_candidates = list(candidates)
+
+            shuffled = list(active_candidates)
             random.shuffle(shuffled)
             if last_failed and len(shuffled) > 1:
                 shuffled.sort(key=lambda w: 1 if w.sub_account_email == last_failed else 0)
@@ -1345,8 +1403,17 @@ class AntigravityPoolClient:
                     break
 
             if chosen_worker is None:
-                time.sleep(random.uniform(0.08, 0.16))
+                elapsed = time.perf_counter() - wait_started
+                if eff_q_timeout is not None and eff_q_timeout >= 0 and elapsed >= eff_q_timeout:
+                    raise AntigravityQueueBusyError(
+                        f"本地 Antigravity 账号池并发槽位繁忙 ({len(active_candidates)} 个可用小号均满载)，排队超过 {eff_q_timeout:.1f}s"
+                    )
+                sleep_s = random.uniform(0.08, 0.15)
+                if eff_q_timeout is not None and eff_q_timeout >= 0:
+                    sleep_s = min(sleep_s, max(0.01, eff_q_timeout - elapsed))
+                time.sleep(sleep_s)
 
+        worker_email = chosen_worker.sub_account_email or ""
         try:
             reply, usage = chosen_worker.ask_with_usage(
                 prompt=prompt,
@@ -1355,11 +1422,18 @@ class AntigravityPoolClient:
                 media=media,
                 timeout=timeout,
                 _pre_acquired_fd=claimed_fd,
+                queue_timeout=eff_q_timeout,
             )
             self._thread_local.last_failed_email = None
+            if worker_email:
+                with self._pool_lock:
+                    self._worker_cooldown_until.pop(worker_email, None)
             return reply, usage
         except Exception as exc:
-            self._thread_local.last_failed_email = chosen_worker.sub_account_email
+            self._thread_local.last_failed_email = worker_email or None
+            if worker_email:
+                with self._pool_lock:
+                    self._worker_cooldown_until[worker_email] = time.perf_counter() + FAILED_ACCOUNT_COOLDOWN_SECONDS
             if not getattr(exc, "account_email", None):
                 setattr(exc, "account_email", chosen_worker.sub_account_email)
             raise
@@ -1371,6 +1445,7 @@ class AntigravityPoolClient:
         system_prompt: Optional[str] = None,
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
+        queue_timeout: Optional[float] = None,
     ) -> str:
         reply, _ = self.ask_with_usage(
             prompt=prompt,
@@ -1378,6 +1453,7 @@ class AntigravityPoolClient:
             system_prompt=system_prompt,
             media=media,
             timeout=timeout,
+            queue_timeout=queue_timeout,
         )
         return reply
 
@@ -1388,6 +1464,7 @@ class AntigravityPoolClient:
         system_prompt: Optional[str] = None,
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
+        queue_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         json_instruction = (
             (system_prompt or "")
@@ -1399,6 +1476,7 @@ class AntigravityPoolClient:
             system_prompt=json_instruction,
             media=media,
             timeout=timeout,
+            queue_timeout=queue_timeout,
         ).strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)

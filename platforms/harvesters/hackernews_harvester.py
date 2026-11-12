@@ -40,6 +40,7 @@ HackerNews (硅谷科技/AI/商业热榜) 平台专用采集与差异抹平适�
    - 失败原因：只返回一串数字 ID 数组 `[40123, 40124, ...]`，若要拉 30 条帖子+评论需要发 100+ 次串行请求，极慢且冗余。
 ================================================================================
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 from html.parser import HTMLParser
 import logging
@@ -53,6 +54,7 @@ from common.common_utils import (
     clean_post_text,
     safe_int,
 )
+from platforms.external_link_extractor import enrich_posts_with_external_articles
 from platforms.harvesters.base_harvester import BasePlatformHarvester
 
 logger = logging.getLogger(__name__)
@@ -89,7 +91,7 @@ def _strip_hn_html(raw_html: str) -> str:
 class HackerNewsHarvester(BasePlatformHarvester):
     """
     HackerNews 平台采集与归一化适配器（100% 免登录、官方 Algolia API）。
-    提供硅谷科技巨头内幕、AI 突破、商业奇闻与高智商神评素材。
+    提供硅谷科技巨头内幕、AI 突破、商业奇闻、外链全文与高智商神评素材。
     """
 
     SOURCE_NAME = PLATFORM_HACKERNEWS
@@ -142,30 +144,138 @@ class HackerNewsHarvester(BasePlatformHarvester):
         })
         return self.normalize_post(item, download_media=False)
 
+    def _attach_comments_concurrent(
+        self,
+        posts: List[Dict[str, Any]],
+        top_n_comments: int = 50,
+        max_comments_per_post: int = 10,
+    ) -> None:
+        if top_n_comments <= 0 or not posts:
+            return
+        comment_targets = [
+            p for p in posts
+            if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0 and not (p.get("comments") or [])
+        ]
+        if not comment_targets:
+            return
+        comment_targets.sort(
+            key=lambda p: (
+                safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2
+                + safe_int((p.get("engagement") or {}).get("like_count"), 0)
+            ),
+            reverse=True,
+        )
+        selected = comment_targets[:top_n_comments]
+        with ThreadPoolExecutor(max_workers=min(6, len(selected))) as pool:
+            fut_map = {
+                pool.submit(self.fetch_post_comments, item["post_id"], max_comments=max_comments_per_post): item
+                for item in selected
+            }
+            for fut in as_completed(fut_map):
+                target_item = fut_map[fut]
+                try:
+                    comments = fut.result()
+                    if comments:
+                        target_item["comments"] = comments
+                except Exception:
+                    pass
+
     # ==========================================================================
     # 四大通用原语实现
     # ==========================================================================
     def fetch_hot_or_recommended(
         self,
-        count: int = 15,
+        count: int = 20,
+        include_24h_top: bool = True,
+        min_24h_points: int = 50,
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        """原语 1：拉取 HackerNews 首页 (`front_page`) 帖子（不做赞数门槛过滤）"""
+        """原语 1：拉取 HackerNews 首页 (`front_page`) + 过去 24h 高赞故事榜（防止刚滑出前 30 名的当日大爆帖漏抓）"""
         url = "https://hn.algolia.com/api/v1/search"
-        params = {
-            "tags": "front_page",
-            "hitsPerPage": max(count, 20),
-        }
+        by_id: Dict[str, Dict[str, Any]] = {}
+        self._last_fp_count = 0
+        self._last_24h_count = 0
+
         try:
-            resp = self.session.get(url, params=params, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+            resp = self.session.get(
+                url,
+                params={"tags": "front_page", "hitsPerPage": max(count, 30)},
+                proxies=self.proxies,
+                timeout=REQUEST_TIMEOUT,
+            )
             if resp.status_code != 200:
-                return []
-            hits = resp.json().get("hits") or []
-            posts = [self._convert_hit(h) for h in hits if h.get("objectID")]
-            return posts[:count]
+                self.record_health_issue(
+                    code="HN_FRONT_PAGE_HTTP_ERR",
+                    message=f"HackerNews Algolia front_page 返回 HTTP {resp.status_code}",
+                    level="critical",
+                    channel="首页front_page",
+                )
+            else:
+                hits = resp.json().get("hits") or []
+                for h in hits:
+                    if h.get("objectID"):
+                        item = self._convert_hit(h)
+                        by_id[item["post_id"]] = item
+                        self._last_fp_count += 1
+                if self._last_fp_count == 0:
+                    self.record_health_issue(
+                        code="HN_FRONT_PAGE_EMPTY",
+                        message="HackerNews Algolia front_page 返回 0 条，疑似接口结构变更",
+                        level="critical",
+                        channel="首页front_page",
+                    )
         except Exception as e:
-            logger.warning(f"[HN适配器] 拉取首页热榜异常: {e}")
-            return []
+            self.record_health_issue(
+                code="HN_FRONT_PAGE_EXCEPTION",
+                message=f"拉取首页 front_page 网络异常: {e}",
+                level="critical",
+                channel="首页front_page",
+            )
+
+        if include_24h_top:
+            min_24h_ts = int(time.time() - 86400)
+            try:
+                resp_24h = self.session.get(
+                    url,
+                    params={
+                        "tags": "story",
+                        "numericFilters": f"created_at_i>={min_24h_ts},points>={max(10, min_24h_points)}",
+                        "hitsPerPage": max(count, 30),
+                    },
+                    proxies=self.proxies,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp_24h.status_code == 200:
+                    for h in resp_24h.json().get("hits") or []:
+                        if h.get("objectID"):
+                            item = self._convert_hit(h)
+                            self._last_24h_count += 1
+                            by_id.setdefault(item["post_id"], item)
+                else:
+                    self.record_health_issue(
+                        code="HN_24H_HTTP_ERR",
+                        message=f"HN 24h 高赞故事榜返回 HTTP {resp_24h.status_code}",
+                        level="warning",
+                        channel="24h高赞榜",
+                    )
+            except Exception as e:
+                self.record_health_issue(
+                    code="HN_24H_EXCEPTION",
+                    message=f"拉取 24h 高赞故事榜异常: {e}",
+                    level="warning",
+                    channel="24h高赞榜",
+                )
+
+        ranked = sorted(
+            by_id.values(),
+            key=lambda p: (
+                safe_int((p.get("engagement") or {}).get("like_count"), 0)
+                + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2,
+                safe_int(p.get("publish_time"), 0),
+            ),
+            reverse=True,
+        )
+        return ranked[:count]
 
     def fetch_user_posts(
         self,
@@ -195,46 +305,136 @@ class HackerNewsHarvester(BasePlatformHarvester):
     def search_or_topic_posts(
         self,
         query: str,
-        count: int = 15,
+        count: int = 20,
         hours_back: int = 72,
+        fetch_comments: bool = False,
+        fetch_external_links: bool = False,
+        download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期故事（不做赞数过滤）。
+        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期故事（同时覆盖相关度排序与最新时间排序）。
+        注：HackerNews 为纯英文极客科技社区，自动跳过纯中文词或剥离中英混写中的中文字符，避免 Algolia 全词 AND 误返 0 条。
         """
-        raw_q = str(query or "").replace(",", "|")
-        keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
-        min_ts = int(time.time() - hours_back * 3600)
-        url = "https://hn.algolia.com/api/v1/search_by_date"
+        import re as _re
 
-        if not keywords:
-            keywords = [""]
+        reset_health = bool(kwargs.get("reset_health", True))
+        if reset_health:
+            self.reset_health_state()
+
+        raw_q = str(query or "").replace(",", "|")
+        raw_keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
+        min_ts = int(time.time() - max(1, hours_back) * 3600)
+
+        english_keywords: List[str] = []
+        seen_en = set()
+        if not raw_keywords:
+            english_keywords = [""]
+        else:
+            for kw in raw_keywords:
+                if all(ord(ch) < 128 for ch in kw):
+                    clean_en = " ".join(kw.split())
+                else:
+                    ascii_tokens = [t for t in _re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-_+#]*", kw) if len(t) >= 2]
+                    clean_en = " ".join(ascii_tokens)
+                if clean_en and clean_en.lower() not in seen_en:
+                    seen_en.add(clean_en.lower())
+                    english_keywords.append(clean_en)
+
+        if raw_keywords and not english_keywords:
+            self.last_search_note = "纯中文查询词（HackerNews为纯英文科技社区，无中文帖）"
+            return []
+        self.last_search_note = f"英文检索词:{','.join(english_keywords[:4])}"
 
         by_id: Dict[str, Dict[str, Any]] = {}
-        for kw in keywords:
-            params = {
-                "tags": "story",
-                "numericFilters": f"created_at_i>={min_ts}",
-                "hitsPerPage": max(5, count),
-            }
-            if kw:
-                params["query"] = kw
-            try:
-                resp = self.session.get(url, params=params, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
-                if resp.status_code == 200:
-                    for h in resp.json().get("hits") or []:
-                        if h.get("objectID"):
-                            item = self._convert_hit(h)
-                            by_id[item["post_id"]] = item
-            except Exception as e:
-                logger.debug(f"[HN适配器] 搜索关键词 {kw!r} 异常: {e}")
+        per_kw = max(10, count)
+        req_total = 0
+        req_failed = 0
 
-        return list(by_id.values())[:count]
+        def _query_algolia(q_str: str) -> int:
+            nonlocal req_total, req_failed
+            added_cnt = 0
+            for endpoint in ("https://hn.algolia.com/api/v1/search", "https://hn.algolia.com/api/v1/search_by_date"):
+                req_total += 1
+                params = {
+                    "tags": "story",
+                    "numericFilters": f"created_at_i>={min_ts}",
+                    "hitsPerPage": per_kw,
+                }
+                if q_str:
+                    params["query"] = q_str
+                try:
+                    resp = self.session.get(endpoint, params=params, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+                    if resp.status_code == 200:
+                        for h in resp.json().get("hits") or []:
+                            if h.get("objectID"):
+                                item = self._convert_hit(h)
+                                if item["post_id"] not in by_id:
+                                    added_cnt += 1
+                                by_id[item["post_id"]] = item
+                    else:
+                        req_failed += 1
+                except Exception as e:
+                    req_failed += 1
+                    logger.debug(f"[HN适配器] 搜索关键词 {q_str!r} 异常: {e}")
+            return added_cnt
+
+        for kw in english_keywords:
+            hits = _query_algolia(kw)
+            # 若调用方传入了 3 个词以上的长短语，Algolia 默认严格全词 AND 易返回 0 条，自动回退核心双词组合检索
+            if hits == 0 and kw:
+                tokens = [t for t in kw.split() if len(t) >= 2 and any(c.isascii() and c.isalnum() for c in t)]
+                if len(tokens) >= 3:
+                    sub_queries = [" ".join(tokens[:2]), " ".join(tokens[-2:])]
+                    for sq in dict.fromkeys(sub_queries):
+                        _query_algolia(sq)
+
+        if req_total > 0 and req_failed == req_total:
+            self.record_health_issue(
+                code="HN_SEARCH_API_UNREACHABLE",
+                message=f"HackerNews Algolia 搜索请求全部失败 ({req_failed}/{req_total})，请检查网络或代理",
+                level="critical",
+                channel="Algolia搜索",
+            )
+        elif req_failed > 0:
+            self.record_health_issue(
+                code="HN_SEARCH_PARTIAL_FAIL",
+                message=f"HackerNews Algolia 搜索部分请求异常 ({req_failed}/{req_total})",
+                level="warning",
+                channel="Algolia搜索",
+            )
+
+        results = sorted(
+            by_id.values(),
+            key=lambda p: (
+                safe_int((p.get("engagement") or {}).get("like_count"), 0)
+                + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2,
+                safe_int(p.get("publish_time"), 0),
+            ),
+            reverse=True,
+        )[:count]
+
+        if fetch_comments and results:
+            self._attach_comments_concurrent(results, top_n_comments=len(results), max_comments_per_post=10)
+        if fetch_external_links and results:
+            enrich_posts_with_external_articles(results, proxies=self.proxies)
+        if download_media or fetch_external_links or fetch_comments:
+            results = self.normalize_batch(results, download_media=download_media)
+
+        if reset_health:
+            self.audit_posts_quality(
+                results,
+                scene="search",
+                expect_comments=fetch_comments,
+                expect_media_download=download_media,
+                max_fresh_age_hours=max(72, hours_back or 72),
+            )
+        return [p for p in results if self.is_valuable_post(p)]
 
     def fetch_post_comments(
         self,
         post_id: str,
-        max_comments: int = 8,
+        max_comments: int = 10,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """原语 4：拉取指定 HN 帖子底下的前排评论"""
@@ -243,7 +443,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
             return []
         url = f"https://hn.algolia.com/api/v1/items/{clean_id}"
         try:
-            resp = self.session.get(url, proxies=self.proxies, timeout=10)
+            resp = requests.get(url, headers={"User-Agent": DEFAULT_UA}, proxies=self.proxies, timeout=10)
             if resp.status_code != 200:
                 return []
             children = resp.json().get("children") or []
@@ -272,45 +472,51 @@ class HackerNewsHarvester(BasePlatformHarvester):
     # 标准调度入口：供上层定时任务调用
     # ==========================================================================
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        self.reset_health_state()
         cfg = config or {}
-        front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 12)
-        per_keyword_count = safe_int(cfg.get("per_keyword_count"), 3)
+        front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 20)
+        include_24h_top = bool(cfg.get("include_24h_top", True))
+        min_24h_points = safe_int(cfg.get("min_24h_points"), 50)
+        per_keyword_count = safe_int(cfg.get("per_keyword_count"), 4)
         keywords = cfg.get("keywords") or []
         top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 50)
+        fetch_ext_links = bool(cfg.get("fetch_external_links", True))
+        download_media = bool(cfg.get("download_media", True))
 
         self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}
 
-        fp_posts = self.fetch_hot_or_recommended(count=front_page_count)
-        self.last_channel_stats["首页front_page"] = len(fp_posts)
+        fp_posts = self.fetch_hot_or_recommended(
+            count=front_page_count,
+            include_24h_top=include_24h_top,
+            min_24h_points=min_24h_points,
+        )
+        self.last_channel_stats["首页front_page"] = getattr(self, "_last_fp_count", len(fp_posts))
+        if include_24h_top:
+            self.last_channel_stats["24h高赞榜"] = getattr(self, "_last_24h_count", 0)
         for p in fp_posts:
             if self.is_valuable_post(p, cfg):
                 by_id[p["post_id"]] = p
 
         for kw in keywords:
-            kw_posts = self.search_or_topic_posts(query=str(kw), count=per_keyword_count)
+            kw_posts = self.search_or_topic_posts(query=str(kw), count=per_keyword_count, reset_health=False)
             self.last_channel_stats[f"关键词:{kw}"] = len(kw_posts)
             for p in kw_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
         all_posts = list(by_id.values())
+        self._attach_comments_concurrent(all_posts, top_n_comments=top_n_comments, max_comments_per_post=10)
+        if fetch_ext_links and all_posts:
+            ext_cnt = enrich_posts_with_external_articles(all_posts, proxies=self.proxies)
+            self.last_channel_stats["外链正文富化"] = ext_cnt
 
-        if top_n_comments > 0 and all_posts:
-            comment_targets = [
-                p for p in all_posts
-                if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0
-            ]
-            comment_targets.sort(
-                key=lambda p: (
-                    safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2
-                    + safe_int((p.get("engagement") or {}).get("like_count"), 0)
-                ),
-                reverse=True,
-            )
-            for item in comment_targets[:top_n_comments]:
-                comments = self.fetch_post_comments(item["post_id"], max_comments=10)
-                if comments:
-                    item["comments"] = comments
-
-        return self.normalize_batch(all_posts, download_media=False)
+        final_posts = self.normalize_batch(all_posts, download_media=download_media)
+        self.audit_posts_quality(
+            final_posts,
+            scene="harvest",
+            expect_comments=(top_n_comments > 0),
+            expect_media_download=download_media,
+            max_fresh_age_hours=168,
+        )
+        return [p for p in final_posts if self.is_valuable_post(p, cfg)]

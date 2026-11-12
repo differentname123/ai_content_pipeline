@@ -16,9 +16,10 @@
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -32,6 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from common.common_utils import (
     get_runtime_file_path,
+    resolve_session_dir,
     safe_int,
     save_json,
     setup_logger,
@@ -74,9 +76,9 @@ logger = _configure_clean_harvester_logging()
 # 一、【最上层总控开关】开启 (True) 或 关闭 (False) 对应平台的拉取
 # ==============================================================================
 PLATFORM_SWITCHES: Dict[str, bool] = {
-    "x": True,              # 英文 X (Twitter)：监控垂直大V时间线与评论
-    "reddit": True,         # 英文 Reddit：10大板块单请求聚合 RSS
-    "hackernews": True,     # 英文 HackerNews：首页 front_page + 关键词故事与评论
+    "x": True,              # 英文 X (Twitter)：监控垂直大V时间线 + 小号推荐主页流与全量评论
+    "reddit": True,         # 英文 Reddit：10大板块单请求聚合 RSS + 外链正文
+    "hackernews": True,     # 英文 HackerNews：首页 front_page + 关键词故事 + 外链正文与评论
     "binance": True,        # 中文 币安广场：首页推荐流 + 币种讨论流与评论
     "okx": True,            # 中文 欧易 Orbit：广场推荐流 + 币种讨论流与评论
     "zhihu": False,         # 预留扩展：知乎
@@ -108,8 +110,13 @@ GLOBAL_SCHEDULE_CONFIG: Dict[str, Any] = {
 # ==============================================================================
 PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
     "x": {
-        "burner_user_data_dir": r"W:\temp\x_myself",
+        "burner_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
         "burner_cookies": "",
+        "include_home_feed": True,        # 小号算法推荐流 HomeTimeline
+        "home_feed_count": 30,
+        "include_trending": True,         # X 官方全球/美国实时热搜榜 (/1.1/trends/place.json) -> 穿透热搜爆款推文
+        "trending_topic_count": 5,
+        "tweets_per_trend": 5,
         "kol_handles": [
             "Polymarket",
             "Kalshi",
@@ -126,42 +133,59 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
             "AutismCapital",
         ],
         "tweets_per_handle": 5,
-        "include_home_feed": False,
-        "home_feed_count": 20,
-        "fetch_comments_for_top_n": 10,
+        "fetch_comments_for_top_n": 80,   # 并发为有评论推文拉齐前排热评
+        "fetch_external_links": True,
     },
     "reddit": {
+        "burner_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
+        "burner_cookies": "",
+        "include_popular": True,          # 同时拉取 Reddit 全站实时热门榜 /r/popular
         "subreddits": [
             "wallstreetbets",
-            "CryptoCurrency",
             "stocks",
-            "options",
-            "FluentInFinance",
+            "investing",
             "technology",
+            "news",
+            "worldnews",
+            "nvidia",
+            "openai",
             "singularity",
-            "algotrading",
-            "PersonalFinance",
-            "antiwork",
+            "CryptoCurrency",
+            "Bitcoin",
+            "FluentInFinance",
+            "Fauxmoi",
+            "OutOfTheLoop",
+            "business",
         ],
         "sort": "top",
         "time_filter": "day",
-        "limit": 20,
-        "fetch_comments_for_top_n": 20,  # 零限流公开镜像拉取全部热帖前排高赞评论
+        "limit": 30,
+        "fetch_comments_for_top_n": 30,
+        "fetch_external_links": True,
     },
     "hackernews": {
-        "front_page_count": 12,
+        "front_page_count": 15,
+        "top_24h_count": 10,              # 补充过去 24h 高分热榜 (points>=50)
         "keywords": ["AI", "OpenAI", "Nvidia", "crypto", "billion"],
         "per_keyword_count": 3,
-        "fetch_comments_for_top_n": 50,  # Algolia 单帖接口免登无限流，为全部有评论故事拉齐热评
+        "fetch_comments_for_top_n": 50,
+        "fetch_external_links": True,
     },
     "binance": {
         "recommend_count": 15,
+        "include_hot_hashtags": True,     # 币安广场官方热门话题榜 (hashtag/hot-list)
+        "hot_hashtag_count": 4,
+        "per_hashtag_count": 5,
+        "include_hot_coins": True,        # 币安合约热搜币种榜 (topSearchList)
+        "hot_coin_count": 3,
         "keywords": [],
         "coins": ["BTC", "ETH", "SOL"],
-        "per_coin_count": 6,
+        "per_coin_count": 5,
     },
     "okx": {
         "recommend_count": 12,
+        "include_hot_coins": True,        # 欧易官方热门币种排行 (rubik/web/public/hot-rank)
+        "hot_coin_count": 3,
         "coins": ["BTC", "ETH", "SOL"],
         "per_coin_count": 5,
         "author_ids": [],
@@ -172,14 +196,14 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 
 # ==============================================================================
-# 四、运维拉取状态诊断与精简报告生成（仅关注拉取执行健康度，不含流量评估噪音）
+# 四、运维拉取状态诊断与精简报告生成（全链路平台异常感知 + 数据质量体检）
 # ==============================================================================
 def create_harvester_instance(platform_name: str, platform_cfg: Dict[str, Any]):
-    """按平台标识实例化对应的平台适配器"""
+    """按平台标识实例化对应的平台适配器（X 与 Reddit 共用专用爬虫小号目录 `x_xiaohao`）"""
     cls = HARVESTER_REGISTRY.get(platform_name)
     if not cls:
         raise ValueError(f"未注册的平台适配器: {platform_name}")
-    if platform_name == "x":
+    if platform_name in ("x", "reddit"):
         return cls(
             burner_cookies=platform_cfg.get("burner_cookies", ""),
             burner_user_data_dir=platform_cfg.get("burner_user_data_dir"),
@@ -189,17 +213,27 @@ def create_harvester_instance(platform_name: str, platform_cfg: Dict[str, Any]):
 
 def _resolve_auth_mode_desc(plat_name: str, harvester: Any) -> str:
     """提取各平台当前账号与通道状态"""
-    if plat_name == "x":
+    if plat_name in ("x", "reddit"):
         return str(getattr(harvester, "burner_account_summary", "免登录模式"))
-    if plat_name == "reddit":
-        return "免登录 (0账号10板块单次聚合RSS)"
     if plat_name == "hackernews":
-        return "免登录 (0账号Algolia官方API)"
+        return "免登录 (Algolia首页+24h高分榜+外链全文)"
     if plat_name == "binance":
-        return "免登录 (0账号公开流+自营过滤)"
+        return "免登录 (广场推荐+热门话题榜+热搜币种榜)"
     if plat_name == "okx":
-        return "免登录 (0账号Orbit流+自营过滤)"
+        return "免登录 (Orbit推荐+热门币种榜+自营过滤)"
     return "免登录模式"
+
+
+def _has_external_article(post: Dict[str, Any]) -> bool:
+    txt = str(((post.get("content") or {}).get("text_content")) or "")
+    if "【原帖关联外链全文" in txt:
+        return True
+    meta = post.get("metadata") or {}
+    pextra = meta.get("platform_extra") or {}
+    if meta.get("external_link_enriched") or pextra.get("external_link_enriched"):
+        return True
+    ext = meta.get("external_article") or pextra.get("external_article")
+    return isinstance(ext, dict) and bool(str(ext.get("text") or "").strip())
 
 
 def _summarize_platform_execution(
@@ -210,7 +244,7 @@ def _summarize_platform_execution(
     upsert_stats: Dict[str, Any],
     cost_s: float,
 ) -> Dict[str, Any]:
-    """统计单平台拉取执行效果：子通道命中数、入库新增/复抓、配图下载成功率、评论拉取数与异常告警"""
+    """统计单平台拉取执行效果与异常感知报告：杜绝接口失效、登录掉线或残缺空帖伪装成正常"""
     auth_mode = _resolve_auth_mode_desc(plat_name, harvester)
     total_posts = len(posts)
     new_count = safe_int(upsert_stats.get("new_count"), 0)
@@ -222,6 +256,7 @@ def _summarize_platform_execution(
     posts_with_comments = 0
     total_comments = 0
     comment_images_count = 0
+    external_articles_count = 0
 
     for p in posts:
         media = p.get("media") or {}
@@ -230,7 +265,7 @@ def _summarize_platform_execution(
         if imgs:
             posts_with_images += 1
             remote_image_count += len(imgs)
-        local_image_count += len(lmap)
+            local_image_count += sum(1 for u in imgs if u in lmap)
 
         cmts = p.get("comments") or []
         if cmts:
@@ -239,50 +274,88 @@ def _summarize_platform_execution(
             for c in cmts:
                 comment_images_count += len((c.get("local_mapping") or {}))
 
+        if _has_external_article(p):
+            external_articles_count += 1
+
     channel_stats: Dict[str, int] = getattr(harvester, "last_channel_stats", {}) or {}
+    health_summary: Dict[str, Any] = (
+        harvester.get_health_summary() if hasattr(harvester, "get_health_summary") else {}
+    )
+    health_status = str(health_summary.get("health_status") or "healthy")
+    health_issues: List[Dict[str, Any]] = list(health_summary.get("issues") or [])
+    quality_report: Dict[str, Any] = dict(health_summary.get("quality_report") or {})
+
     alerts: List[str] = []
+    seen_alert_msgs = set()
+
+    def _push_alert(msg: str) -> None:
+        if msg and msg not in seen_alert_msgs:
+            seen_alert_msgs.add(msg)
+            alerts.append(msg)
+
+    for issue in health_issues:
+        lvl = str(issue.get("level") or "warning")
+        if lvl not in ("critical", "warning"):
+            continue
+        prefix = "🚨" if lvl == "critical" else "⚠️"
+        code = str(issue.get("code") or "HEALTH")
+        ch = str(issue.get("channel") or plat_name)
+        _push_alert(f"{prefix} [{plat_name}/{code}] ({ch}) {issue.get('message')}")
 
     if total_posts == 0:
-        alerts.append(
-            f"❌ [{plat_name}] 本轮拉取条数为 0！请检查代理网络或 `platforms/harvesters/{plat_name}_harvester.py` 接口连通性。"
+        _push_alert(
+            f"❌ [{plat_name}] 本轮拉取有效条数为 0！请检查代理网络、登录态或 `platforms/harvesters/{plat_name}_harvester.py` 接口连通性。"
         )
 
     if remote_image_count > 0 and local_image_count == 0 and p_cfg.get("download_media", True):
-        alerts.append(
+        _push_alert(
             f"⚠️ [{plat_name}] 发现 {remote_image_count} 张配图但本地下载成功 0 张！请检查图片 CDN 网络连通性。"
         )
 
-    # 构造子通道拉取明细与 0 条子通道巡检告警
+    # 构造子通道拉取明细与关键主干子通道 0 条告警
     if plat_name == "x":
         total_ch = len(channel_stats)
         zero_ch = [k for k, v in channel_stats.items() if v == 0]
+        zero_core_ch = [k for k in zero_ch if not k.startswith("@")]
+        zero_kol_ch = [k for k in zero_ch if k.startswith("@")]
         ok_ch = total_ch - len(zero_ch)
         detail_str = ", ".join(f"{k}:{v}" for k, v in channel_stats.items())
-        channel_summary = f"子通道({ok_ch}/{total_ch}正常): {detail_str}"
-        if zero_ch:
-            alerts.append(
-                f"⚠️ [x] 以下监控账号本轮拉取为 0 条: {', '.join(zero_ch)} "
-                f"(请检查该账号近期是否发帖/改名，或小号 Session `{p_cfg.get('burner_user_data_dir')}` 状态)"
-            )
+        channel_summary = f"子通道({ok_ch}/{total_ch}命中): {detail_str}"
+        if zero_core_ch:
+            _push_alert(f"⚠️ [x] 核心主干流返回 0 条: {', '.join(zero_core_ch)} (请检查小号 `x_xiaohao` 状态)")
+        elif len(zero_kol_ch) >= 4:
+            _push_alert(f"⚠️ [x] 多个监控博主本轮返回 0 条: {', '.join(zero_kol_ch)}")
     elif plat_name == "reddit":
         sub_cnt = len(p_cfg.get("subreddits") or [])
         detail_str = ", ".join(f"{k}:{v}" for k, v in channel_stats.items())
-        channel_summary = f"单次聚合请求({sub_cnt}板块 -> 抓回{total_posts}条) | 板块分布: {detail_str}"
+        channel_summary = f"热榜聚合(popular+{sub_cnt}板块 -> 抓回{total_posts}条) | 分布: {detail_str}"
     else:
         total_ch = len(channel_stats)
         zero_ch = [k for k, v in channel_stats.items() if v == 0]
         ok_ch = total_ch - len(zero_ch)
         raw_sum = sum(channel_stats.values())
         detail_str = ", ".join(f"{k}:{v}" for k, v in channel_stats.items())
-        channel_summary = f"子通道({ok_ch}/{total_ch}正常, 原始{raw_sum}条->去重后{total_posts}条): {detail_str}"
-        if zero_ch:
-            alerts.append(f"⚠️ [{plat_name}] 以下子通道本轮拉取为 0 条: {', '.join(zero_ch)}")
+        channel_summary = f"子通道({ok_ch}/{total_ch}命中, 原始{raw_sum}条->去重后{total_posts}条): {detail_str}"
 
-    status_label = "✅正常" if (total_posts > 0 and not alerts) else ("⚠️预警" if total_posts > 0 else "❌空数据")
+    if total_posts == 0:
+        status_label = "❌空数据"
+        norm_status = "empty"
+    elif health_status == "critical":
+        status_label = "🚨严重降级"
+        norm_status = "critical"
+    elif health_status == "degraded" or alerts:
+        status_label = "⚠️降级预警"
+        norm_status = "degraded"
+    else:
+        status_label = "✅正常"
+        norm_status = "ok"
 
     return {
-        "status": "ok" if total_posts > 0 else "empty",
+        "status": norm_status,
         "status_label": status_label,
+        "health_status": health_status,
+        "health_issues": health_issues,
+        "quality_report": quality_report,
         "auth_mode": auth_mode,
         "harvested_count": total_posts,
         "new_count": new_count,
@@ -293,6 +366,7 @@ def _summarize_platform_execution(
         "posts_with_comments": posts_with_comments,
         "total_comments_attached": total_comments,
         "comment_images_mapped": comment_images_count,
+        "external_articles_count": external_articles_count,
         "channel_stats": channel_stats,
         "channel_summary": channel_summary,
         "alerts": alerts,
@@ -301,18 +375,19 @@ def _summarize_platform_execution(
 
 
 def format_ops_harvest_report(report: Dict[str, Any]) -> str:
-    """渲染高信息密度运维拉取报告（仅呈现拉取执行健康度、子通道明细与异常诊断）"""
+    """渲染高信息密度运维拉取报告（清晰呈现采集健康度、降级告警、子通道明细与数据完整度）"""
     lines = [
         "",
-        "=" * 116,
-        f"📋 【多平台拉取运维巡检报告】 轮次: #{report.get('round_no', 1)} | 时间: {report['run_time']} "
+        "=" * 120,
+        f"📋 【多平台拉取与健康体检报告】 轮次: #{report.get('round_no', 1)} | 时间: {report['run_time']} "
         f"| 总耗时: {report['elapsed_seconds']}s | 库内累计: {report.get('collection_total_docs', 0)}条 ({report['target_collection']})",
         f"📊 本轮汇总: 入库 {report['total_harvested']} 条 (新增: {report['total_new_inserted']} / 复抓更新: {report['total_repolled_updated']}) "
         f"| 配图下载: {report['total_local_images']}/{report['total_remote_images']} 张 "
-        f"| 评论拉取: {report['total_comments']} 条 (含评论配图 {report['total_comment_images']} 张)",
-        "-" * 116,
-        f"{'平台':<10} | {'状态':<6} | {'耗时':<6} | {'入库数':<6} | {'新增/复抓':<10} | {'配图(已下/发现)':<14} | {'评论(带评帖/总条数)':<16} | 账号与采集通道状态",
-        "-" * 116,
+        f"| 评论拉取: {report['total_comments']} 条 (含评论配图 {report['total_comment_images']} 张) "
+        f"| 外链正文: {report.get('total_external_articles', 0)} 篇",
+        "-" * 120,
+        f"{'平台':<10} | {'健康状态':<8} | {'耗时':<6} | {'入库数':<6} | {'新增/复抓':<10} | {'配图(已下/发现)':<14} | {'评论(带评帖/总条数)':<16} | {'外链文':<6} | 账号与采集通道状态",
+        "-" * 120,
     ]
 
     for plat in report["enabled_platforms"]:
@@ -323,12 +398,13 @@ def format_ops_harvest_report(report: Dict[str, Any]) -> str:
         new_upd_str = f"+{st.get('new_count', 0)} / ~{st.get('updated_count', 0)}"
         img_str = f"{st.get('local_images_mapped', 0)}/{st.get('remote_images_count', 0)}张 ({st.get('posts_with_images', 0)}帖)"
         cmt_str = f"{st.get('posts_with_comments', 0)}帖 / {st.get('total_comments_attached', 0)}条"
+        ext_str = f"{st.get('external_articles_count', 0)}篇"
         auth_str = st.get("auth_mode", "-")
         lines.append(
-            f"{plat:<10} | {status_lbl:<6} | {cost_str:<6} | {tot_str:<6} | {new_upd_str:<10} | {img_str:<14} | {cmt_str:<16} | {auth_str}"
+            f"{plat:<10} | {status_lbl:<8} | {cost_str:<6} | {tot_str:<6} | {new_upd_str:<10} | {img_str:<14} | {cmt_str:<16} | {ext_str:<6} | {auth_str}"
         )
 
-    lines.append("-" * 116)
+    lines.append("-" * 120)
     lines.append("🔎 【各平台子通道拉取命中明细】")
     for plat in report["enabled_platforms"]:
         st = report["platform_stats"].get(plat) or {}
@@ -337,20 +413,20 @@ def format_ops_harvest_report(report: Dict[str, Any]) -> str:
         else:
             lines.append(f"  • [{plat:<10}] {st.get('channel_summary', '-')}")
 
-    lines.append("-" * 116)
+    lines.append("-" * 120)
     ops_alerts = report.get("ops_alerts") or []
     if ops_alerts:
-        lines.append(f"🚨 【运维异常告警与排查建议 ({len(ops_alerts)} 项)】")
+        lines.append(f"🚨 【平台异常感知与数据质量告警 ({len(ops_alerts)} 项)】")
         for idx, alert_msg in enumerate(ops_alerts, 1):
             lines.append(f"  {idx}. {alert_msg}")
     else:
-        lines.append("🟢 【巡检结论】全部开启平台及子通道拉取正常，0 报错、0 空通道，图片下载与评论富化全部正常。")
-    lines.append("=" * 116)
+        lines.append("🟢 【巡检结论】全部开启平台登录态、热榜通道、评论富化、外链提取与图片下载均健康正常，0 降级、0 残缺帖。")
+    lines.append("=" * 120)
     return "\n".join(lines)
 
 
 # ==============================================================================
-# 五、核心执行引擎（单轮执行 & 每小时常驻定时循环）
+# 五、两大标准模块化编程入口（广谱巡检采集 & 按关键词跨平台指哪打哪深挖）
 # ==============================================================================
 def run_harvest_once(
     switches: Optional[Dict[str, bool]] = None,
@@ -358,7 +434,7 @@ def run_harvest_once(
     global_config: Optional[Dict[str, Any]] = None,
     round_no: int = 1,
 ) -> Dict[str, Any]:
-    """执行单轮多平台拉取、结构化清洗、入库与运维巡检报告输出"""
+    """执行单轮多平台广谱拉取、结构化清洗、入库与运维巡检报告输出"""
     started = time.monotonic()
     effective_switches = switches if switches is not None else PLATFORM_SWITCHES
     effective_p_cfgs = platform_configs if platform_configs is not None else PLATFORM_HARVEST_CONFIGS
@@ -372,7 +448,7 @@ def run_harvest_once(
     disabled_platforms = [p for p, on in effective_switches.items() if not on]
 
     logger.info(
-        f"🚀 [拉取总控] 开始第 #{round_no} 轮采集 | 开启平台: {enabled_platforms} | 目标集合: [{collection_name}]"
+        f"🚀 [拉取总控] 开始第 #{round_no} 轮广谱采集 | 开启平台: {enabled_platforms} | 目标集合: [{collection_name}]"
     )
 
     post_manager: Optional[HarvestedPostManager] = None
@@ -395,6 +471,8 @@ def run_harvest_once(
         "total_local_images": 0,
         "total_comments": 0,
         "total_comment_images": 0,
+        "total_external_articles": 0,
+        "post_keys": [],
         "ops_alerts": [],
         "elapsed_seconds": 0.0,
     }
@@ -438,6 +516,7 @@ def run_harvest_once(
             report["total_local_images"] += plat_summary["local_images_mapped"]
             report["total_comments"] += plat_summary["total_comments_attached"]
             report["total_comment_images"] += plat_summary["comment_images_mapped"]
+            report["total_external_articles"] += plat_summary["external_articles_count"]
             report["ops_alerts"].extend(plat_summary["alerts"])
             all_harvested_posts.extend(posts)
 
@@ -445,7 +524,8 @@ def run_harvest_once(
                 f"{plat_summary['status_label']} [{plat_name}] 完成 ({cost_s}s) "
                 f"| 入库: {plat_summary['harvested_count']}条 (+{plat_summary['new_count']}/~{plat_summary['updated_count']}) "
                 f"| 配图: {plat_summary['local_images_mapped']}/{plat_summary['remote_images_count']}张 "
-                f"| 评论: {plat_summary['posts_with_comments']}帖/{plat_summary['total_comments_attached']}条"
+                f"| 评论: {plat_summary['posts_with_comments']}帖/{plat_summary['total_comments_attached']}条 "
+                f"| 外链文: {plat_summary['external_articles_count']}篇"
             )
 
         except Exception as e:
@@ -468,6 +548,7 @@ def run_harvest_once(
                 "posts_with_comments": 0,
                 "total_comments_attached": 0,
                 "comment_images_mapped": 0,
+                "external_articles_count": 0,
                 "channel_stats": {},
                 "channel_summary": f"异常中断: {e}",
                 "alerts": [err_alert],
@@ -482,6 +563,11 @@ def run_harvest_once(
         except Exception:
             pass
 
+    report["post_keys"] = [
+        f"{p.get('source')}:{p.get('post_id')}"
+        for p in all_harvested_posts
+        if p.get("source") and p.get("post_id")
+    ]
     report["elapsed_seconds"] = round(time.monotonic() - started, 2)
 
     snapshot_file = effective_g_cfg.get("snapshot_filename")
@@ -500,6 +586,185 @@ def run_harvest_once(
 
     logger.info(format_ops_harvest_report(report))
     return report
+
+
+def harvest_broad_feeds(
+    switches: Optional[Dict[str, bool]] = None,
+    platform_configs: Optional[Dict[str, Dict[str, Any]]] = None,
+    global_config: Optional[Dict[str, Any]] = None,
+    round_no: int = 1,
+) -> Dict[str, Any]:
+    """模块 1A 编程接口：执行全平台广谱巡检采集并幂等写入 `harvested_social_posts`。"""
+    return run_harvest_once(
+        switches=switches,
+        platform_configs=platform_configs,
+        global_config=global_config,
+        round_no=round_no,
+    )
+
+
+def harvest_by_keywords(
+    keywords: Sequence[str],
+    platforms: Optional[Sequence[str]] = None,
+    per_platform_limit: int = 25,
+    hours_back: int = 72,
+    fetch_comments: bool = True,
+    fetch_external_links: bool = True,
+    download_media: bool = True,
+    save_to_mongo: bool = True,
+    collection_name: str = NEW_HARVESTED_COLLECTION_NAME,
+    platform_configs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    模块 1B 编程接口：按指定关键词组跨平台并发深挖采集（「指哪打哪」检索），
+    自动拉取外链正文、前排高赞评论、下载主帖与评论区配图，幂等写入 `harvested_social_posts`，
+    并输出分清「垂直社区客观少数据」与「综合大平台爬虫故障/漏搜」的异常感知诊断报告。
+
+    可完全独立于下游或上游任何模块单独调用。
+    """
+    started = time.monotonic()
+    clean_keywords: List[str] = []
+    seen_kw = set()
+    for kw in keywords or []:
+        s = str(kw or "").strip()
+        if s and s.lower() not in seen_kw:
+            seen_kw.add(s.lower())
+            clean_keywords.append(s)
+
+    if not clean_keywords:
+        return {
+            "keywords": [],
+            "platforms": [],
+            "by_platform_counts": {},
+            "platform_diagnosis": {},
+            "platform_health": {},
+            "platform_errors": {},
+            "ops_alerts": [],
+            "total_posts": 0,
+            "new_count": 0,
+            "updated_count": 0,
+            "post_keys": [],
+            "posts": [],
+            "elapsed_seconds": 0.0,
+        }
+
+    effective_p_cfgs = platform_configs if platform_configs is not None else PLATFORM_HARVEST_CONFIGS
+    if platforms is not None:
+        target_platforms = [p for p in platforms if p in HARVESTER_REGISTRY]
+    else:
+        target_platforms = [p for p, on in PLATFORM_SWITCHES.items() if on and p in HARVESTER_REGISTRY]
+
+    query_str = "|".join(clean_keywords)
+    by_platform_counts: Dict[str, int] = {p: 0 for p in target_platforms}
+    platform_health: Dict[str, Dict[str, Any]] = {}
+    platform_errors: Dict[str, str] = {}
+    ops_alerts: List[str] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+
+    def _search_one_platform(plat_name: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        p_cfg = dict(effective_p_cfgs.get(plat_name) or {})
+        harvester = create_harvester_instance(plat_name, p_cfg)
+        raw_hits = harvester.search_or_topic_posts(
+            query=query_str,
+            count=per_platform_limit,
+            hours_back=hours_back,
+            fetch_comments=fetch_comments,
+            fetch_external_links=fetch_external_links,
+            download_media=download_media,
+        ) or []
+        valid_hits = [p for p in raw_hits if harvester.is_valuable_post(p, p_cfg)]
+        h_summary = harvester.get_health_summary() if hasattr(harvester, "get_health_summary") else {}
+        return valid_hits, h_summary
+
+    if target_platforms:
+        with ThreadPoolExecutor(max_workers=min(5, len(target_platforms))) as pool:
+            fut_map = {pool.submit(_search_one_platform, plat): plat for plat in target_platforms}
+            for fut in as_completed(fut_map):
+                plat = fut_map[fut]
+                try:
+                    plat_posts, h_sum = fut.result()
+                    plat_posts = plat_posts or []
+                    by_platform_counts[plat] = len(plat_posts)
+                    platform_health[plat] = h_sum or {}
+                    for issue in (h_sum or {}).get("issues") or []:
+                        lvl = str(issue.get("level") or "")
+                        if lvl in ("critical", "warning"):
+                            pfx = "🚨" if lvl == "critical" else "⚠️"
+                            ops_alerts.append(
+                                f"{pfx} [{plat}/{issue.get('code', 'SEARCH')}] {issue.get('message')}"
+                            )
+                    for p in plat_posts:
+                        pk = f"{p.get('source')}:{p.get('post_id')}"
+                        if p.get("source") and p.get("post_id"):
+                            by_key[pk] = p
+                except Exception as e:
+                    platform_errors[plat] = str(e)
+                    ops_alerts.append(f"❌ [{plat}/EXCEPTION] 关键词检索抛出未捕获异常: {e}")
+                    logger.warning(f"⚠️ [定向关键词深挖] 平台 [{plat}] 检索异常 ({query_str}): {e}")
+
+    # 区分「垂直社区属性客观少数据」vs「全球综合大平台应当有数据却漏搜/通道降级」
+    mega_platforms = {"x", "reddit", "binance"}
+    max_mega_hits = max((by_platform_counts.get(mp, 0) for mp in mega_platforms), default=0)
+    platform_diagnosis: Dict[str, str] = {}
+    for plat in target_platforms:
+        cnt = by_platform_counts.get(plat, 0)
+        h_stat = str((platform_health.get(plat) or {}).get("health_status") or "healthy")
+        note = str((platform_health.get(plat) or {}).get("search_note") or "").strip()
+        if plat in platform_errors:
+            platform_diagnosis[plat] = f"❌报错中断 ({platform_errors[plat][:80]})"
+        elif h_stat == "critical":
+            platform_diagnosis[plat] = f"🚨通道严重异常 (命中{cnt}条{', ' + note if note else ''})"
+        elif h_stat == "degraded":
+            platform_diagnosis[plat] = f"⚠️通道降级预警 (命中{cnt}条{', ' + note if note else ''})"
+        elif cnt > 0:
+            platform_diagnosis[plat] = f"✅正常命中 ({cnt}条{', ' + note if note else ''})"
+        elif plat in ("okx", "hackernews"):
+            reason = "加密垂直社区非本领域话题" if plat == "okx" else "英文极客社区无匹配讨论"
+            platform_diagnosis[plat] = f"ℹ️平台属性正常0条 ({reason})"
+        elif plat in mega_platforms and max_mega_hits >= 5:
+            msg = (
+                f"⚠️ [{plat}/SUSPECTED_SEARCH_MISS] 同批其他大平台已搜出 {max_mega_hits} 条热帖，"
+                f"但综合平台 [{plat}] 返回 0 条！请排查关键词中英文覆盖或 [{plat}] 搜索接口状态。"
+            )
+            ops_alerts.append(msg)
+            platform_diagnosis[plat] = "⚠️疑似漏搜0条 (同批大平台已有热帖)"
+        else:
+            platform_diagnosis[plat] = "ℹ️未命中近期帖 (0条)"
+
+    all_posts = list(by_key.values())
+    upsert_stats = {"total": 0, "new_count": 0, "updated_count": 0}
+    if save_to_mongo and all_posts:
+        post_manager = HarvestedPostManager(gen_db_object(), collection_name=collection_name)
+        upsert_stats = post_manager.upsert_posts(all_posts) or upsert_stats
+        for p in all_posts:
+            if isinstance(p.get("first_seen_at"), datetime):
+                p["first_seen_at"] = p["first_seen_at"].isoformat()
+            if isinstance(p.get("db_update_time"), datetime):
+                p["db_update_time"] = p["db_update_time"].isoformat()
+
+    elapsed = round(time.monotonic() - started, 2)
+    post_keys = list(by_key.keys())
+    logger.info(
+        f"🔎 [定向关键词深挖] 关键词={clean_keywords} | 平台命中={by_platform_counts} "
+        f"| 诊断={platform_diagnosis} "
+        f"| 合计={len(all_posts)}条 (+{safe_int(upsert_stats.get('new_count'), 0)}/~{safe_int(upsert_stats.get('updated_count'), 0)}) "
+        f"| 告警={len(ops_alerts)}项 | 耗时={elapsed}s"
+    )
+    return {
+        "keywords": clean_keywords,
+        "platforms": target_platforms,
+        "by_platform_counts": by_platform_counts,
+        "platform_diagnosis": platform_diagnosis,
+        "platform_health": platform_health,
+        "platform_errors": platform_errors,
+        "ops_alerts": ops_alerts,
+        "total_posts": len(all_posts),
+        "new_count": safe_int(upsert_stats.get("new_count"), 0),
+        "updated_count": safe_int(upsert_stats.get("updated_count"), 0),
+        "post_keys": post_keys,
+        "posts": all_posts,
+        "elapsed_seconds": elapsed,
+    }
 
 
 def run_harvest_daemon(interval_seconds: Optional[int] = None):

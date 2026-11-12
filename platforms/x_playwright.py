@@ -1326,6 +1326,208 @@ def comment_on_x_post(
         return error_info, False, None
 
 
+def follow_x_user(
+    target_screen_name,
+    user_data_dir=USER_DATA_DIR,
+    debug=True,
+    use_proxy=True,
+):
+    """
+    主控入口 2.5：打开指定 X 用户个人主页（`https://x.com/{screen_name}`）并执行安全幂等关注操作。
+    - 严格限定在 `[data-testid="primaryColumn"]` 主资料卡区域内定位按钮，杜绝误点右侧推荐栏；
+    - 若检测到已处于关注状态（`data-testid$="-unfollow"`），直接幂等返回 `("ALREADY_FOLLOWING")`，绝不误触发取关。
+
+    返回:
+        Tuple(错误信息(str|None), 是否成功(bool), 状态标识(str|None: "FOLLOWED" | "ALREADY_FOLLOWING"))
+    """
+    clean_handle = str(target_screen_name or "").strip().lstrip("@").split("/")[0].split("?")[0].strip()
+    if not clean_handle:
+        return "缺少目标用户名: target_screen_name 不能为空", False, None
+
+    if not os.path.isdir(user_data_dir):
+        return (
+            f"缺少 X 浏览器用户环境: {user_data_dir}，请先登录 X 账号保存会话",
+            False,
+            None,
+        )
+
+    profile_url = f"https://x.com/{clean_handle}"
+    proxy_server = get_proxy_url() if use_proxy else None
+
+    logger.info(
+        f"\n{'=' * 70}\n[任务/Follow] 启动 X 自动化关注 | 目标账号: 【@{clean_handle}】 | URL: <{profile_url}> "
+        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+    )
+
+    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
+    offscreen_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-gpu",
+        "--window-position=-10000,-10000",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-features=CalculateNativeWinOcclusion",
+        "--disable-breakpad",
+        "--force-device-scale-factor=1",
+        "--hide-scrollbars",
+    ] + anti_freeze_args
+
+    debug_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--start-maximized",
+        "--window-position=0,0",
+    ] + anti_freeze_args
+
+    try:
+        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
+            with sync_playwright() as p:
+                context = None
+                try:
+                    context = _launch_persistent(
+                        p,
+                        user_data_dir,
+                        args=debug_args if debug else offscreen_args,
+                        viewport=None if debug else {"width": 1920, "height": 1080},
+                        debug=debug,
+                        proxy=proxy_server,
+                    )
+                    context.set_default_timeout(60000)
+                    context.set_default_navigation_timeout(60000)
+
+                    page = context.new_page()
+                    for old_page in context.pages:
+                        if old_page != page:
+                            try:
+                                old_page.close()
+                            except Exception:
+                                pass
+                    page.bring_to_front()
+                    install_overlay_guard(page)
+
+                    response = page.goto(profile_url, timeout=60000, wait_until="domcontentloaded")
+                    try:
+                        page.locator(
+                            'div[data-testid="UserName"], '
+                            'div[data-testid="empty_state_header_text"], '
+                            'input[autocomplete="username"], '
+                            'a[data-testid="loginButton"]'
+                        ).first.wait_for(state="visible", timeout=25000)
+                    except Exception:
+                        pass
+
+                    _dismiss_overlays(page, aggressive=False, desc="x-follow-nav")
+                    report_guard_hits(page, "x-follow-nav")
+
+                    if response and response.status >= 400:
+                        return f"X 用户主页加载异常 (HTTP {response.status})", False, None
+
+                    login_err = _check_x_login_state(page)
+                    if login_err:
+                        return login_err, False, None
+
+                    check_for_crash(page)
+
+                    empty_hdr = page.locator('div[data-testid="empty_state_header_text"]').first
+                    if empty_hdr.count() > 0 and empty_hdr.is_visible():
+                        err_txt = (empty_hdr.inner_text() or "").strip()[:120]
+                        return f"目标 X 账号不可用或不存在 (@{clean_handle}): {err_txt}", False, None
+
+                    primary_col = page.locator('[data-testid="primaryColumn"]').first
+                    header_Placement = primary_col.locator('div[data-testid="placementTracking"]')
+
+                    # 幂等保护：若已处于关注或待批准状态，直接返回成功，绝不点击取关按钮
+                    already_btn = header_Placement.locator(
+                        'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
+                    ).first
+                    if already_btn.count() > 0 and already_btn.is_visible():
+                        logger.info(f"[关注/Follow] 账号 @{clean_handle} 已处于关注状态，幂等跳过点击")
+                        return None, True, "ALREADY_FOLLOWING"
+
+                    follow_btn = header_Placement.locator('button[data-testid$="-follow"]').first
+                    if follow_btn.count() == 0:
+                        follow_btn = primary_col.locator('button[data-testid$="-follow"]').first
+                    if follow_btn.count() == 0 or not follow_btn.is_visible():
+                        return f"未能在 @{clean_handle} 主页定位到可点击的关注按钮", False, None
+
+                    testid_val = follow_btn.get_attribute("data-testid") or ""
+                    if testid_val.endswith("-unfollow"):
+                        return None, True, "ALREADY_FOLLOWING"
+
+                    friendship_ok = {"hit": False}
+
+                    def _on_follow_resp(resp):
+                        u = (resp.url or "").lower()
+                        if ("friendships/create" in u or "createfriendship" in u) and resp.status == 200:
+                            friendship_ok["hit"] = True
+
+                    page.on("response", _on_follow_resp)
+                    try:
+                        _robust_click(follow_btn)
+                        deadline = time.time() + 10.0
+                        while time.time() < deadline:
+                            if friendship_ok["hit"]:
+                                break
+                            unfollow_now = header_Placement.locator(
+                                'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
+                            ).first
+                            if unfollow_now.count() > 0 and unfollow_now.is_visible():
+                                friendship_ok["hit"] = True
+                                break
+                            page.wait_for_timeout(300)
+                    finally:
+                        try:
+                            page.remove_listener("response", _on_follow_resp)
+                        except Exception:
+                            pass
+
+                    if friendship_ok["hit"]:
+                        page.wait_for_timeout(1200)
+                        logger.info(f"[任务/Follow] X 关注成功 | 账号: 【@{clean_handle}】 | 结果: [Success]")
+                        return None, True, "FOLLOWED"
+
+                    _forensics(page, f"x_follow_unconfirmed_{clean_handle}", {"url": profile_url})
+                    return f"点击关注按钮后未检测到关注状态切换 (@{clean_handle})", False, None
+
+                except BusinessErrorException as biz_e:
+                    error_info = f"[业务拦截] {biz_e}"
+                    logger.error(f"[任务/Follow] X 关注被阻断 | 原因: 【{error_info}】")
+                    return error_info, False, None
+
+                except Exception as e:
+                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                    if context and context.pages:
+                        try:
+                            _forensics(
+                                context.pages[0],
+                                f"x_follow_error_{clean_handle}",
+                                {"url": profile_url, "error": error_info[:2000]},
+                            )
+                        except Exception:
+                            pass
+                    _alert_failure_scene(error_info)
+                    return error_info, False, None
+
+                finally:
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"[任务/Follow] {error_info}")
+        return error_info, False, None
+
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return error_info, False, None
+
+
 def login_and_save_session(user_data_dir=USER_DATA_DIR, use_proxy=True):
     """打开可见浏览器供人工登录 X 账号，按 Enter 后关闭并固化会话至 user_data_dir。"""
     proxy_server = get_proxy_url() if use_proxy else None

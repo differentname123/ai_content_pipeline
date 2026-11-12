@@ -76,8 +76,15 @@ def call_llm_json(
     last_trace: Dict[str, Any] = {}
 
     for outer_attempt in range(1, max_outer + 1):
+        effective_prompt = prompt
+        if outer_attempt > 1 and accumulated_errors:
+            effective_prompt = (
+                f"{prompt}\n\n"
+                f"【系统格式强校验纠错警告】你上一次的输出未通过严格的 JSON 格式校验，失败原因：{accumulated_errors[-1]}。\n"
+                f"请立即严格按照提示词规定的精确键名与字段类型重新输出纯 JSON 对象，严禁擅自更改字段名或在字符串数组中嵌套对象！"
+            )
         resp = generate_content(
-            prompt=prompt,
+            prompt=effective_prompt,
             model=normalized_model,
             file_paths=valid_files if valid_files else None,
             fallback_model_list=fallback_models if normalized_model else None,

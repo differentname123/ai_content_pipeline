@@ -548,7 +548,7 @@ def clean_universal_posts(final_clean_list):
 # ============================================================
 # 3. 多模态详情富化、媒体下载与评论并发拉取
 # ============================================================
-def _enrich_single_post(item, session):
+def _enrich_single_post(item, session, download_media: bool = True):
     """单条帖子数据的多模态丰富处理 (无锁设计原子函数)"""
     stats = {
         "long_updated": 0,
@@ -619,16 +619,16 @@ def _enrich_single_post(item, session):
                 urls_to_download.add(img_url)
 
         stats["total_download_urls"] = len(urls_to_download)
-        proxy_url = PROXIES.get("http")
-
-        for url in urls_to_download:
-            try:
-                local_path = download_web_media(url=url, save_dir=MEDIA_SAVE_DIR, proxy=proxy_url)
-                if local_path:
-                    media_info["local_mapping"][url] = local_path
-                    stats["total_download_success"] += 1
-            except Exception as dl_e:
-                logger.debug(f"[币安富化/媒体下载] 下载异常 | 帖子ID: [{post_id}] | URL: <{url}> | 原因: [{dl_e}]")
+        if download_media and urls_to_download:
+            proxy_url = PROXIES.get("http")
+            for url in urls_to_download:
+                try:
+                    local_path = download_web_media(url=url, save_dir=MEDIA_SAVE_DIR, proxy=proxy_url)
+                    if local_path:
+                        media_info["local_mapping"][url] = local_path
+                        stats["total_download_success"] += 1
+                except Exception as dl_e:
+                    logger.debug(f"[币安富化/媒体下载] 下载异常 | 帖子ID: [{post_id}] | URL: <{url}> | 原因: [{dl_e}]")
 
         try:
             comment_count = item.get("engagement", {}).get("comment_count", 0)
@@ -649,8 +649,8 @@ def _enrich_single_post(item, session):
     return item, stats
 
 
-def update_posts_in_place(final_clean_list, _stats_out=None):
-    """就地并发更新帖子内容、下载媒体与拉取评论"""
+def update_posts_in_place(final_clean_list, _stats_out=None, download_media: bool = True):
+    """就地并发更新帖子内容、可选下载媒体与拉取评论"""
     if not final_clean_list:
         return []
 
@@ -671,7 +671,7 @@ def update_posts_in_place(final_clean_list, _stats_out=None):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_item = {
-                executor.submit(_enrich_single_post, item, session): item
+                executor.submit(_enrich_single_post, item, session, download_media): item
                 for item in final_clean_list
             }
             for future in concurrent.futures.as_completed(future_to_item):
@@ -857,7 +857,7 @@ def get_binance_feed_token(token="DOGE", required_count=20, orderBy=2):
     return _paginate_feed(url, headers, build_payload, required_count, f"币种:{token}")
 
 
-def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **kwargs):
+def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, download_media: bool = True, **kwargs):
     """统一的币安广场数据拉取接口（智能路由 + 增量拦截 + 自营拦截 + 清洗富化，单条聚合日志输出）"""
     started = time.monotonic()
     if existing_ids is None:
@@ -907,7 +907,7 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
     if count and len(clean_feed_list) > int(count):
         clean_feed_list = clean_feed_list[: int(count)]
     enrich_stats = {}
-    enriched_list = update_posts_in_place(clean_feed_list, _stats_out=enrich_stats)
+    enriched_list = update_posts_in_place(clean_feed_list, _stats_out=enrich_stats, download_media=download_media)
     logger.info(
         f"[币安采集/{feed_type}] 采集与富化完成 | 标的: [{target_desc}] | 原始抓取: [{len(feed_list)}] "
         f"| 拦截过滤: [{intercepted_count}] | 净增有效: [{len(enriched_list)}] "

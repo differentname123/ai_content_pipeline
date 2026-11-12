@@ -266,34 +266,133 @@ def _discover_tweet_ids_from_local_browsers(screen_name):
 # ============================================================
 # 3. 登录态 GraphQL UserTweets 游标翻页拉取（可选增强通道）
 # ============================================================
-def extract_x_cookies_from_user_data_dir(user_data_dir):
-    """从指定的 Playwright Chrome user_data_dir 提取 X (x.com) 登录 Cookie"""
-    if not user_data_dir or not os.path.exists(user_data_dir):
+def _get_chromium_cookie_db_mtime(user_data_dir: str) -> float:
+    """获取 Chromium 会话目录下 Cookies 数据库文件的最新修改时间（若未初始化则返回 0.0）。"""
+    if not user_data_dir or not os.path.isdir(user_data_dir):
+        return 0.0
+    mtimes = []
+    for rel in (
+        os.path.join("Default", "Network", "Cookies"),
+        os.path.join("Default", "Cookies"),
+        os.path.join("Network", "Cookies"),
+    ):
+        fp = os.path.join(user_data_dir, rel)
+        if os.path.isfile(fp):
+            try:
+                mtimes.append(os.path.getmtime(fp))
+            except Exception:
+                pass
+    return max(mtimes) if mtimes else 0.0
+
+
+def invalidate_burner_cookie_cache(user_data_dir: str = "") -> None:
+    """清理指定会话目录（或全部）的本地 Cookie 缓存（供人工重新登录后立即生效）。"""
+    cache_path = get_runtime_file_path("burner_cookies_cache.json")
+    if not os.path.exists(cache_path):
+        return
+    try:
+        if not user_data_dir:
+            save_json(cache_path, {})
+            return
+        norm_dir = os.path.normcase(os.path.abspath(str(user_data_dir)))
+        data = read_json(cache_path)
+        if isinstance(data, dict):
+            cleaned = {k: v for k, v in data.items() if not k.startswith(norm_dir + "|")}
+            save_json(cache_path, cleaned)
+    except Exception:
+        pass
+
+
+def extract_domain_cookies_from_user_data_dir(
+    user_data_dir: str,
+    urls: list,
+    required_any_names: tuple = (),
+    ttl_seconds: int = 21600,
+    force_refresh: bool = False,
+) -> str:
+    """
+    从指定的 Playwright Chrome `user_data_dir` 安全无头提取指定域名 Cookie，并带基于 Cookies 文件 mtime + TTL 的持久化缓存：
+    1) 若会话目录或底层 Cookies 数据库文件尚不存在（例如小号尚未首次登录），0 毫秒直接返回空串，绝不误建空浏览器目录；
+    2) 命中缓存时 `<1ms` 毫秒级返回，避免每次实例化 Harvester 反复拉起 Chrome 进程；
+    3) 需要提取时统一复用 `_launch_persistent(..., debug=False)` 独占锁与无头模式，零弹窗闪烁、零并发锁冲突。
+    """
+    if not user_data_dir or not os.path.isdir(user_data_dir) or not urls:
         return ""
+    cookie_mtime = _get_chromium_cookie_db_mtime(user_data_dir)
+    if cookie_mtime <= 0.0:
+        return ""
+
+    norm_dir = os.path.normcase(os.path.abspath(str(user_data_dir)))
+    cache_key = f"{norm_dir}|{','.join(sorted(str(u) for u in urls))}"
+    cache_path = get_runtime_file_path("burner_cookies_cache.json")
+    now_ts = time.time()
+
+    if not force_refresh and os.path.exists(cache_path):
+        try:
+            cache_obj = read_json(cache_path)
+            entry = cache_obj.get(cache_key) if isinstance(cache_obj, dict) else None
+            if isinstance(entry, dict):
+                cached_str = str(entry.get("cookies") or "")
+                cached_at = float(entry.get("cached_at") or 0.0)
+                cached_mtime = float(entry.get("cookie_mtime") or 0.0)
+                # 当底层 Cookie 库文件未变化，或仍在有效期内且已包含关键登录态时直接复用
+                if (now_ts - cached_at) < ttl_seconds and (
+                    abs(cached_mtime - cookie_mtime) < 1.0
+                    or (cached_str and (not required_any_names or any(f"{n}=" in cached_str for n in required_any_names)))
+                ):
+                    return cached_str
+        except Exception:
+            pass
+
     try:
         from playwright.sync_api import sync_playwright
+        from platforms.playwright_base import _launch_persistent
 
         proxy_server = PROXIES.get("http") if isinstance(PROXIES, dict) else None
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
+            context = _launch_persistent(
+                p,
                 user_data_dir=user_data_dir,
-                channel="chrome",
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
-                ignore_default_args=["--enable-automation"],
-                proxy={"server": proxy_server} if proxy_server else None,
+                args=["--disable-blink-features=AutomationControlled"],
+                debug=False,
+                proxy=proxy_server,
             )
             try:
-                raw_cookies = context.cookies(["https://x.com", "https://twitter.com"])
-                return "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
+                raw_cookies = context.cookies(list(urls))
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
             finally:
                 context.close()
+
+        new_mtime = _get_chromium_cookie_db_mtime(user_data_dir) or cookie_mtime
+        try:
+            cache_obj = read_json(cache_path) if os.path.exists(cache_path) else {}
+            if not isinstance(cache_obj, dict):
+                cache_obj = {}
+            cache_obj[cache_key] = {
+                "cookies": cookie_str,
+                "cookie_mtime": new_mtime,
+                "cached_at": now_ts,
+            }
+            save_json(cache_path, cache_obj)
+        except Exception:
+            pass
+        return cookie_str
     except Exception as e:
         logger.warning(
-            f"[X平台/凭证提取] 从会话目录提取 Cookie 失败 | 目录: <{user_data_dir}> "
-            f"| 原因: [{e}] | 排查方向: [检查浏览器会话目录或关闭占用进程]"
+            f"[凭证提取] 从会话目录提取 Cookie 失败 | 目录: <{user_data_dir}> | 域名: {urls} "
+            f"| 原因: [{e}] | 排查方向: [检查浏览器会话目录或关闭外部手工打开的同目录 Chrome]"
         )
         return ""
+
+
+def extract_x_cookies_from_user_data_dir(user_data_dir, force_refresh: bool = False):
+    """从指定的 Playwright Chrome user_data_dir 提取 X (x.com) 登录 Cookie（带无头锁保护与缓存）"""
+    return extract_domain_cookies_from_user_data_dir(
+        user_data_dir=user_data_dir,
+        urls=["https://x.com", "https://twitter.com"],
+        required_any_names=("auth_token",),
+        force_refresh=force_refresh,
+    )
 
 
 def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies=False, proxies=PROXIES):

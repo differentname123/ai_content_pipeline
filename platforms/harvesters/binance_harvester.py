@@ -45,57 +45,215 @@
 ================================================================================
 """
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from common.common_utils import PLATFORM_BINANCE, safe_int
 from platforms.binance_api import (
     clean_binance_replies,
     fetch_binance_feed,
+    fetch_binance_future_hot_coins,
+    fetch_binance_hot_hashtags,
     fetch_binance_replies,
 )
 from platforms.harvesters.base_harvester import BasePlatformHarvester
+from platforms.harvesters.okx_harvester import CRYPTO_KEYWORD_TO_TICKER
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_quote_asset(symbol: str) -> str:
+    """将合约交易对符号（如 `AGTUSDT`、`BTCUSDC`）还原为基础币种代码（`AGT`、`BTC`）。"""
+    s = str(symbol or "").strip().upper()
+    for suffix in ("USDT", "USDC", "FDUSD", "BUSD"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)]
+    return s
 
 
 class BinanceHarvester(BasePlatformHarvester):
     """
     币安广场 (Binance Square) 采集与归一化适配器（100% 免登录）。
-    专门提供中文加密圈高情绪实盘交割单、暴富暴负故事与评论区神评素材。
+    覆盖「官方热门话题榜 (`hot-list`) + 合约热搜币榜 (`topSearchList`) + 首页推荐流 + 关键词/币种精准检索」，
+    并内置接口异常、空流与数据质量自检。
     """
 
     SOURCE_NAME = PLATFORM_BINANCE
 
     def fetch_hot_or_recommended(self, count: int = 20, **kwargs) -> List[Dict[str, Any]]:
-        """原语 1：拉取币安广场首页推荐爆款流（含自动长文解析、配图本地下载与评论富化）"""
-        raw_posts = fetch_binance_feed(count=count) or []
-        return self.normalize_batch(raw_posts, download_media=False)
+        """原语 1：拉取币安广场首页推荐爆款流（延迟统一阶段下载图片，避免重复阻塞）"""
+        try:
+            raw_posts = fetch_binance_feed(count=count, download_media=False) or []
+            if count > 0 and not raw_posts:
+                self.record_health_issue(
+                    code="BINANCE_RECOMMEND_EMPTY",
+                    message="币安广场首页推荐流接口返回 0 条数据，疑似接口变更或代理网络受阻",
+                    level="critical",
+                    channel="推荐流",
+                )
+            return self.normalize_batch(raw_posts, download_media=False)
+        except Exception as e:
+            self.record_health_issue(
+                code="BINANCE_RECOMMEND_ERROR",
+                message=f"币安广场首页推荐流请求异常: {e}",
+                level="critical",
+                channel="推荐流",
+            )
+            return []
+
+    def fetch_hot_hashtags_posts(
+        self,
+        max_hashtags: int = 5,
+        posts_per_hashtag: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """拉取币安广场官方实时热门话题榜 (`hashtag/hot-list`) 前排话题下的高热帖子。"""
+        self.last_hot_hashtags: List[str] = []
+        try:
+            hot_items = fetch_binance_hot_hashtags() or []
+        except Exception as e:
+            self.record_health_issue(
+                code="BINANCE_HOT_HASHTAGS_ERROR",
+                message=f"拉取币安官方热门话题榜异常: {e}",
+                level="warning",
+                channel="官方热搜话题榜",
+            )
+            return []
+
+        if not hot_items:
+            self.record_health_issue(
+                code="BINANCE_HOT_HASHTAGS_EMPTY",
+                message="币安官方热门话题榜 (`hashtag/hot-list`) 返回为空，疑似榜单接口变更",
+                level="warning",
+                channel="官方热搜话题榜",
+            )
+            return []
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for item in hot_items[: max(1, max_hashtags)]:
+            if not isinstance(item, dict):
+                continue
+            tag = str(item.get("hashtag") or item.get("hashtagNormalized") or "").strip()
+            if not tag:
+                continue
+            self.last_hot_hashtags.append(tag)
+            raw_posts = fetch_binance_feed(count=max(2, posts_per_hashtag), keyword=tag, download_media=False) or []
+            for p in self.normalize_batch(raw_posts, download_media=False):
+                if p.get("post_id"):
+                    by_id[p["post_id"]] = p
+
+        return list(by_id.values())
 
     def fetch_user_posts(self, user_id: str, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
         """原语 2：按币安作者名或关键词定向搜索该博主的帖子"""
         if not user_id:
             return []
-        raw_posts = fetch_binance_feed(count=count, keyword=str(user_id).strip()) or []
+        raw_posts = fetch_binance_feed(count=count, keyword=str(user_id).strip(), download_media=False) or []
         return self.normalize_batch(raw_posts, download_media=False)
 
     def search_or_topic_posts(
         self,
         query: str,
-        count: int = 20,
+        count: int = 25,
         is_coin_token: bool = False,
+        hours_back: int = 72,
+        download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词 (`keyword`) 或币种代码 (`token="BTC"`) 拉取币安广场垂直内容流。
+        原语 3：按关键词（支持 `|` 或 `,` 分隔多词）或币种代码 (`token="BTC"`) 拉取币安广场垂直内容流。
+        候选检索阶段关闭同步图片下载以大幅提速，筛选出最终 Top `count` 后再并发下载真实原图。
         """
-        q = str(query or "").strip()
-        if not q:
+        reset_health = bool(kwargs.get("reset_health", True))
+        if reset_health:
+            self.reset_health_state()
+
+        raw_q = str(query or "").replace(",", "|")
+        keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
+        if not keywords:
             return self.fetch_hot_or_recommended(count=count)
-        if is_coin_token or (q.isupper() and 2 <= len(q) <= 8):
-            raw_posts = fetch_binance_feed(count=count, token=q) or []
-        else:
-            raw_posts = fetch_binance_feed(count=count, keyword=q) or []
-        return self.normalize_batch(raw_posts, download_media=False)
+
+        min_ts = int(time.time() - max(1, hours_back) * 3600) if (hours_back and hours_back > 0) else 0
+        by_id: Dict[str, Dict[str, Any]] = {}
+        per_kw = max(8, min(count, 25))
+        search_errors = 0
+
+        for kw in keywords:
+            clean_coin = kw.lstrip("$").strip()
+            mapped_ticker = CRYPTO_KEYWORD_TO_TICKER.get(clean_coin.lower())
+            is_ticker = is_coin_token or bool(mapped_ticker) or (
+                clean_coin.isascii() and clean_coin.isalnum() and clean_coin.isupper() and 2 <= len(clean_coin) <= 8
+            )
+            target_ticker = mapped_ticker or clean_coin.upper()
+            try:
+                if is_ticker:
+                    raw_posts = fetch_binance_feed(count=per_kw, token=target_ticker, download_media=False) or []
+                    # 对中英文币名（如“比特币”、“Ethereum”），除币种专流外再补充关键词全文搜索以兼顾长文深度帖
+                    if not is_coin_token and not clean_coin.isupper():
+                        raw_posts.extend(fetch_binance_feed(count=max(6, per_kw // 2), keyword=kw, download_media=False) or [])
+                else:
+                    raw_posts = fetch_binance_feed(count=per_kw, keyword=kw, download_media=False) or []
+                    # 币安广场搜索对空格分隔的多词长短语（如 "黄仁勋 出轨"）可能只命中精确连写，补充去空格或核心词检索
+                    if len(raw_posts) < 3 and " " in kw:
+                        compact_kw = "".join(kw.split())
+                        if not compact_kw.isascii():
+                            raw_posts.extend(fetch_binance_feed(count=per_kw, keyword=compact_kw, download_media=False) or [])
+                        if not raw_posts:
+                            sub_terms = [t.strip() for t in kw.split() if len(t.strip()) >= 2][:2]
+                            for st in sub_terms:
+                                raw_posts.extend(fetch_binance_feed(count=per_kw, keyword=st, download_media=False) or [])
+            except Exception as e:
+                search_errors += 1
+                self.record_health_issue(
+                    code="BINANCE_SEARCH_ERROR",
+                    message=f"币安广场搜索关键词 {kw!r} 抛出异常: {e}",
+                    level="warning",
+                    channel=f"搜索:{kw}",
+                )
+                continue
+
+            normalized = self.normalize_batch(raw_posts, download_media=False)
+            for item in normalized:
+                pid = str(item.get("post_id") or "")
+                pub_ts = safe_int(item.get("publish_time"), 0)
+                if not pid:
+                    continue
+                if min_ts > 0 and pub_ts > 0 and pub_ts < min_ts:
+                    continue
+                by_id[pid] = item
+
+        if search_errors > 0 and search_errors == len(keywords):
+            self.record_health_issue(
+                code="BINANCE_SEARCH_ALL_FAILED",
+                message=f"币安广场全部 {len(keywords)} 个关键词搜索均异常失败",
+                level="critical",
+                channel="搜索流",
+            )
+
+        results = sorted(
+            by_id.values(),
+            key=lambda p: (
+                safe_int((p.get("engagement") or {}).get("like_count"), 0)
+                + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2
+                + safe_int((p.get("engagement") or {}).get("quote_count"), 0) * 2,
+                safe_int(p.get("publish_time"), 0),
+            ),
+            reverse=True,
+        )[:count]
+
+        if download_media and results:
+            results = self.normalize_batch(results, download_media=True)
+
+        if reset_health:
+            self.audit_posts_quality(
+                results,
+                scene="search",
+                expect_comments=True,
+                expect_media_download=download_media,
+                max_fresh_age_hours=max(72, hours_back or 72),
+            )
+            valid_ids = {p["post_id"] for p in results if self.is_valuable_post(p)}
+            results = [p for p in results if p["post_id"] in valid_ids]
+        return results
 
     def fetch_post_comments(
         self,
@@ -111,13 +269,21 @@ class BinanceHarvester(BasePlatformHarvester):
         return self.normalize_comments(cleaned, parent_post_id=str(post_id))
 
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        self.reset_health_state()
         cfg = config or {}
         recommend_count = safe_int(cfg.get("recommend_count"), 15)
+        include_hot_hashtags = bool(cfg.get("include_hot_hashtags", True))
+        hot_hashtags_count = safe_int(cfg.get("hot_hashtags_count"), 5)
+        posts_per_hashtag = safe_int(cfg.get("posts_per_hashtag"), 4)
+        include_hot_future_coins = bool(cfg.get("include_hot_future_coins", True))
+        hot_future_coins_count = safe_int(cfg.get("hot_future_coins_count"), 4)
         keywords = cfg.get("keywords") or []
-        coins = cfg.get("coins") or []
+        configured_coins = [str(c).strip().upper() for c in (cfg.get("coins") or []) if str(c).strip()]
         download_media = bool(cfg.get("download_media", True))
 
         self.last_channel_stats: Dict[str, int] = {}
+        self.last_hot_hashtags: List[str] = []
+        self.last_hot_coins: List[str] = []
         by_id: Dict[str, Dict[str, Any]] = {}
 
         # 1. 首页推荐流
@@ -128,20 +294,87 @@ class BinanceHarvester(BasePlatformHarvester):
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        # 2. 关键词搜索流
+        # 2. 币安官方实时热搜话题榜 (`hashtag/hot-list`)
+        if include_hot_hashtags and hot_hashtags_count > 0:
+            tag_posts = self.fetch_hot_hashtags_posts(
+                max_hashtags=hot_hashtags_count,
+                posts_per_hashtag=posts_per_hashtag,
+            )
+            self.last_channel_stats["官方热门话题榜"] = len(tag_posts)
+            for p in tag_posts:
+                if self.is_valuable_post(p, cfg):
+                    by_id[p["post_id"]] = p
+
+        # 3. 固定配置关键词搜索流
         for kw in keywords:
-            kw_posts = self.search_or_topic_posts(query=kw, count=safe_int(cfg.get("per_keyword_count"), 10), is_coin_token=False)
+            kw_posts = self.search_or_topic_posts(
+                query=kw,
+                count=safe_int(cfg.get("per_keyword_count"), 8),
+                is_coin_token=False,
+                download_media=False,
+                reset_health=False,
+            )
             self.last_channel_stats[f"关键词:{kw}"] = len(kw_posts)
             for p in kw_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        # 3. 热门币种流
-        for coin in coins:
-            c_posts = self.search_or_topic_posts(query=coin, count=safe_int(cfg.get("per_coin_count"), 6), is_coin_token=True)
-            self.last_channel_stats[f"币种:{coin}"] = len(c_posts)
+        # 4. 币安合约热搜榜异动币 (`topSearchList`) + 固定主流币去重合并
+        merged_coins: List[str] = []
+        if include_hot_future_coins and hot_future_coins_count > 0:
+            try:
+                raw_hot_futures = fetch_binance_future_hot_coins() or []
+                if not raw_hot_futures:
+                    self.record_health_issue(
+                        code="BINANCE_HOT_FUTURES_EMPTY",
+                        message="币安合约热搜币榜 (`topSearchList`) 返回为空",
+                        level="warning",
+                        channel="合约热搜币榜",
+                    )
+                for fc in raw_hot_futures:
+                    if not isinstance(fc, dict):
+                        continue
+                    base_sym = _strip_quote_asset(fc.get("symbol") or "")
+                    if base_sym and base_sym not in self.last_hot_coins:
+                        self.last_hot_coins.append(base_sym)
+                        if len(self.last_hot_coins) >= hot_future_coins_count:
+                            break
+                for hc in self.last_hot_coins:
+                    if hc not in merged_coins:
+                        merged_coins.append(hc)
+            except Exception as e:
+                self.record_health_issue(
+                    code="BINANCE_HOT_FUTURES_ERROR",
+                    message=f"拉取币安合约热搜币榜异常: {e}",
+                    level="warning",
+                    channel="合约热搜币榜",
+                )
+
+        for cc in configured_coins:
+            if cc not in merged_coins:
+                merged_coins.append(cc)
+
+        per_coin_cnt = safe_int(cfg.get("per_coin_count"), 5)
+        for coin in merged_coins:
+            c_posts = self.search_or_topic_posts(
+                query=coin,
+                count=per_coin_cnt,
+                is_coin_token=True,
+                download_media=False,
+                reset_health=False,
+            )
+            prefix = "热搜币" if coin in self.last_hot_coins else "币种"
+            self.last_channel_stats[f"{prefix}:{coin}"] = len(c_posts)
             for p in c_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        return self.normalize_batch(list(by_id.values()), download_media=download_media)
+        final_posts = self.normalize_batch(list(by_id.values()), download_media=download_media)
+        self.audit_posts_quality(
+            final_posts,
+            scene="harvest",
+            expect_comments=True,
+            expect_media_download=download_media,
+            max_fresh_age_hours=168,
+        )
+        return [p for p in final_posts if self.is_valuable_post(p, cfg)]
