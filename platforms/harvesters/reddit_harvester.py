@@ -89,12 +89,13 @@ DEFAULT_GOLDMINE_SUBREDDITS = [
 
 
 class _RedditHTMLParser(HTMLParser):
-    """使用 Python 标准库 HTMLParser 解析 Reddit Atom `<content>`，零正则提取正文与配图 URL。"""
+    """使用 Python 标准库 HTMLParser 解析 Reddit Atom `<content>`，零正则提取正文、配图与视频链接。"""
 
     def __init__(self) -> None:
         super().__init__()
         self.text_parts: List[str] = []
         self.image_urls: List[str] = []
+        self.video_urls: List[str] = []
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         attr_dict = dict(attrs)
@@ -105,7 +106,10 @@ class _RedditHTMLParser(HTMLParser):
             candidate_url = attr_dict.get("src") or ""
         if candidate_url.startswith(("http://", "https://")):
             clean_u = html.unescape(candidate_url)
-            if ("i.redd.it" in clean_u or "preview.redd.it" in clean_u or "imgur.com" in clean_u) and clean_u not in self.image_urls:
+            u_low = clean_u.lower()
+            if "v.redd.it" in u_low and clean_u not in self.video_urls:
+                self.video_urls.append(clean_u)
+            elif ("i.redd.it" in u_low or "preview.redd.it" in u_low or "imgur.com" in u_low) and clean_u not in self.image_urls:
                 self.image_urls.append(clean_u)
         if tag in ("p", "br", "div", "li", "tr"):
             self.text_parts.append("\n")
@@ -121,6 +125,18 @@ def _strip_reddit_prefix(raw: str) -> str:
         if s.lower().startswith(prefix):
             return s[len(prefix):].strip()
     return s
+
+
+def _extract_reddit_base36_id(raw_target: str) -> str:
+    """从完整帖子 URL 或 `reddit_xxx` / `t3_xxx` 中提取纯净 base36 ID。"""
+    s = str(raw_target or "").strip()
+    if "/comments/" in s:
+        after = s.split("/comments/", 1)[1].strip("/")
+        return after.split("/", 1)[0].strip()
+    if "/gallery/" in s:
+        after = s.split("/gallery/", 1)[1].strip("/")
+        return after.split("/", 1)[0].strip()
+    return s.replace("reddit_", "").replace("t3_", "").strip("/ ")
 
 
 def _deduplicate_reddit_image_urls(urls: List[str]) -> List[str]:
@@ -172,10 +188,10 @@ def _deduplicate_reddit_image_urls(urls: List[str]) -> List[str]:
     return [best_by_asset[k] for k in asset_order]
 
 
-def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str]]:
-    """从 Reddit Atom HTML 内容中提取纯文本与去重后的高清图片列表，剔除固定页脚。"""
+def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str], List[str]]:
+    """从 Reddit Atom HTML 内容中提取纯文本、去重高清图片列表与视频链接列表，剔除固定页脚。"""
     if not raw_html:
-        return "", []
+        return "", [], []
     parser = _RedditHTMLParser()
     parser.feed(raw_html)
     parser.close()
@@ -184,20 +200,35 @@ def _parse_reddit_html(raw_html: str) -> Tuple[str, List[str]]:
     footer_idx = raw_text.lower().rfind("submitted by")
     if footer_idx != -1 and ("[link]" in raw_text[footer_idx:].lower() or "[comments]" in raw_text[footer_idx:].lower()):
         raw_text = raw_text[:footer_idx]
-    return clean_post_text(raw_text), _deduplicate_reddit_image_urls(parser.image_urls)
+    return clean_post_text(raw_text), _deduplicate_reddit_image_urls(parser.image_urls), parser.video_urls
+
+
+def _extract_urls_from_plain_text(text: str) -> List[str]:
+    """从评论纯文本中提取直接附带的 Reddit / Imgur 图片链接。"""
+    found: List[str] = []
+    for tok in str(text or "").split():
+        clean_tok = tok.strip("()[]<>\"',.;")
+        low = clean_tok.lower()
+        if low.startswith(("http://", "https://")) and any(d in low for d in ("i.redd.it/", "preview.redd.it/", "i.imgur.com/")):
+            if clean_tok not in found:
+                found.append(clean_tok)
+    return _deduplicate_reddit_image_urls(found)
 
 
 class RedditHarvester(BasePlatformHarvester):
     """
     Reddit 平台采集与归一化适配器（100% 免登录、0 账号成本）。
+    主帖流走单次多板块 Atom RSS 聚合请求，并结合免登公开镜像接口补齐真实赞评数、多图 Gallery 全量原图、视频标记与高赞神评树。
     """
 
     SOURCE_NAME = PLATFORM_REDDIT
+    ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com/api"
 
     def __init__(self, proxies: Optional[Dict[str, str]] = None):
         super().__init__(proxies=proxies)
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": FIREFOX_UA})
+        self._last_rss_rl_remaining: float = 1.0
 
     def _parse_atom_entries(self, xml_text: str) -> List[Dict[str, Any]]:
         """内部核心：解析 Reddit Atom XML 中的 `<entry>` 列表并转换为统一标准 Schema"""
@@ -209,7 +240,6 @@ class RedditHarvester(BasePlatformHarvester):
         for idx, ent in enumerate(entries):
             raw_id = (ent.find("atom:id", ns).text or "") if ent.find("atom:id", ns) is not None else ""
             if "t1_" in raw_id:
-                # t1_ 是评论节点，跳过主帖解析
                 continue
             post_id = raw_id.replace("t3_", "").strip()
             if not post_id:
@@ -226,11 +256,13 @@ class RedditHarvester(BasePlatformHarvester):
 
             content_el = ent.find("atom:content", ns)
             raw_html = html.unescape(content_el.text or "") if content_el is not None else ""
-            body_txt, imgs = _parse_reddit_html(raw_html)
+            body_txt, imgs, vids = _parse_reddit_html(raw_html)
 
+            video_url = vids[0] if vids else (post_url if "v.redd.it" in post_url.lower() else None)
             full_text = f"【Reddit r/{sub_name}】{title}\n{body_txt}".strip() if body_txt else f"【Reddit r/{sub_name}】{title}"
 
-            item = self.create_empty_post(card_type="BUZZ_LONG" if len(body_txt) > 500 else "BUZZ_SHORT")
+            card_type = "BUZZ_VIDEO" if video_url else ("BUZZ_LONG" if len(body_txt) > 500 else "BUZZ_SHORT")
+            item = self.create_empty_post(card_type=card_type)
             item["post_id"] = f"reddit_{post_id}"
             item["publish_time"] = normalize_publish_timestamp(updated_str)
             item["author_id"] = author_name
@@ -248,8 +280,9 @@ class RedditHarvester(BasePlatformHarvester):
             item["media"].update({
                 "cover_image": imgs[0] if imgs else None,
                 "images": imgs,
+                "video_url": video_url,
+                "video_duration": 1 if video_url else 0,
             })
-            # 忠实记录原始值（Reddit Atom RSS 不返回精确赞数/浏览量，在 platform_extra 中记录热榜排名 rank_in_feed）
             item["engagement"].update({
                 "view_count": 0,
                 "like_count": 0,
@@ -263,6 +296,102 @@ class RedditHarvester(BasePlatformHarvester):
             results.append(self.normalize_post(item, download_media=False))
 
         return results
+
+    def _enrich_posts_via_arctic_shift(self, posts: List[Dict[str, Any]]) -> None:
+        """
+        单次批量请求公开镜像 `posts/ids`，无损补齐：
+        1) 真实点赞数 (`score`) 与评论数 (`num_comments`)；
+        2) 多图相册 (`/gallery/...`) 在 RSS 中被折叠的全部高清原图；
+        3) 精确视频帖标记 (`is_video` / `reddit_video` / `v.redd.it`)。
+        若镜像偶发超时，静默跳过，完全不影响主流程。
+        """
+        if not posts:
+            return
+        id_map: Dict[str, Dict[str, Any]] = {}
+        for p in posts:
+            b36 = _extract_reddit_base36_id(p.get("post_id", ""))
+            if b36:
+                id_map[b36] = p
+        if not id_map:
+            return
+
+        mime_to_ext = {
+            "image/png": "png",
+            "image/jpg": "jpg",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+            "image/gif": "gif",
+        }
+
+        try:
+            resp = self.session.get(
+                f"{self.ARCTIC_SHIFT_BASE}/posts/ids",
+                params={"ids": ",".join(id_map.keys())},
+                proxies=self.proxies,
+                timeout=12,
+            )
+            if resp.status_code != 200:
+                return
+            for meta in (resp.json().get("data") or []):
+                if not isinstance(meta, dict):
+                    continue
+                pid = str(meta.get("id") or "").strip()
+                item = id_map.get(pid)
+                if not item:
+                    continue
+
+                eng = item.setdefault("engagement", {})
+                eng["like_count"] = max(safe_int(eng.get("like_count"), 0), safe_int(meta.get("score"), 0))
+                eng["comment_count"] = max(safe_int(eng.get("comment_count"), 0), safe_int(meta.get("num_comments"), 0))
+
+                # 精确识别 Reddit 原生视频帖
+                rv = ((meta.get("media") or {}).get("reddit_video")) or ((meta.get("secure_media") or {}).get("reddit_video")) or {}
+                ext_url = str(meta.get("url") or "")
+                is_vid = bool(
+                    meta.get("is_video")
+                    or rv
+                    or str(meta.get("domain") or "").lower() == "v.redd.it"
+                    or "v.redd.it" in ext_url.lower()
+                )
+                if is_vid:
+                    v_url = rv.get("fallback_url") or (ext_url if "v.redd.it" in ext_url.lower() else f"https://v.redd.it/{pid}")
+                    item["card_type"] = "BUZZ_VIDEO"
+                    item["media"]["video_url"] = v_url
+                    item["media"]["video_duration"] = max(1, safe_int(rv.get("duration"), 1))
+
+                # 补齐 Reddit 多图相册 (Gallery) 的全部高清原图
+                mm = meta.get("media_metadata") or {}
+                if isinstance(mm, dict) and mm:
+                    ordered_mids: List[str] = []
+                    g_items = ((meta.get("gallery_data") or {}).get("items")) or []
+                    for gi in g_items:
+                        if isinstance(gi, dict) and not gi.get("is_deleted") and gi.get("media_id"):
+                            ordered_mids.append(str(gi["media_id"]))
+                    for k in mm.keys():
+                        if k not in ordered_mids:
+                            ordered_mids.append(str(k))
+
+                    gallery_urls: List[str] = []
+                    for mid in ordered_mids:
+                        m_obj = mm.get(mid) or {}
+                        if m_obj.get("e") == "RedditVideo":
+                            item["card_type"] = "BUZZ_VIDEO"
+                            item["media"]["video_url"] = item["media"].get("video_url") or f"https://v.redd.it/{mid}"
+                            continue
+                        ext = mime_to_ext.get(str(m_obj.get("m") or "").lower(), "")
+                        if ext:
+                            gallery_urls.append(f"https://i.redd.it/{mid}.{ext}")
+                        else:
+                            s_url = html.unescape(str(((m_obj.get("s") or {}).get("u")) or ""))
+                            if s_url:
+                                gallery_urls.append(s_url)
+
+                    if gallery_urls:
+                        merged_imgs = _deduplicate_reddit_image_urls(gallery_urls + list(item["media"].get("images") or []))
+                        item["media"]["images"] = merged_imgs
+                        item["media"]["cover_image"] = merged_imgs[0] if merged_imgs else None
+        except Exception as e:
+            logger.debug(f"[Reddit适配器] 批量元数据富化跳过: {e}")
 
     # ==========================================================================
     # 四大通用原语实现
@@ -285,11 +414,16 @@ class RedditHarvester(BasePlatformHarvester):
         url = f"https://www.reddit.com/r/{combined}/{sort}/.rss?t={time_filter}&limit={max(count, 25)}"
         try:
             resp = self.session.get(url, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+            try:
+                self._last_rss_rl_remaining = float(resp.headers.get("x-ratelimit-remaining", "1.0"))
+            except ValueError:
+                self._last_rss_rl_remaining = 0.0
             if resp.status_code != 200:
                 logger.warning(f"[Reddit适配器] 多板块 RSS 返回 HTTP {resp.status_code}")
                 return []
-            posts = self._parse_atom_entries(resp.text)
-            return posts[:count]
+            posts = self._parse_atom_entries(resp.text)[:count]
+            self._enrich_posts_via_arctic_shift(posts)
+            return posts
         except Exception as e:
             logger.warning(f"[Reddit适配器] 拉取多板块热榜异常: {e}")
             return []
@@ -304,7 +438,9 @@ class RedditHarvester(BasePlatformHarvester):
             resp = self.session.get(url, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 return []
-            return self._parse_atom_entries(resp.text)[:count]
+            posts = self._parse_atom_entries(resp.text)[:count]
+            self._enrich_posts_via_arctic_shift(posts)
+            return posts
         except Exception as e:
             logger.warning(f"[Reddit适配器] 拉取用户 u/{clean_user} 异常: {e}")
             return []
@@ -341,27 +477,74 @@ class RedditHarvester(BasePlatformHarvester):
 
     def fetch_post_comments(self, post_id: str, max_comments: int = 10, **kwargs) -> List[Dict[str, Any]]:
         """
-        原语 4：免登通过单帖 `.rss` 提取该帖底下的前排高赞神评（自动过滤 AutoModerator 机器人置顶回复）。
-        `post_id` 支持传入完整帖子 URL 或 `reddit_xxx` / `xxx` ID。
+        原语 4：免登提取指定帖子的前排高赞神评（自动过滤机器人与删除楼层，带真实点赞数且零 429 限流）。
+        优先走公开镜像 `comments/tree`，若未命中且当前 RSS 令牌桶尚有余量则回退 `.rss`。
         """
         raw_target = str(post_id or "").strip()
-        if not raw_target:
+        clean_id = _extract_reddit_base36_id(raw_target)
+        if not clean_id:
             return []
-        if raw_target.startswith("http"):
-            rss_url = raw_target.rstrip("/") + f"/.rss?limit={max_comments + 4}"
-        else:
-            clean_id = raw_target.replace("reddit_", "").replace("t3_", "")
-            rss_url = f"https://www.reddit.com/comments/{clean_id}/.rss?limit={max_comments + 4}"
 
+        parent_pid = f"reddit_{clean_id}"
+
+        # 通道 A：零限流公开镜像评论树（原生携带真实点赞 score）
+        try:
+            resp = self.session.get(
+                f"{self.ARCTIC_SHIFT_BASE}/comments/tree",
+                params={"link_id": clean_id, "limit": max(25, max_comments * 3)},
+                proxies=self.proxies,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                nodes = resp.json().get("data") or []
+                parsed_comments: List[Dict[str, Any]] = []
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    d = node.get("data") if isinstance(node.get("data"), dict) else node
+                    author = _strip_reddit_prefix(str(d.get("author") or ""))
+                    if not author or author.lower() in ("automoderator", "visualmod", "[deleted]", "none"):
+                        continue
+                    body = clean_post_text(html.unescape(str(d.get("body") or "")))
+                    if not body or body.lower() in ("[deleted]", "[removed]"):
+                        continue
+                    c_imgs = _extract_urls_from_plain_text(body)
+                    parsed_comments.append({
+                        "reply_id": str(d.get("id") or ""),
+                        "parent_id": parent_pid,
+                        "create_time": safe_int(d.get("created_utc"), int(time.time())),
+                        "author_uid": author,
+                        "author_name": author,
+                        "content": body,
+                        "likes": safe_int(d.get("score"), 0),
+                        "images": c_imgs,
+                    })
+                if parsed_comments:
+                    parsed_comments.sort(key=lambda x: x["likes"], reverse=True)
+                    return self.normalize_comments(parsed_comments[:max_comments], parent_post_id=parent_pid)
+        except Exception as e:
+            logger.debug(f"[Reddit适配器] 镜像评论树 {clean_id} 异常: {e}")
+
+        # 通道 B：仅在独立单帖调试且 RSS 令牌桶未耗尽时回退 `.rss`
+        if self._last_rss_rl_remaining <= 0.0:
+            return []
+        rss_url = (
+            raw_target.rstrip("/") + f"/.rss?limit={max_comments + 4}"
+            if raw_target.startswith("http")
+            else f"https://www.reddit.com/comments/{clean_id}/.rss?limit={max_comments + 4}"
+        )
         try:
             resp = self.session.get(rss_url, proxies=self.proxies, timeout=12)
+            try:
+                self._last_rss_rl_remaining = float(resp.headers.get("x-ratelimit-remaining", "0.0"))
+            except ValueError:
+                self._last_rss_rl_remaining = 0.0
             if resp.status_code != 200:
                 return []
             root = ET.fromstring(resp.text)
             ns = {"atom": "http://www.w3.org/2005/Atom"}
             entries = root.findall("atom:entry", ns)
             raw_comments = []
-            # 第 0 个 entry 是主帖本身，后续 entry 为按热度排序的评论
             for ent in entries[1:]:
                 c_id = (ent.find("atom:id", ns).text or "").replace("t1_", "") if ent.find("atom:id", ns) is not None else ""
                 author_el = ent.find("atom:author/atom:name", ns)
@@ -371,12 +554,12 @@ class RedditHarvester(BasePlatformHarvester):
                 updated_str = ent.find("atom:updated", ns).text if ent.find("atom:updated", ns) is not None else ""
                 content_el = ent.find("atom:content", ns)
                 raw_html = html.unescape(content_el.text or "") if content_el is not None else ""
-                txt, c_imgs = _parse_reddit_html(raw_html)
+                txt, c_imgs, _ = _parse_reddit_html(raw_html)
                 if not txt and not c_imgs:
                     continue
                 raw_comments.append({
                     "reply_id": c_id,
-                    "parent_id": raw_target,
+                    "parent_id": parent_pid,
                     "create_time": normalize_publish_timestamp(updated_str),
                     "author_uid": author,
                     "author_name": author,
@@ -386,7 +569,7 @@ class RedditHarvester(BasePlatformHarvester):
                 })
                 if len(raw_comments) >= max_comments:
                     break
-            return self.normalize_comments(raw_comments, parent_post_id=raw_target)
+            return self.normalize_comments(raw_comments, parent_post_id=parent_pid)
         except Exception as e:
             logger.debug(f"[Reddit适配器] 拉取评论 {rss_url} 异常: {e}")
             return []
@@ -400,7 +583,7 @@ class RedditHarvester(BasePlatformHarvester):
         sort = cfg.get("sort", "top")
         time_filter = cfg.get("time_filter", "day")
         limit = safe_int(cfg.get("limit"), 20)
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 0)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 15)
         keywords = cfg.get("keywords")
         download_media = bool(cfg.get("download_media", True))
 
@@ -418,11 +601,9 @@ class RedditHarvester(BasePlatformHarvester):
 
         if top_n_comments > 0 and valuable_posts:
             for item in valuable_posts[:top_n_comments]:
-                post_url = (item.get("metadata") or {}).get("url") or item["post_id"]
-                comments = self.fetch_post_comments(post_url, max_comments=8)
+                comments = self.fetch_post_comments(item["post_id"], max_comments=8)
                 if comments:
                     item["comments"] = comments
                     item["engagement"]["comment_count"] = max(item["engagement"].get("comment_count", 0), len(comments))
-                time.sleep(0.3)
 
         return self.normalize_batch(valuable_posts, download_media=download_media)

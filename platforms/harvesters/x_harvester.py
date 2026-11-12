@@ -228,8 +228,8 @@ def _parse_cookie_dict(cookie_str: str) -> dict:
     return out
 
 
-def _extract_gql_tweet_objects(data) -> list:
-    """提取 GraphQL 响应树中的 Tweet 节点（自动解包 TweetWithVisibilityResults 并跳过官方 Promoted 广告容器）"""
+def _extract_gql_tweet_objects(data, skip_pinned: bool = False) -> list:
+    """提取 GraphQL 响应树中的 Tweet 节点（自动解包 TweetWithVisibilityResults，跳过广告容器与可选置顶旧帖节点）"""
     found = []
 
     def walk(obj):
@@ -238,6 +238,12 @@ def _extract_gql_tweet_objects(data) -> list:
             if "promotedMetadata" in obj:
                 return
             tname = obj.get("__typename")
+            if skip_pinned and (
+                obj.get("type") == "TimelinePinEntry"
+                or tname == "TimelinePinEntry"
+                or str(obj.get("entryId") or "").startswith("pinned")
+            ):
+                return
             if tname == "TweetWithVisibilityResults" and isinstance(obj.get("tweet"), dict):
                 walk(obj["tweet"])
                 return
@@ -458,12 +464,41 @@ class XHarvester(BasePlatformHarvester):
         if isinstance(quoted_res, dict) and quoted_res.get("legacy"):
             q_leg = quoted_res["legacy"]
             q_user = (((quoted_res.get("core") or {}).get("user_results") or {}).get("result") or {}).get("legacy") or {}
-            q_txt = _clean_x_text_with_entities(q_leg.get("full_text") or "", q_leg)
+            q_note = (((quoted_res.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}).get("text")
+            q_txt = _clean_x_text_with_entities(q_note or q_leg.get("full_text") or "", q_leg)
+            q_media = (q_leg.get("extended_entities") or {}).get("media") or (q_leg.get("entities") or {}).get("media") or []
+            q_images = []
+            q_has_video = False
+            for qm in q_media:
+                if not isinstance(qm, dict):
+                    continue
+                qm_type = qm.get("type")
+                qm_img = qm.get("media_url_https")
+                if qm_type == "photo" and qm_img:
+                    q_images.append(qm_img)
+                    if qm_img not in images:
+                        images.append(qm_img)
+                elif qm_type in ("video", "animated_gif"):
+                    q_has_video = True
+                    if qm_img and qm_img not in images:
+                        images.append(qm_img)
+                    q_variants = ((qm.get("video_info") or {}).get("variants")) or []
+                    q_mp4s = [v for v in q_variants if v.get("content_type") == "video/mp4" and v.get("url")]
+                    if q_mp4s and not video_url:
+                        q_mp4s.sort(key=lambda x: safe_int(x.get("bitrate"), 0), reverse=True)
+                        video_url = q_mp4s[0]["url"]
+                    elif not video_url:
+                        video_url = qm_img or "https://x.com/i/videos/quoted"
+                    if not video_duration:
+                        video_duration = max(1, int(safe_int((qm.get("video_info") or {}).get("duration_millis"), 0) / 1000))
+
             quoted_data = {
                 "post_id": str(quoted_res.get("rest_id") or ""),
                 "username": q_user.get("screen_name", ""),
                 "text": q_txt,
                 "likes": safe_int(q_leg.get("favorite_count"), 0),
+                "images": q_images,
+                "has_video": q_has_video,
             }
             if q_txt and q_txt not in clean_txt:
                 clean_txt = f"{clean_txt}\n[引用 @{quoted_data['username']}]: {q_txt}".strip()
@@ -524,14 +559,15 @@ class XHarvester(BasePlatformHarvester):
         """
         原语 2：拉取指定大 V (`@handle` 或数字 UID) 的推文。
         自动路由策略：
-        - 若该大 V 支持免登实时流 (`guest_realtime=True`)，优先走 0 账号 Guest Token 通道，不消耗小号配额；
-        - 若该大 V 在免登下仅返回历史缓存（如 `@unusual_whales`）且当前已配小号，自动切换小号登录态拿今日实时新帖！
+        - 若当前已配只读小号 (`has_burner_account=True`)，默认统一走小号登录态并跳过主页置顶旧帖 (`skip_pinned=True`)，
+          彻底杜绝免登模式下部分大 V 夹带返回 2025 年历史缓存热帖的问题；
+        - 若未配小号或小号请求临时限流，自动平滑回退免登 Guest Token 通道。
         """
         clean_name = str(user_id).lstrip("@").strip()
         meta_info = VERIFIED_X_ACCOUNTS.get(clean_name) or {}
         category = meta_info.get("category", "x_kol")
-        guest_ok = meta_info.get("guest_realtime", True)
-        use_burner = (force_burner or not guest_ok) and self.has_burner_account
+        prefer_guest = bool(kwargs.get("prefer_guest", False)) and not force_burner
+        use_burner = self.has_burner_account and not prefer_guest
 
         uid = self.resolve_user_id(clean_name)
         if not uid:
@@ -546,34 +582,41 @@ class XHarvester(BasePlatformHarvester):
             "withVoice": True,
             "withV2Timeline": True,
         }
+        req_params = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
+        }
         headers = self._get_burner_headers() if use_burner else self._get_guest_headers()
         try:
             resp = self.session.get(
                 url,
                 headers=headers,
-                params={
-                    "variables": json.dumps(variables, separators=(",", ":")),
-                    "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
-                },
+                params=req_params,
                 proxies=self.proxies,
                 timeout=REQUEST_TIMEOUT,
             )
-            if resp.status_code == 429 and not use_burner:
+            if resp.status_code != 200 and use_burner:
+                # 小号若偶发限流/失效，自动回退免登通道
+                resp = self.session.get(
+                    url,
+                    headers=self._get_guest_headers(),
+                    params=req_params,
+                    proxies=self.proxies,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            elif resp.status_code == 429 and not use_burner:
                 self._refresh_guest_token()
                 resp = self.session.get(
                     url,
                     headers=self._get_guest_headers(),
-                    params={
-                        "variables": json.dumps(variables, separators=(",", ":")),
-                        "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
-                    },
+                    params=req_params,
                     proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
             if resp.status_code != 200:
                 return []
 
-            raw_nodes = _extract_gql_tweet_objects(resp.json())
+            raw_nodes = _extract_gql_tweet_objects(resp.json(), skip_pinned=True)
             by_id = {}
             for node in raw_nodes:
                 legacy_node = node.get("legacy") or {}

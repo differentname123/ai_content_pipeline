@@ -2,17 +2,14 @@
 """
 真实像素视觉工作室 (`visual_studio.py`)
 
-核心红线与 80/20 实证原则：
-1. 严禁凭空 AI 生图 (`generate`) 与破坏原图像素的全图重绘——杜绝一眼假的 AI 插画。
-2. 100% 基于采集到的真实原帖图片，执行高可靠、零失真的确定性像素编辑：
-   - `none`  ：无合适真实原图时直接发纯文本推文（`final_image_paths = []`）；
-   - `reuse` ：直接复用 1~4 张画面干净的真实原图（零损复制）；
-   - `crop`  ：按多模态模型输出的归一化坐标 `[ymin, xmin, ymax, xmax]` (0..1000) 精准裁掉手机状态栏、
-               社交软件顶底栏、原作者昵称及边缘水印，100% 保留主体原始清晰像素；
-   - `stitch`：将 2~3 张强关联真实原图（支持先各自裁剪核心区）按等高横向或等宽纵向无损比例拼接，
-               自动规避极端细长条比例，适配 X 信息流最佳展示尺寸；
-   - `mask_boxes`（可选局部去小水印）：仅针对画面保留区内面积 `<= 8%` 的边角小水印执行平滑拉普拉斯边界插值消除，
-               内置面积硬护栏，绝不允许涂抹画面中心主体。
+核心准则：
+1. 严禁凭空 AI 生图 (`generate`) 与破坏原图像素的全图重绘。
+2. 100% 基于采集到的真实原帖图片，执行高可靠、零失真的确定性像素编辑（不设图片像素宽高门槛，不截断图片张数）：
+   - `none`  ：不配图，直接发纯文本（`final_image_paths = []`）；
+   - `reuse` ：直接无损复用真实原图；
+   - `crop`  ：按多模态模型输出的归一化坐标 `[ymin, xmin, ymax, xmax]` (0..1000) 精准裁掉外围软件界面栏、状态栏或边缘水印；
+   - `stitch`：将 2~3 张强关联真实原图（支持先各自裁剪核心区）按等高横向或等宽纵向无变形拼接；
+   - `mask_boxes`（可选局部去小水印）：仅针对画面保留区内面积 `<= 8%` 的边角小水印执行平滑拉普拉斯边界插值消除。
 """
 import shutil
 import time
@@ -24,7 +21,6 @@ from PIL import Image
 
 from content_pipeline.pipeline_config import PIPELINE_VISUAL_DIR
 
-MAX_X_PUBLISH_IMAGES = 4
 MAX_MASK_AREA_RATIO = 0.08
 MAX_MASK_HEIGHT_RATIO = 0.22
 STITCH_GAP_PX = 8
@@ -78,16 +74,16 @@ def _validate_crop_pixel_box(
     orig_w: int,
     orig_h: int,
 ) -> Tuple[bool, str]:
-    """校验裁剪框物理尺寸与长宽比合理性，防止异常坐标把图裁成残缺细条。"""
+    """仅做基础非退化数学防呆校验（防止异常坐标裁出零尺寸或极端一条线），不设硬编码分辨率门槛。"""
     left, top, right, bottom = px_box
     cw, ch = right - left, bottom - top
-    if cw < 160 or ch < 120:
-        return False, f"裁剪后尺寸过小({cw}x{ch})"
+    if cw < 16 or ch < 16:
+        return False, f"裁剪框退化过小({cw}x{ch})"
     orig_area = max(1, orig_w * orig_h)
-    if (cw * ch) / orig_area < 0.14:
+    if (cw * ch) / orig_area < 0.08:
         return False, f"裁剪面积占比过低({(cw * ch) / orig_area:.1%})"
     aspect = cw / max(1, ch)
-    if aspect < 0.22 or aspect > 4.5:
+    if aspect < 0.15 or aspect > 6.0:
         return False, f"裁剪长宽比极端({aspect:.2f})"
     return True, ""
 
@@ -99,7 +95,7 @@ def _heal_small_watermark_boxes(
 ) -> Tuple[Image.Image, List[str]]:
     """
     使用边界中值初始化 + 向量化拉普拉斯谐波插值（Laplace Harmonic Inpainting），
-    平滑消除画面边角的小尺寸文字/台标水印。
+    平滑消除画面边角的小尺寸文字/角标水印。
     严格护栏：单框面积不得超过保留画面面积的 8%，高度不得超过保留高度的 22%。
     """
     notes: List[str] = []
@@ -120,7 +116,6 @@ def _heal_small_watermark_boxes(
         if nb is None:
             continue
         x1, y1, x2, y2 = _norm_box_to_pixels(nb, w, h)
-        # 计算与保留裁剪区的交集，若该水印本就已被裁剪框切掉则无需涂抹
         ix1, iy1 = max(x1, k_left), max(y1, k_top)
         ix2, iy2 = min(x2, k_right), min(y2, k_bottom)
         if ix2 - ix1 < 4 or iy2 - iy1 < 4:
@@ -132,7 +127,6 @@ def _heal_small_watermark_boxes(
             notes.append(f"mask#{idx + 1}:oversized_skipped({box_area / kept_area:.1%})")
             continue
 
-        # 微扩 2px 覆盖文字抗锯齿边缘
         pad_inner = 2
         mx1 = max(0, x1 - pad_inner)
         my1 = max(0, y1 - pad_inner)
@@ -156,7 +150,6 @@ def _heal_small_watermark_boxes(
         init_color = np.median(border_pixels, axis=0)
         patch[mask] = init_color
 
-        # 60 次向量化四邻域拉普拉斯松弛，毫秒级无缝过渡背景渐变或纯色底板
         for _ in range(60):
             up = np.vstack([patch[0:1, :], patch[:-1, :]])
             down = np.vstack([patch[1:, :], patch[-1:, :]])
@@ -174,9 +167,7 @@ def _heal_small_watermark_boxes(
 
 
 def _save_crisp_image(img: Image.Image, dest_base: Path, prefer_png: bool = False) -> Tuple[Path, Dict[str, Any]]:
-    """
-    高保真保存：截图/表格类 PNG 保持无损 PNG（防止小字边缘出现 JPEG 噪点），照片类保存为 95 质量无色度抽样 JPG。
-    """
+    """高保真保存：PNG 源保持无损 PNG，照片源保存为 95 质量无色度抽样 JPG。"""
     dest_base.parent.mkdir(parents=True, exist_ok=True)
     rgb = img.convert("RGB")
     w, h = rgb.size
@@ -228,11 +219,7 @@ def _stitch_panels(
     panels: List[Image.Image],
     requested_layout: str = "auto",
 ) -> Tuple[Image.Image, str]:
-    """
-    将 2~3 张真实画面按原比例无变形拼接为一张高可读性组合图：
-    - 竖屏/方图默认横向并排 (`horizontal`)，横屏宽图默认纵向叠放 (`vertical`)；
-    - 若纵向叠放会导致总高宽比 `> 2.5`（在 X 信息流会被严重上下截断），自动转为横向并排。
-    """
+    """将 2~3 张真实画面按原比例无变形拼接为一张高可读性组合图。"""
     layout = str(requested_layout or "auto").strip().lower()
     avg_aspect = sum(im.size[0] / max(1, im.size[1]) for im in panels) / len(panels)
 
@@ -307,7 +294,6 @@ def produce_visual_asset(
         trace["duration_seconds"] = round(time.perf_counter() - started, 3)
         return trace
 
-    # 解析有效的候选图条目（按请求顺序去重，最多 4 张）
     valid_specs: List[Dict[str, Any]] = []
     seen_ids = set()
     for it in raw_items:
@@ -322,8 +308,7 @@ def produce_visual_asset(
         try:
             with Image.open(src_p) as im_chk:
                 sw, sh = im_chk.size
-            if min(sw, sh) < 120 or max(sw, sh) < 240:
-                trace["operation_notes"].append(f"{img_id}:tiny_thumbnail_skipped({sw}x{sh})")
+            if sw < 2 or sh < 2:
                 continue
         except Exception:
             continue
@@ -336,11 +321,8 @@ def produce_visual_asset(
                 "mask_boxes": it.get("mask_boxes") if isinstance(it.get("mask_boxes"), list) else [],
             }
         )
-        if len(valid_specs) >= MAX_X_PUBLISH_IMAGES:
-            break
 
     if not valid_specs:
-        # 若模型动作非 none 但未正确填写 items，安全回退为不配图（绝不乱塞无关图或 AI 生图）
         trace["operation_notes"].append("no_valid_items_matched_fallback_to_none")
         trace["duration_seconds"] = round(time.perf_counter() - started, 3)
         return trace
@@ -349,7 +331,6 @@ def produce_visual_asset(
     trace["selected_image_ids"] = [s["image_id"] for s in valid_specs]
     trace["source_image_paths"] = [str(s["source_path"]) for s in valid_specs]
 
-    # 路径 1：多图拼接 (`stitch`，需至少 2 张有效图；若仅 1 张则自动平滑转为单图 `crop` / `reuse`)
     if requested_action == "stitch" and len(valid_specs) >= 2:
         panels: List[Image.Image] = []
         prefer_png = False
@@ -377,7 +358,6 @@ def produce_visual_asset(
         trace["duration_seconds"] = round(time.perf_counter() - started, 3)
         return trace
 
-    # 路径 2：单图或多图独立复用/裁剪/去边角水印 (`reuse` / `crop`)
     final_paths: List[str] = []
     metas: List[Dict[str, Any]] = []
     any_modified = False

@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Module 2 (Step 3)：全局单窗口按短编号归堆与选题模块 (`step3_topic_grouping.py`)
+阶段 3 (Step 3)：全局单窗口归堆与选题模块 (`step3_topic_grouping.py`)
 
-本质职责：
-1. 将各平台公平轮询入选的合格情报卡，连同实时互动/热榜排名与可用原图描述，一次性放入同一个上下文窗口；
-2. 由模型在全局视野内按短编号（`#1..#N`）合并同事件多帖（含带图帖）或挑出独立好帖；
-3. 严守阶段边界：只输出选题与关联原帖映射，绝不生成 `creative_angle` 等长文提纲干扰下游原生创作。
-
-可独立运行调试：直接在 IDE 运行本文件，即可基于库中已有的 `pipeline_post_digests` 执行一次全局归堆选题。
+唯一固定职责：
+1. 通览时间窗口内全部可用单帖档案（不剔除历史已用原帖，保证事件前因后果完整；防重交由后续独立发布层负责）；
+2. 将讨论同一事件的多条帖子完整归并，不强制要求有图、不限制纯文本比例；
+3. 严守阶段边界：仅输出选题概述与关联原帖映射，绝不生成写作提纲干扰下游创作。
 """
 import sys
 import time
@@ -54,7 +52,7 @@ def _validate_step3_json(data: Dict[str, Any]) -> Optional[str]:
 
 
 def _format_engagement_label(source: str, raw_post: Optional[Dict[str, Any]]) -> str:
-    """客观呈现各平台真实热度信号，避免将不返回公开赞数的 Reddit RSS 误标为 0 赞冷帖。"""
+    """客观呈现各平台真实热度信号。"""
     p = raw_post or {}
     eng = p.get("engagement") or {}
     views = int(eng.get("view_count") or 0)
@@ -64,12 +62,14 @@ def _format_engagement_label(source: str, raw_post: Optional[Dict[str, Any]]) ->
     l_vel = float(eng.get("likes_per_hour") or 0.0)
     v_vel = float(eng.get("views_per_hour") or 0.0)
 
-    if str(source).lower() == "reddit" and views == 0 and likes == 0:
+    if str(source).lower() == "reddit":
         extra = ((p.get("metadata") or {}).get("platform_extra") or {})
         sub = extra.get("subreddit") or "r/reddit"
         rank = extra.get("rank_in_feed")
-        rank_str = f"24h多板块热榜第 #{rank} 名" if rank else "24h热榜入选"
-        return f"{sub} {rank_str} (RSS无公开赞数)"
+        rank_part = f"24h热榜#{rank}" if rank else "24h热榜"
+        if likes > 0 or comments > 0:
+            return f"{sub} {rank_part}, 赞:{likes}, 评:{comments}"
+        return f"{sub} {rank_part}"
 
     parts = []
     if views > 0:
@@ -90,27 +90,27 @@ def _format_candidate_card_block(
     digest: Dict[str, Any],
     live_raw_post: Optional[Dict[str, Any]],
 ) -> str:
-    """将单张情报卡、实时平台热度与可用主帖原图说明拼装为高信噪比审阅卡片。"""
+    """将单帖档案、平台热度与全部主帖原图客观说明组装为审阅卡片。"""
     source = str(digest.get("source") or "unknown")
     heat_str = _format_engagement_label(source, live_raw_post)
 
-    usable_imgs = [
+    post_imgs = [
         im for im in (digest.get("images") or [])
-        if isinstance(im, dict) and im.get("usable_as_visual") and im.get("local_path")
+        if isinstance(im, dict) and im.get("local_path")
     ]
-    if usable_imgs:
-        img_descs = "；".join(str(im.get("desc") or "").strip()[:90] for im in usable_imgs[:2])
-        visual_str = f"可用原图({len(usable_imgs)}张): {img_descs}"
+    if post_imgs:
+        img_descs = "；".join(str(im.get("desc") or "").strip()[:100] for im in post_imgs)
+        visual_str = f"附带原图({len(post_imgs)}张): {img_descs}"
     else:
-        visual_str = "可用原图: 无"
+        visual_str = "附带原图: 0张"
 
     lines = [
         f"[{alias}] 平台:{source} | 热度({heat_str}) | {visual_str}",
-        f"  - 事实与看点: {digest.get('summary') or digest.get('complete_summary') or ''}",
+        f"  - 内容还原: {digest.get('summary') or ''}",
     ]
-    val_comms = digest.get("valuable_comments") or digest.get("comment_essence") or []
+    val_comms = digest.get("valuable_comments") or []
     if val_comms:
-        lines.append("  - 评论补充/神评: " + "；".join(str(c) for c in val_comms[:3]))
+        lines.append("  - 评论增量: " + "；".join(str(c) for c in val_comms[:4]))
     return "\n".join(lines)
 
 
@@ -121,7 +121,7 @@ def run_step3_topic_selection(
     run_id: str = "manual_step3",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
-    执行 Step 3 单窗口全局归堆与爆款选题。
+    执行 Step 3 单窗口全局归堆与选题。
     返回 `(step3_summary, selected_topic_records)`。
     """
     logger = get_pipeline_logger()
@@ -137,29 +137,14 @@ def run_step3_topic_selection(
     lookback_hours = float(cfg.get("lookback_hours", 36))
     usable_digests = db.fetch_usable_digests(lookback_hours=lookback_hours, limit=500)
 
-    dedup_hours = float(cfg.get("dedup_used_posts_hours", 72))
-    used_post_keys, recent_created_topics = db.fetch_recent_creation_memory(
-        profile_name=profile_name,
-        lookback_hours=dedup_hours,
-    )
-
-    excluded_used_count = 0
-    fresh_digests: List[Dict[str, Any]] = []
-    for d in usable_digests:
-        if d.get("post_key") in used_post_keys:
-            excluded_used_count += 1
-            continue
-        fresh_digests.append(d)
-
-    if not fresh_digests:
+    if not usable_digests:
         elapsed = round(time.perf_counter() - t0, 2)
-        logger.warning("[Step3/跳过] 当前窗口内没有未消费的合格情报卡，跳过选题。")
+        logger.warning("[Step3/跳过] 当前时间窗口内暂无可用单帖档案，跳过选题。")
         return (
             {
                 "status": "skipped_empty",
                 "elapsed_seconds": elapsed,
                 "candidate_count": 0,
-                "excluded_used_posts": excluded_used_count,
                 "selected_count": 0,
                 "model_used": None,
                 "selected_topics_preview": [],
@@ -168,11 +153,10 @@ def run_step3_topic_selection(
             [],
         )
 
-    # 关联最新实时互动数据，并按跨平台公平轮询截取单窗口上限（防止 Reddit/HN 被高浏览基数平台淹没）
-    live_raw_map = db.fetch_raw_posts_by_keys([d["post_key"] for d in fresh_digests])
+    live_raw_map = db.fetch_raw_posts_by_keys([d["post_key"] for d in usable_digests])
     max_window = int(cfg.get("max_candidates_in_window", 120))
     window_digests = round_robin_interleave_by_source(
-        fresh_digests,
+        usable_digests,
         max_total=max_window,
         raw_lookup=live_raw_map,
     )
@@ -185,24 +169,16 @@ def run_step3_topic_selection(
         card_blocks.append(_format_candidate_card_block(alias, d, live_raw_map.get(d["post_key"])))
 
     target_count = int(cfg.get("target_topic_count", 3))
-    recent_topics_str = (
-        "\n".join(f"- {t}" for t in recent_created_topics[:20])
-        if recent_created_topics
-        else "（近期暂无已发布历史话题）"
-    )
-
     slots = {
         "TARGET_TOPIC_COUNT": str(target_count),
         "PROFILE_PREFERENCE": profile.get("topic_preference", ""),
-        "RECENT_CREATED_TOPICS": recent_topics_str,
         "CANDIDATE_COUNT": str(len(window_digests)),
         "CANDIDATE_DIGEST_LIST": "\n\n".join(card_blocks),
     }
 
     model_label = cfg.get("model") or f"group:{cfg.get('preset_model_group', 'medium')}"
     logger.info(
-        f"[Step3/启动] 单窗口跨平台候选={len(window_digests)}条 (防重剔除旧帖={excluded_used_count}) -> "
-        f"上限精选={target_count}个 | 路由={model_label}"
+        f"[Step3/启动] 单窗口全量可用候选={len(window_digests)}条 -> 上限挑选={target_count}个 | 路由={model_label}"
     )
 
     rendered_prompt, prompt_meta = render_prompt_template(prompt_file, slots)
@@ -226,7 +202,6 @@ def run_step3_topic_selection(
                 "status": "failed",
                 "elapsed_seconds": elapsed,
                 "candidate_count": len(window_digests),
-                "excluded_used_posts": excluded_used_count,
                 "selected_count": 0,
                 "model_used": llm_trace.get("model_used"),
                 "selected_topics_preview": [],
@@ -243,7 +218,7 @@ def run_step3_topic_selection(
     topic_records: List[Dict[str, Any]] = []
     used_in_this_round = set()
 
-    for rank_idx, item in enumerate(raw_topics, 1):
+    for item in raw_topics:
         if not isinstance(item, dict):
             continue
         resolved_keys: List[str] = []
@@ -260,7 +235,6 @@ def run_step3_topic_selection(
             continue
 
         used_in_this_round.update(resolved_keys)
-        # 由确定性代码计算多源合并或单帖模式，无需消耗大模型注意力
         actual_mode = "multi_post_event" if len(resolved_keys) >= 2 else "single_viral_story"
         topic_id = f"topic_{now_ts}_{len(topic_records) + 1}_{uuid4().hex[:6]}"
         topic_summary = str(item.get("topic_summary") or "").strip()
@@ -309,7 +283,6 @@ def run_step3_topic_selection(
         "status": "ok" if topic_records else "empty_selection",
         "elapsed_seconds": elapsed,
         "candidate_count": len(window_digests),
-        "excluded_used_posts": excluded_used_count,
         "selected_count": len(topic_records),
         "model_used": llm_trace.get("model_used"),
         "prompt_sha1": llm_trace.get("prompt_sha1"),

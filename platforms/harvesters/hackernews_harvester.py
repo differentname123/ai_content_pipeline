@@ -258,7 +258,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
                     "create_time": safe_int(c.get("created_at_i"), int(time.time())),
                     "author_uid": str(c.get("author") or "hn_commenter"),
                     "author_name": str(c.get("author") or "hn_commenter"),
-                    "content": clean_c[:4000],
+                    "content": clean_c,
                     "likes": 0,
                 })
                 if len(raw_comments) >= max_comments:
@@ -276,7 +276,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 12)
         per_keyword_count = safe_int(cfg.get("per_keyword_count"), 3)
         keywords = cfg.get("keywords") or []
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 20)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 50)
 
         self.last_channel_stats: Dict[str, int] = {}
         by_id: Dict[str, Dict[str, Any]] = {}

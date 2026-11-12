@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-流水线专用数据库访问层 (`pipeline_db.py`)
+流水线专用数据库访问层与确定性入口过滤 (`pipeline_db.py`)
 
-物理隔离承诺：
+物理隔离与极简确定性入口准则：
 1. 对 `harvested_social_posts` 严格只读（Read-Only），绝不写入或覆盖采集器字段。
-2. Step 2 / Step 3 / Step 4 与运行轨迹分别写入独立的 `pipeline_*` 集合，与历史旧集合完全解耦。
+2. 入口仅执行两条 100% 确定性的物理过滤：
+   - 严格按真实发布时间 `publish_time >= cutoff_ts` 入窗（彻底杜绝旧帖因复抓刷新 `db_update_time` 混入当期窗口）；
+   - 凡带视频标记（`video_url` 非空、`video_duration > 0`、`card_type == "BUZZ_VIDEO"` 等）的帖子在入口直接排除，不纳入后续参考。
+3. Step 2 / Step 3 / Step 4 / Step 5 与运行轨迹分别写入独立的 `pipeline_*` 集合，与历史旧集合完全解耦。
 """
 import threading
 import time
@@ -30,10 +33,44 @@ def split_post_key(post_key: str) -> Tuple[str, str]:
     return src.strip(), pid.strip()
 
 
+def is_video_post(raw_post: Dict[str, Any]) -> bool:
+    """
+    100% 确定性判断帖子是否为含视频帖：
+    - `media.video_url` 非空 或 `media.video_duration > 0`
+    - `card_type == "BUZZ_VIDEO"`
+    - 被引用推文标记包含视频 (`metadata.quoted_post.has_video` / `metadata.platform_extra.quoted_post.has_video`)
+    - 媒体或原链接为平台视频资源 (`amplify_video_thumb` / `ext_tw_video_thumb` / `tweet_video_thumb` / `v.redd.it`)
+    """
+    if not isinstance(raw_post, dict):
+        return False
+    media = raw_post.get("media") or {}
+    if media.get("video_url") or int(media.get("video_duration") or 0) > 0:
+        return True
+    if str(raw_post.get("card_type") or "").upper() == "BUZZ_VIDEO":
+        return True
+
+    meta = raw_post.get("metadata") or {}
+    extra = meta.get("platform_extra") or {}
+    qp = meta.get("quoted_post") or extra.get("quoted_post") or {}
+    if isinstance(qp, dict) and qp.get("has_video"):
+        return True
+
+    url_candidates = list(media.get("images") or []) + [
+        media.get("cover_image"),
+        meta.get("url"),
+        meta.get("external_url"),
+    ]
+    for u in url_candidates:
+        u_low = str(u or "").lower()
+        if any(tok in u_low for tok in ("amplify_video_thumb", "ext_tw_video_thumb", "tweet_video_thumb", "v.redd.it")):
+            return True
+    return False
+
+
 def sort_posts_within_platform(source: str, posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    按各平台原生有效热度指标在平台内部排序（避免跨平台量纲差异导致像 Reddit RSS 这种无公开赞数的渠道被饿死）：
-    - Reddit：优先按多板块 24h Top 热榜名次 `metadata.platform_extra.rank_in_feed` 升序（第 1 名最前），其次按发布时间倒序；
+    按各平台原生有效热度指标在平台内部排序：
+    - Reddit：若具备真实赞数 (`viral_score > 0` 或 `like_count > 0`) 优先结合热榜排位与赞数，否则按 24h 热榜名次 `rank_in_feed` 升序；
     - 其他平台（X / HackerNews / Binance / OKX）：按 `engagement.viral_score` 倒序，其次按发布时间倒序。
     """
     if str(source).lower() == "reddit":
@@ -41,6 +78,7 @@ def sort_posts_within_platform(source: str, posts: List[Dict[str, Any]]) -> List
             posts,
             key=lambda p: (
                 int((((p.get("metadata") or {}).get("platform_extra") or {}).get("rank_in_feed")) or 9999),
+                -int((p.get("engagement") or {}).get("like_count") or 0),
                 -int(p.get("publish_time") or 0),
             ),
         )
@@ -59,8 +97,8 @@ def round_robin_interleave_by_source(
     raw_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    将候选帖子或情报卡按 `source` 分桶、桶内按平台自身热度排序后，执行多平台公平轮询抽取（Round-Robin）。
-    保证 X、Reddit、HackerNews、Binance、OKX 在下游理解与全局选题窗口中永远享有均衡席位。
+    将候选帖子或单帖档案按 `source` 分桶、桶内按平台自身热度排序后，执行多平台公平轮询抽取（Round-Robin）。
+    保证 X、Reddit、HackerNews、Binance、OKX 在理解与全局选题窗口中始终享有均衡席位。
     """
     if not items:
         return []
@@ -72,7 +110,6 @@ def round_robin_interleave_by_source(
     sorted_buckets: Dict[str, List[Dict[str, Any]]] = {}
     for src, bucket in by_src.items():
         if raw_lookup is not None:
-            # 若传入的是 Step 2 情报卡，结合 raw_lookup 里的实时互动/热榜排名在平台桶内排序
             if src == "reddit":
                 sorted_buckets[src] = sorted(
                     bucket,
@@ -84,6 +121,10 @@ def round_robin_interleave_by_source(
                                 or {}
                             ).get("rank_in_feed")
                             or 9999
+                        ),
+                        -int(
+                            ((raw_lookup.get(d.get("post_key", "")) or {}).get("engagement") or {}).get("like_count")
+                            or 0
                         ),
                         -int(d.get("publish_time") or 0),
                     ),
@@ -126,7 +167,7 @@ def round_robin_interleave_by_source(
 
 
 class PipelineDB:
-    """统一管理新流水线的只读源查询与三阶段产物持久化。"""
+    """统一管理新流水线的只读源查询、确定性入口过滤与各阶段产物持久化。"""
 
     def __init__(self, db_instance: Optional[MongoBase] = None):
         self.db: MongoBase = db_instance or gen_db_object()
@@ -156,6 +197,7 @@ class PipelineDB:
             self.db.create_index(self.creation_col, [("creation_id", 1)], unique=True)
             self.db.create_index(self.creation_col, [("topic_id", 1)], unique=False)
             self.db.create_index(self.creation_col, [("profile_name", 1), ("created_at_ts", -1)], unique=False)
+            self.db.create_index(self.creation_col, [("publish_status", 1), ("created_at_ts", -1)], unique=False)
             self.db.create_index(self.creation_col, [("source_post_keys", 1)], unique=False)
 
             self.db.create_index(self.trace_col, [("run_id", 1)], unique=True)
@@ -163,30 +205,30 @@ class PipelineDB:
             _INDEX_READY.add(tag)
 
     # --------------------------------------------------------------------------
-    # Step 1 -> Step 2 只读原帖查询（分平台公平查询，彻底消除 viral_score=0 渠道饥饿）
+    # Step 1 -> Step 2 确定性入口过滤查询（严格 publish_time 窗口 + 一刀切排除视频帖）
     # --------------------------------------------------------------------------
-    def fetch_recent_raw_posts(
+    def fetch_recent_raw_posts_with_stats(
         self,
         lookback_hours: float = 48.0,
         per_source_limit: int = 200,
-    ) -> List[Dict[str, Any]]:
+        exclude_video_posts: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """
-        按平台分别获取最近窗口内的原始标准化帖子并公平交错返回，
-        彻底防止单一高产或高浏览量纲平台挤占总查询上限、饿死 Reddit 等渠道。
+        按平台分别查询严格位于 `publish_time >= cutoff_ts` 真实发布时间窗口内的原帖，
+        并在入口确定性排除所有含视频帖子，最后跨平台公平轮询返回。
         """
         cutoff_ts = int(time.time() - max(lookback_hours, 1.0) * 3600)
-        cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc)
         raw_collection = self.db.get_collection(self.raw_col)
         sources = [s for s in (raw_collection.distinct("source") or []) if isinstance(s, str) and s.strip()]
 
         all_docs: List[Dict[str, Any]] = []
+        total_in_time_window = 0
+        excluded_video_count = 0
+
         for src in sources:
             query = {
                 "source": src,
-                "$or": [
-                    {"publish_time": {"$gte": cutoff_ts}},
-                    {"db_update_time": {"$gte": cutoff_dt}},
-                ],
+                "publish_time": {"$gte": cutoff_ts},
             }
             sort_spec = (
                 [("publish_time", -1)]
@@ -198,11 +240,41 @@ class PipelineDB:
                 query=query,
                 sort=sort_spec,
                 limit=per_source_limit,
-            )
+            ) or []
+            total_in_time_window += len(docs)
+
+            if exclude_video_posts:
+                clean_docs: List[Dict[str, Any]] = []
+                for d in docs:
+                    if is_video_post(d):
+                        excluded_video_count += 1
+                    else:
+                        clean_docs.append(d)
+                docs = clean_docs
+
             if docs:
                 all_docs.extend(sort_posts_within_platform(src, docs))
 
-        return round_robin_interleave_by_source(all_docs, max_total=len(all_docs))
+        interleaved = round_robin_interleave_by_source(all_docs, max_total=len(all_docs))
+        stats = {
+            "in_time_window_total": total_in_time_window,
+            "excluded_video_count": excluded_video_count,
+            "eligible_non_video_count": len(interleaved),
+        }
+        return interleaved, stats
+
+    def fetch_recent_raw_posts(
+        self,
+        lookback_hours: float = 48.0,
+        per_source_limit: int = 200,
+        exclude_video_posts: bool = True,
+    ) -> List[Dict[str, Any]]:
+        posts, _ = self.fetch_recent_raw_posts_with_stats(
+            lookback_hours=lookback_hours,
+            per_source_limit=per_source_limit,
+            exclude_video_posts=exclude_video_posts,
+        )
+        return posts
 
     def fetch_raw_posts_by_keys(self, post_keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """按 `source:post_id` 列表精确批量取回最新原帖（含最新实时互动快照与本地图片映射）。"""
@@ -224,10 +296,10 @@ class PipelineDB:
         return out
 
     # --------------------------------------------------------------------------
-    # Step 2 情报卡读写 (`pipeline_post_digests`)
+    # Step 2 单帖档案读写 (`pipeline_post_digests`)
     # --------------------------------------------------------------------------
     def get_existing_digest_keys(self, post_keys: Sequence[str]) -> Set[str]:
-        """查询哪些 `post_key` 已经成功完成 Step 2 理解，支持幂等增量跳过。"""
+        """查询哪些 `post_key` 已经成功完成 Step 2 理解，支持幂等增量复用缓存。"""
         if not post_keys:
             return set()
         docs = self.db.find_many(
@@ -247,20 +319,17 @@ class PipelineDB:
         self.db.bulk_upsert(self.digest_col, digests, ["source", "post_id"])
 
     def fetch_usable_digests(self, lookback_hours: float = 36.0, limit: int = 500) -> List[Dict[str, Any]]:
-        """获取时间窗口内所有 `is_usable=True` 的完整帖子情报卡。"""
+        """严格按真实发布时间 `publish_time >= cutoff_ts` 获取窗口内全部 `is_usable=True` 的单帖档案。"""
         cutoff_ts = int(time.time() - max(lookback_hours, 1.0) * 3600)
         query = {
             "status": "ok",
             "is_usable": True,
-            "$or": [
-                {"publish_time": {"$gte": cutoff_ts}},
-                {"digested_at_ts": {"$gte": cutoff_ts}},
-            ],
+            "publish_time": {"$gte": cutoff_ts},
         }
         docs = self.db.find_many(
             self.digest_col,
             query=query,
-            sort=[("digested_at_ts", -1)],
+            sort=[("publish_time", -1)],
             limit=limit,
         )
         return docs or []
@@ -298,38 +367,18 @@ class PipelineDB:
         ) or []
 
     # --------------------------------------------------------------------------
-    # Step 4 原创成品读写与防重复查询 (`pipeline_creations`)
+    # Step 4 & Step 5 成品读写 (`pipeline_creations`)
     # --------------------------------------------------------------------------
-    def fetch_recent_creation_memory(
-        self,
-        profile_name: str,
-        lookback_hours: float = 72.0,
-    ) -> Tuple[Set[str], List[str]]:
-        """
-        返回 `(近期已被消费过的原帖 post_key 集合, 近期已生成的话题概述列表)`，
-        用于 Step 3 硬过滤已用原帖 + 软记忆防旧闻复读。
-        """
-        cutoff_ts = int(time.time() - max(lookback_hours, 1.0) * 3600)
-        docs = self.db.find_many(
+    def fetch_creations_pending_review(self, run_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"status": "ok", "publish_status": "pending_review"}
+        if run_id:
+            query["run_id"] = run_id
+        return self.db.find_many(
             self.creation_col,
-            query={
-                "profile_name": profile_name,
-                "status": "ok",
-                "created_at_ts": {"$gte": cutoff_ts},
-            },
-            projection={"source_post_keys": 1, "topic_summary": 1, "topic_title": 1},
-            sort=[("created_at_ts", -1)],
-            limit=200,
-        )
-        used_keys: Set[str] = set()
-        recent_topics: List[str] = []
-        for d in docs or []:
-            for pk in d.get("source_post_keys") or []:
-                used_keys.add(str(pk))
-            label = str(d.get("topic_summary") or d.get("topic_title") or "").strip()
-            if label and label not in recent_topics:
-                recent_topics.append(label)
-        return used_keys, recent_topics
+            query=query,
+            sort=[("created_at_ts", 1)],
+            limit=limit,
+        ) or []
 
     def upsert_creations(self, creations: List[Dict[str, Any]]) -> None:
         if not creations:

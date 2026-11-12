@@ -146,13 +146,13 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
         "sort": "top",
         "time_filter": "day",
         "limit": 20,
-        "fetch_comments_for_top_n": 0,  # Reddit免登RSS限流为1次/60s，单次聚合请求拿齐10板块主帖
+        "fetch_comments_for_top_n": 20,  # 零限流公开镜像拉取全部热帖前排高赞评论
     },
     "hackernews": {
         "front_page_count": 12,
         "keywords": ["AI", "OpenAI", "Nvidia", "crypto", "billion"],
         "per_keyword_count": 3,
-        "fetch_comments_for_top_n": 20,
+        "fetch_comments_for_top_n": 50,  # Algolia 单帖接口免登无限流，为全部有评论故事拉齐热评
     },
     "binance": {
         "recommend_count": 15,

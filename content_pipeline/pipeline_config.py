@@ -4,11 +4,11 @@
 
 ================================================================================
 【日常扩展与调优指南（无需改动引擎代码）】
-1. 切换生成风格/语种/账号人设：修改 `ACTIVE_PROFILE`（或往 `CONTENT_PROFILES` 新增一项并指向新的 `.md` 提示词文件）。
+1. 切换生成风格/语种/账号定位：修改 `ACTIVE_PROFILE`（或往 `CONTENT_PROFILES` 新增一项并指向对应 `.md` 提示词文件）。
 2. 单独调试某一步：修改 `STAGE_SWITCHES` 中的布尔开关，或直接运行对应步骤脚本。
 3. 切换单次运行 / 常驻定时循环：修改 `SCHEDULE_CONFIG["continuous_loop"]`。
-4. 模型路由规范：默认 `model=None`，统一通过 `preset_model_group` ("low" / "medium" / "high")
-   复用 `app/ai_api/model_api.py` 的加权模型池与自动降级机制，绝不在业务配置中硬编码模型名。
+4. 模型路由规范：统一保持 `model=None` + `preset_model_group="medium"` + `timeout=600`，
+   自动走 `app/ai_api/model_api.py` 的加权模型池负载均衡与跨渠道容灾兜底，绝不硬编码模型名。
 ================================================================================
 """
 from pathlib import Path
@@ -31,11 +31,11 @@ for _dir in (PIPELINE_PROMPT_DIR, PIPELINE_VISUAL_DIR, PIPELINE_TRACE_DIR, DEFAU
 PIPELINE_COLLECTIONS: Dict[str, str] = {
     # Step 1 产出的标准化原始帖子集合（本流水线仅【只读】查询，绝不修改原集合文档）
     "raw_posts": "harvested_social_posts",
-    # Step 2 单帖多模态完整情报卡集合（按 source + post_id 唯一幂等存储）
+    # Step 2 单帖多模态完整情报档案集合（按 source + post_id 唯一幂等存储）
     "post_digests": "pipeline_post_digests",
-    # Step 3 全局单窗口归堆与精选话题集合
+    # Step 3 全局单窗口归堆与选题集合
     "topic_clusters": "pipeline_topic_clusters",
-    # Step 4 最终原创图文成品集合
+    # Step 4 & Step 5 原创图文成品与读者盲测终审集合
     "creations": "pipeline_creations",
     # 全链路运行审计与调优追踪集合
     "run_traces": "pipeline_run_traces",
@@ -43,44 +43,45 @@ PIPELINE_COLLECTIONS: Dict[str, str] = {
 
 
 # ==============================================================================
-# 二、可插拔内容风格 Profile 配置（不设任何固定字数区间牢笼，篇幅完全由信息密度决定）
+# 二、可插拔内容风格 Profile 配置（纯抽象原则，不设任何固定字数区间或具体案例框框）
 # ==============================================================================
 CONTENT_PROFILES: Dict[str, Dict[str, Any]] = {
-    # 预设 1：X 平台中文全领域高网感原生推文（科技/AI、宏观政治、商业财富、交易实录、高共鸣奇闻/神梗）
+    # 预设 1：中文社交平台全领域原生创作者号
     "zh_viral_general": {
-        "display_name": "X平台中文全领域原生爆款号",
+        "display_name": "中文全领域原生内容号",
         "language": "zh",
         "step2_prompt_file": "step2_post_comprehension.md",
         "step3_prompt_file": "step3_topic_selection_default.md",
         "step4_prompt_file": "step4_creation_zh_viral.md",
+        "step5_prompt_file": "step5_cold_reader_review.md",
         "topic_preference": (
-            "面向 X (Twitter) 简中泛科技、商业财经、全球宏观大事件与加密交易高认知受众。优先挑选：\n"
-            "1) 跨平台多源共振的重磅突发事件（科技/AI巨头核心动态、宏观地缘震荡、商业巨额诉讼/人事地震）；\n"
-            "2) 有真实数据或实锤截图支撑的暴富/暴亏/套利奇闻（或评论区扒出惊人反转的案例）；\n"
-            "3) 冲突张力极强、观点犀利或极具冷幽默传播力的独立好帖。\n"
-            "全领域开放视野，不局限于单一币圈行情喊单，宁缺毋滥。"
+            "面向广泛关注科技商业、宏观政经、金融交易与社会真实故事的公众读者。优先挑选：\n"
+            "1) 多源讨论共振、信息密度高的重要突发事件或前沿动态；\n"
+            "2) 具备扎实事实数据、鲜明因果反转或真实个体经历的深度与反差议题；\n"
+            "3) 冲突张力鲜明、洞察犀利或天然具备幽默共鸣感的高质量独立内容。\n"
+            "全领域开放视野，不局限于单一垂直行业，宁缺毋滥。"
         ),
         "style_guidelines": (
             "输出语言：自然地道的简体中文。\n"
-            "原生推文语感：像一位见多识广、说话一针见血的业内真人在发 X 推文。第一句直切核心事实、反差数字或槽点；"
-            "有话则长、无话则短，把话说透立刻收尾，绝不铺垫寒暄、绝不凑字数、绝不强行升华说教。"
+            "表达基调：以洞察敏锐、表达利落的独立创作者口吻直接面向公众发声；"
+            "对陌生背景自然融入简明交代确保零门槛顺畅阅读，直切核心看点，篇幅随内容实质自然伸缩，讲透即止。"
         ),
     },
-    # 预设 2：英文 X (Twitter) 原生高留存推文号（直接切换 ACTIVE_PROFILE 即可生效）
+    # 预设 2：英文社交平台全领域原生创作者号
     "en_x_creator": {
-        "display_name": "English X Native Creator",
+        "display_name": "English Native Social Creator",
         "language": "en",
         "step2_prompt_file": "step2_post_comprehension.md",
         "step3_prompt_file": "step3_topic_selection_default.md",
         "step4_prompt_file": "step4_creation_en_x.md",
+        "step5_prompt_file": "step5_cold_reader_review.md",
         "topic_preference": (
-            "Target global English X audience across Tech/AI, Macro/Geopolitics, Markets/Business, and Crypto.\n"
-            "Prioritize multi-source breaking stories, hard-number asymmetric trades/debunkings, and sharp real-world ironies."
+            "Target a broad, sharp English-speaking audience across technology, business, macro events, markets, and compelling human stories.\n"
+            "Prioritize multi-source breaking developments, verifiable asymmetric outcomes or reversals, and high-resonance standalone insights."
         ),
         "style_guidelines": (
-            "Output Language: Crisp, idiomatic English native to X.\n"
-            "Voice & Pacing: Lead immediately with the hardest number, contrast, or punchline. "
-            "Let actual information density dictate length—never pad filler, never repeat text already obvious inside the attached screenshot, and stop right when the point lands."
+            "Output Language: Crisp, idiomatic English.\n"
+            "Voice & Pacing: Write directly as an authentic public creator; weave brief context naturally for unfamiliar entities so any reader grasps the full picture effortlessly, lead with the sharpest point, and let real substance dictate length."
         ),
     },
 }
@@ -93,9 +94,10 @@ ACTIVE_PROFILE: str = "zh_viral_general"
 # 三、总控阶段开关与调度配置（直接在 IDE 运行 `pipeline_runner.py` 即可生效）
 # ==============================================================================
 STAGE_SWITCHES: Dict[str, bool] = {
-    "step2_comprehension": True,    # Step 2：对新拉取帖子做多模态图文+热评忠实还原与自洽性体检
-    "step3_topic_selection": True,  # Step 3：单窗口跨平台均衡审阅、按编号合并事件与选题
-    "step4_creation": True,         # Step 4：X 原生文案撰写 + 真实原图复用/裁剪/拼接/去边角水印
+    "step2_comprehension": True,    # Step 2：单帖「文字+全部主帖原图+前排评论」多模态无损还原
+    "step3_topic_selection": True,  # Step 3：全局单窗口同事件归并及高潜选题
+    "step4_creation": True,         # Step 4：原生初稿创作 + 真实原图确定性编辑
+    "step5_blind_review": True,     # Step 5：零背景普通网友视角盲测终审（最多 1 次定点打磨）
 }
 
 SCHEDULE_CONFIG: Dict[str, Any] = {
@@ -105,36 +107,34 @@ SCHEDULE_CONFIG: Dict[str, Any] = {
 
 
 # ==============================================================================
-# 四、各阶段工程参数（统一走 `preset_model_group` 模型组，所有上限均对齐平台客观物理边界）
+# 四、各阶段工程参数（零脆弱硬编码门槛：不截断图片张数、不设像素门槛、不剔除历史已用帖）
 # ==============================================================================
 STEP2_CONFIG: Dict[str, Any] = {
-    # 扫描最近多少小时内入库/发布的原始帖子
+    # 严格按真实发布时间 `publish_time` 扫描最近多少小时内的帖子
     "lookback_hours": 48,
-    # 单轮最多新理解多少条未处理帖子（按 5 大平台轮询均衡抽取，冷启动各取 Top 8 共 40 条，日常每小时增量约 20~35 条可一次消化）
-    "max_new_posts_per_run": 40,
+    # 入口确定性排除所有含视频帖子（免除一切未下载视频猜测与视频适配复杂度）
+    "exclude_video_posts": True,
+    # 单轮最多新理解多少条未处理帖子（按各平台公平轮询抽取，已理解过的直接命中缓存）
+    "max_new_posts_per_run": 50,
     # 并发工作线程数
     "concurrency": 5,
-    # 单帖最多挂载几张主帖原图（对齐 X 平台单帖原生 4 图物理上限，仅取主帖图，绝不混入评论区无关表情包）
-    "max_images_per_post": 4,
-    # 单帖最多提取前多少条评论（对齐 Step 1 单帖拉取的前 10 条热评）
+    # 单帖最多附带前多少条高赞评论
     "max_comments_per_post": 10,
-    # 是否强制重算已有情报卡（日常增量运行保持 False，调试新提示词时可临时改 True）
+    # 是否强制重算已有单帖档案（日常增量运行保持 False）
     "force_recompute": False,
-    # 模型组调度：model=None 时由 model_api.py 按权重调度组内模型并自动跨渠道降级兜底
+    # 统一走模型组负载均衡
     "model": None,
     "preset_model_group": "medium",
     "timeout": 600,
 }
 
 STEP3_CONFIG: Dict[str, Any] = {
-    # 纳入全局选题视野的情报卡时间窗口（小时）
+    # 纳入全局选题视野的单帖真实发布时间窗口（小时）
     "lookback_hours": 36,
-    # 单窗口最多放入多少条可用情报卡（按各平台均衡轮询填入，约 1.5 万 Tokens 处于单窗口高召回区）
+    # 单窗口最多放入多少条可用单帖档案（按跨平台公平轮询填入）
     "max_candidates_in_window": 120,
-    # 每轮最多精选几个话题进入 Step 4 生产（宁缺毋滥，允许少于该上限）
+    # 每轮最多挑选几个话题进入生产（宁缺毋滥，允许少于该上限）
     "target_topic_count": 3,
-    # 防重复记忆窗口：过去多少小时内已被消费过的原帖不再重复入选，并将已产话题注入防重列表
-    "dedup_used_posts_hours": 72,
     "model": None,
     "preset_model_group": "medium",
     "timeout": 600,
@@ -143,12 +143,20 @@ STEP3_CONFIG: Dict[str, Any] = {
 STEP4_CONFIG: Dict[str, Any] = {
     # 创作并发数
     "concurrency": 2,
-    # 单次运行最多生产几篇待产选题
+    # 单次运行最多生产几篇选题
     "max_creations_per_run": 5,
-    # 单个选题最多挂载多少张真实可用候选原图供主笔模型直接看图裁切/拼接（1:1 物理附件对齐）
-    "max_candidate_images_per_topic": 4,
-    # 是否启用本地真实像素视觉工作室（仅执行 reuse / crop / stitch / 边角小水印消除 / none，严禁 AI 生图）
+    # 是否启用本地真实像素视觉工作室（仅执行 reuse / crop / stitch / 小角标消除 / none，严禁 AI 生图）
     "enable_visual_studio": True,
+    "model": None,
+    "preset_model_group": "medium",
+    "timeout": 600,
+}
+
+STEP5_CONFIG: Dict[str, Any] = {
+    # 读者盲测并发数
+    "concurrency": 3,
+    # 当盲测返回 `revise` 时最多交回 Step 4 定点打磨几次（严格 <= 1，绝不死循环）
+    "max_revisions": 1,
     "model": None,
     "preset_model_group": "medium",
     "timeout": 600,

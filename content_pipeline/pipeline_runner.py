@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-多模态原创内容生产流水线总控入口 (`pipeline_runner.py`)
+多模态原创内容生产全链路总控入口 (`pipeline_runner.py`)
 
 ================================================================================
 【使用说明（直接在 IDE 点击运行即可，无需命令行参数）】
-1. 本总控将 Step 1 入库 (`harvested_social_posts`) 之后的三大核心环节串联执行：
-   - Step 2 (`step2_comprehension.py`)：单帖「主帖图文+热评」忠实语义还原与自洽性体检
-   - Step 3 (`step3_topic_grouping.py`)：跨平台公平单窗口按短编号归堆与选题
-   - Step 4 (`step4_creation.py` + `visual_studio.py`)：X 原生推文创作 + 真实原图复用/裁剪/拼接/去边角水印
+1. 本总控将 Step 1 入库 (`harvested_social_posts`) 之后的完整生产闭环串联执行：
+   - 确定性入口过滤 (`pipeline_db.py`)：严格 `publish_time` 时间窗 + 含视频帖直接全部排除
+   - Step 2 (`step2_comprehension.py`)：单帖「完整正文 + 全部主帖原图 + 前排评论」多模态无损还原
+   - Step 3 (`step3_topic_grouping.py`)：全局单窗口同事件归并及高潜选题（不删历史帖、不限有无图）
+   - Step 4 (`step4_creation.py` + `visual_studio.py`)：原生初稿创作 + 真实原图确定性编辑
+   - Step 5 (`step5_blind_review.py`)：100% 物理上下文隔离的普通网友第一视角盲测（最多 1 次定点打磨）
 2. 调整风格或参数：直接修改 `content_pipeline/pipeline_config.py` 中的 `ACTIVE_PROFILE`、
    `STAGE_SWITCHES`、`preset_model_group` 或 `prompt/pipeline_v2/*.md` 提示词文件。
 3. 可观测性与调优闭环：
@@ -41,6 +43,7 @@ from content_pipeline.pipeline_logger import (
 from content_pipeline.step2_comprehension import run_step2_comprehension
 from content_pipeline.step3_topic_grouping import run_step3_topic_selection
 from content_pipeline.step4_creation import run_step4_creation
+from content_pipeline.step5_blind_review import run_step5_blind_review
 
 
 def execute_pipeline_round(
@@ -49,6 +52,7 @@ def execute_pipeline_round(
     step2_override: Optional[Dict[str, Any]] = None,
     step3_override: Optional[Dict[str, Any]] = None,
     step4_override: Optional[Dict[str, Any]] = None,
+    step5_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """执行完整一轮（或按开关指定子阶段）的原创内容生产流水线，并持久化全链路追踪报告。"""
     logger = get_pipeline_logger()
@@ -87,6 +91,7 @@ def execute_pipeline_round(
 
     step4_summary = None
     created_works: List[Dict[str, Any]] = []
+    enable_step5 = bool(active_switches.get("step5_blind_review", True))
     if active_switches.get("step4_creation", True):
         topics_input = selected_topics if active_switches.get("step3_topic_selection", True) else None
         step4_summary, created_works = run_step4_creation(
@@ -95,7 +100,24 @@ def execute_pipeline_round(
             profile_name=profile_name,
             step4_cfg=step4_override,
             run_id=run_id,
+            await_blind_review=enable_step5,
         )
+
+    step5_summary = None
+    if enable_step5:
+        creations_input = created_works if active_switches.get("step4_creation", True) else None
+        step5_summary, reviewed_works = run_step5_blind_review(
+            db=db,
+            creations=creations_input,
+            profile_name=profile_name,
+            step4_cfg=step4_override,
+            step5_cfg=step5_override,
+        )
+        if creations_input is None:
+            created_works = reviewed_works
+        else:
+            by_cid = {w["creation_id"]: w for w in reviewed_works}
+            created_works = [by_cid.get(c["creation_id"], c) for c in created_works]
 
     total_elapsed = round(time.perf_counter() - t0, 2)
     finished_bj = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
@@ -110,11 +132,13 @@ def execute_pipeline_round(
         "step2_summary": step2_summary,
         "step3_summary": step3_summary,
         "step4_summary": step4_summary,
+        "step5_summary": step5_summary,
         "audit_details": {
             "digests": [
                 {
                     "post_key": d.get("post_key"),
                     "source": d.get("source"),
+                    "publish_time": d.get("publish_time"),
                     "is_usable": d.get("is_usable"),
                     "reject_reason": d.get("reject_reason"),
                     "summary": d.get("summary"),
@@ -142,13 +166,18 @@ def execute_pipeline_round(
                     "topic_id": c.get("topic_id"),
                     "topic_summary": c.get("topic_summary"),
                     "status": c.get("status"),
+                    "publish_status": c.get("publish_status"),
+                    "revision_count": c.get("revision_count", 0),
                     "post_text": c.get("post_text"),
                     "char_count": c.get("char_count"),
                     "source_post_keys": c.get("source_post_keys"),
+                    "candidate_images_count": c.get("candidate_images_count", 0),
                     "visual_plan": c.get("visual_plan"),
                     "visual_trace": c.get("visual_trace"),
                     "final_image_paths": c.get("final_image_paths"),
                     "final_image_path": c.get("final_image_path"),
+                    "initial_draft": c.get("initial_draft"),
+                    "blind_review": c.get("blind_review"),
                     "text_model": (c.get("llm_trace") or {}).get("model_used"),
                     "prompt_sha1": (c.get("llm_trace") or {}).get("prompt_sha1"),
                 }
