@@ -22,7 +22,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from common.common_utils import resolve_session_dir, safe_int
+from common.common_utils import safe_int
 from common.mongo_db.mongo_base import gen_db_object
 from platforms.harvesters.x_harvester import XHarvester
 from platforms.x_playwright import comment_on_x_post, follow_x_user
@@ -48,7 +48,7 @@ def _sleep_jitter(delay_range: Sequence[float]) -> None:
 
 
 def publish_comments_from_db(
-    user_data_dir: str,
+    user_data_dir: str = PUBLISHER_DEFAULTS["user_data_dir"],
     *,
     categories: Optional[Sequence[str]] = PUBLISHER_DEFAULTS["allowed_categories"],
     languages: Optional[Sequence[str]] = PUBLISHER_DEFAULTS["allowed_languages"],
@@ -57,7 +57,7 @@ def publish_comments_from_db(
     also_follow: bool = PUBLISHER_DEFAULTS["also_follow"],
     like_when_commenting: bool = PUBLISHER_DEFAULTS["like_when_commenting"],
     playwright_debug: bool = PUBLISHER_DEFAULTS["playwright_debug"],
-    dry_run: bool = False,
+    dry_run: bool = PUBLISHER_DEFAULTS["dry_run"],
 ) -> Dict[str, Any]:
     """
     从 `harvested_social_posts` 中按分类、语种与评分从高到低筛选待评帖子并发送评论。
@@ -306,24 +306,11 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # 命令行支持：`python x_growth/comment_publisher.py [user_data_dir] [--dry-run] [--categories=tech_ai,crypto_web3] [--languages=zh,en]`
-    is_dry = "--dry-run" in sys.argv
-    cats_arg: Optional[List[str]] = None
-    langs_arg: Optional[List[str]] = None
-    pos_args: List[str] = []
-    for arg in sys.argv[1:]:
-        if arg.startswith("--categories="):
-            cats_arg = [x.strip() for x in arg.split("=", 1)[1].split(",") if x.strip()]
-        elif arg.startswith("--languages="):
-            langs_arg = [x.strip() for x in arg.split("=", 1)[1].split(",") if x.strip()]
-        elif not arg.startswith("-"):
-            pos_args.append(arg)
-
-    target_dir = pos_args[0] if pos_args else resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao")
+    # 直接在 IDE 中点击运行即可，所有配置固定在 x_growth/growth_config.py 的 PUBLISHER_DEFAULTS 中
     res = publish_comments_from_db(
-        target_dir,
-        categories=cats_arg,
-        languages=langs_arg,
-        dry_run=is_dry,
+        user_data_dir=str(PUBLISHER_DEFAULTS["user_data_dir"]),
+        categories=PUBLISHER_DEFAULTS.get("allowed_categories"),
+        languages=PUBLISHER_DEFAULTS.get("allowed_languages"),
+        dry_run=bool(PUBLISHER_DEFAULTS.get("dry_run", False)),
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))

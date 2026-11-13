@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from common.common_utils import PROMPT_DIR, get_config, setup_logger
+from common.common_utils import PROMPT_DIR, get_config, resolve_session_dir, setup_logger
 from platforms.harvesters import NEW_HARVESTED_COLLECTION_NAME
 
 TZ_CN = timezone(timedelta(hours=8))
@@ -83,13 +83,22 @@ def get_growth_logger() -> logging.Logger:
     return _LOGGER
 
 
-# 模块一默认参数（均可在调用函数时覆盖，日常仅需传 user_data_dir）
+# 模块一直接运行与常驻定时配置（在 IDE 中直接运行 comment_pipeline.py 即按此配置执行，无需任何命令行参数）
+PIPELINE_SCHEDULE_CONFIG: Dict[str, Any] = {
+    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 默认 W:\temp\x_xiaohao，也可直接改为路径字符串
+    "continuous_loop": True,            # True=常驻定时循环；False=仅单次运行一轮后退出
+    "interval_seconds": 3600,           # 基础轮询间隔秒数（3600 秒 = 1 小时）
+    "jitter_seconds": (0, 300),         # 每轮附加随机正抖动（0~300 秒），避免固定整点机械请求触发风控
+    "force_rescore": False,             # 是否强制重评已打分帖子（日常常驻运行保持 False）
+}
+
+# 模块一生成与筛选参数
 PIPELINE_DEFAULTS: Dict[str, Any] = {
     "feed_fetch_count": 30,             # 推荐流 (For You) 单次拉取条数
     "feed_detail_concurrency": 2,       # 温和拉取推荐帖评论区以提取评论用户的线程数（防并发突发风控）
     "min_followers": 100,               # 潜力认证用户最小粉丝数（过滤纯空壳号）
     "max_followers": 3000,              # 潜力认证用户最大粉丝数（聚焦会认真看每条评论且高意愿回关的同体量个体号）
-    "max_target_users_per_run": 15,     # 单轮最多拉取多少位潜力用户的最新帖（温和节奏防 code=326 风控）
+    "max_target_users_per_run": 15,     # 单轮最多主动拉取多少位潜力用户的最新帖（温和节奏防 code=326 风控）
     "post_max_age_seconds": 86400,      # 只保留最近一天（24h）内发布的帖子
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 仅拉取并生成英语(en)与日语(ja)帖子的评论
     "comment_batch_size": 5,            # 每次批量生成 5 条帖子的评论、分类与语种
@@ -100,10 +109,12 @@ PIPELINE_DEFAULTS: Dict[str, Any] = {
     "llm_timeout": 300,
 }
 
-# 模块二默认参数（独立发评论模块）
+# 模块二直接运行配置（在 IDE 中直接运行 comment_publisher.py 即按此配置执行，无需任何命令行参数）
 PUBLISHER_DEFAULTS: Dict[str, Any] = {
-    "allowed_categories": None,         # None 或空列表表示不限分类；传如 ["tech_ai", "crypto_web3"] 则只发对应赛道
-    "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 默认仅允许发布 en / ja 语种评论（单号运营可进一步传 ["en"] 或 ["ja"]）
+    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 发评使用的 X 账号登录目录（如换号可直接改路径）
+    "dry_run": False,                   # True=仅查库预览不实际发评；False=真实启动浏览器发送评论
+    "allowed_categories": None,         # None 表示不限分类；填如 ["tech_ai", "crypto_web3"] 则只发对应赛道
+    "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 默认允许 en / ja；英文专号改为 ("en",)，日文专号改为 ("ja",)
     "min_score": 70,                    # 仅发布独立盲测评分 >= 该分值的自然可用评论
     "max_publish_per_run": 3,           # 单次调用最多发送几条高分评论
     "post_max_age_seconds": 86400,      # 仅发布 24 小时以内的新鲜帖子

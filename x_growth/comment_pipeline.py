@@ -16,6 +16,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -25,7 +26,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from common.common_utils import resolve_session_dir, safe_int
+from common.common_utils import safe_int
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import HarvestedPostManager
 from content_pipeline.comment_creator import calc_x_weighted_length
@@ -36,9 +37,11 @@ from platforms.harvesters.x_harvester import XHarvester
 from x_growth.growth_config import (
     AUTO_COMMENT_FIELD,
     PIPELINE_DEFAULTS,
+    PIPELINE_SCHEDULE_CONFIG,
     POST_CATEGORIES,
     POSTS_COLLECTION_NAME,
     SUPPORTED_COMMENT_LANGUAGES,
+    TZ_CN,
     X_GROWTH_PROMPT_DIR,
     format_category_list_for_prompt,
     get_configured_self_handles,
@@ -283,6 +286,7 @@ def _build_rel_snapshot(u_prof: Dict[str, Any]) -> Dict[str, Any]:
 def _fetch_latest_today_posts_for_users(
     harvester: XHarvester,
     users: Sequence[Dict[str, Any]],
+    max_target_users: int,
     cutoff_ts: int,
     allowed_langs_set: Set[str],
     feed_posts_map: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -290,8 +294,8 @@ def _fetch_latest_today_posts_for_users(
     """
     阶段 2：温和串行拉取每位潜力用户最近 24h 内的最新 1 条原创有效目标语种主帖，并补全完整帖子信息与评论。
     - 仅保留目标语种（默认 `en`/`ja`）帖子；
-    - 若推荐流本身已命中该用户的 24h 内原创有效帖，直接复用免除额外请求；
-    - 一旦检测到账号触发 X `code=326` 安全挑战，立即熔断停止请求，保护账号安全。
+    - 若推荐流本身已命中该用户的 24h 内原创有效帖，直接零成本复用免除额外请求；
+    - 一旦检测到账号触发 X `code=326` 安全挑战，立即跳过后续 UserTweets 网络请求，保护账号安全。
     """
     selected_posts: List[Dict[str, Any]] = []
     user_rel_by_post_id: Dict[str, Dict[str, Any]] = {}
@@ -316,7 +320,9 @@ def _fetch_latest_today_posts_for_users(
             feed_latest_by_author[ah] = fp
 
     seen_pids: Set[str] = set()
-    for idx, u_prof in enumerate(users):
+    live_fetches = 0
+    max_live_fetches = max(1, int(max_target_users))
+    for u_prof in users:
         handle = str(u_prof.get("screen_name") or "").strip().lstrip("@")
         if not handle:
             continue
@@ -324,10 +330,11 @@ def _fetch_latest_today_posts_for_users(
 
         chosen: Optional[Dict[str, Any]] = feed_latest_by_author.get(h_low)
         if chosen is None:
-            if getattr(harvester, "_burner_locked_326", False):
-                break
-            if idx > 0:
+            if getattr(harvester, "_burner_locked_326", False) or live_fetches >= max_live_fetches:
+                continue
+            if live_fetches > 0:
                 time.sleep(random.uniform(0.65, 1.25))
+            live_fetches += 1
             recent_posts = harvester.fetch_user_posts(
                 handle,
                 count=8,
@@ -336,8 +343,6 @@ def _fetch_latest_today_posts_for_users(
                 force_burner=True,
                 known_uid=str(u_prof.get("user_id") or ""),
             )
-            if getattr(harvester, "_burner_locked_326", False) and not recent_posts:
-                break
             if not recent_posts:
                 continue
             recent_posts.sort(key=lambda x: safe_int(x.get("publish_time"), 0), reverse=True)
@@ -747,7 +752,7 @@ def _batch_score_with_strong_model(
 
 
 def run_comment_pipeline(
-    user_data_dir: str,
+    user_data_dir: str = PIPELINE_SCHEDULE_CONFIG["user_data_dir"],
     *,
     min_followers: int = PIPELINE_DEFAULTS["min_followers"],
     max_followers: int = PIPELINE_DEFAULTS["max_followers"],
@@ -796,16 +801,16 @@ def run_comment_pipeline(
         self_uid=self_uid,
         self_handles=self_handles,
     )
-    target_users = qualified_users[: max(1, int(max_target_users))]
     logger.info(
         f"[Module1/用户筛选] 推荐流帖子={feed_count}条 -> 命中高潜力未连接蓝V用户={len(qualified_users)}人 "
-        f"(本轮取前 {len(target_users)} 人拉取今日新帖)"
+        f"(主动拉取上限={max(1, int(max_target_users))}人，推荐流已命中原帖自动零成本复用)"
     )
 
     # 2. 拉取每位潜力用户最近 24h 内的最新 1 条目标语种完整有字帖子并存入 harvested_social_posts
     latest_posts, user_rel_map = _fetch_latest_today_posts_for_users(
         harvester=harvester,
-        users=target_users,
+        users=qualified_users,
+        max_target_users=max_target_users,
         cutoff_ts=cutoff_ts,
         allowed_langs_set=allowed_langs_set,
         feed_posts_map=feed_posts_map,
@@ -992,6 +997,67 @@ def run_comment_pipeline(
     }
 
 
+def run_comment_pipeline_daemon(
+    user_data_dir: str = PIPELINE_SCHEDULE_CONFIG["user_data_dir"],
+    interval_seconds: Optional[int] = None,
+    jitter_seconds: Optional[Tuple[int, int]] = None,
+) -> None:
+    """
+    常驻定时任务：按设定间隔（默认 3600s + 0~300s 随机抖动）持续拉取推荐流、生成英/日评论并独立盲测打分入库。
+    - 严格启用库内幂等防重（已打分帖子绝不重复调用大模型）；
+    - 单轮网络或接口波动自动捕获记录日志，不中断主进程。
+    """
+    logger = get_growth_logger()
+    base_interval = max(60, int(interval_seconds or PIPELINE_SCHEDULE_CONFIG.get("interval_seconds", 3600)))
+    raw_jitter = jitter_seconds if jitter_seconds is not None else PIPELINE_SCHEDULE_CONFIG.get("jitter_seconds", (0, 300))
+    if isinstance(raw_jitter, (list, tuple)) and len(raw_jitter) == 2:
+        j_low, j_high = max(0, int(raw_jitter[0])), max(0, int(raw_jitter[1]))
+        if j_low > j_high:
+            j_low, j_high = j_high, j_low
+    else:
+        j_low, j_high = 0, 0
+
+    session_path = str(Path(user_data_dir).expanduser().resolve())
+    logger.info(
+        f"⏰ [Module1/常驻定时任务启动] 登录目录={session_path} | "
+        f"基础周期={base_interval}s ({base_interval / 3600:.2f}h) | 随机正抖动={j_low}~{j_high}s | "
+        f"允许语种={list(SUPPORTED_COMMENT_LANGUAGES)}"
+    )
+
+    round_no = 0
+    while True:
+        round_no += 1
+        logger.info(f"========== [Module1/定时轮次 #{round_no}] 开始执行 ==========")
+        try:
+            res = run_comment_pipeline(session_path, force_rescore=False)
+            top_preview = [
+                f"{it['author']}({it['language']}|{it['best_score']}分): {it['best_comment']}"
+                for it in (res.get("items") or [])[:3]
+            ]
+            logger.info(
+                f"✅ [Module1/定时轮次 #{round_no} 完成] 新拉今日帖={res.get('today_posts_harvested', 0)}条 | "
+                f"库内补齐={res.get('db_supplemented_posts', 0)}条 | 新增评分入库={res.get('newly_scored_posts', 0)}条 | "
+                f"耗时={res.get('elapsed_seconds', 0)}s"
+                + (f" | 高分预览={top_preview}" if top_preview else "")
+            )
+        except KeyboardInterrupt:
+            logger.info("[Module1/常驻定时任务退出] 收到手动中断信号，安全停止。")
+            break
+        except Exception as exc:
+            logger.exception(f"❌ [Module1/定时轮次 #{round_no} 异常] 未捕获错误（将在下轮自动重试）: {exc}")
+
+        sleep_sec = base_interval + (random.randint(j_low, j_high) if j_high > 0 else 0)
+        next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            f"💤 [Module1/常驻休眠] 第 #{round_no} 轮结束，休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 自动执行..."
+        )
+        try:
+            time.sleep(sleep_sec)
+        except KeyboardInterrupt:
+            logger.info("[Module1/常驻定时任务退出] 休眠期间收到手动中断信号，安全停止。")
+            break
+
+
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -999,9 +1065,17 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # 支持命令行直接传登录目录路径（可选 `--force` 强制重评已有帖子），未传时默认读取 x_xiaohao_browser_session_dir
-    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    force_flag = "--force" in sys.argv
-    target_dir = cli_args[0] if cli_args else resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao")
-    res = run_comment_pipeline(target_dir, force_rescore=force_flag)
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+    # 直接在 IDE 中点击运行即可，所有配置固定在 x_growth/growth_config.py 的 PIPELINE_SCHEDULE_CONFIG 中
+    target_dir = str(PIPELINE_SCHEDULE_CONFIG["user_data_dir"])
+    if PIPELINE_SCHEDULE_CONFIG.get("continuous_loop", True):
+        run_comment_pipeline_daemon(
+            user_data_dir=target_dir,
+            interval_seconds=PIPELINE_SCHEDULE_CONFIG.get("interval_seconds", 3600),
+            jitter_seconds=PIPELINE_SCHEDULE_CONFIG.get("jitter_seconds", (0, 300)),
+        )
+    else:
+        res = run_comment_pipeline(
+            user_data_dir=target_dir,
+            force_rescore=bool(PIPELINE_SCHEDULE_CONFIG.get("force_rescore", False)),
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))

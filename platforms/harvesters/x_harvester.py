@@ -3,25 +3,24 @@
 X (Twitter) 平台专用采集与差异抹平适配器 (XHarvester)
 
 ================================================================================
-【运维速查手册 (Ops Quick Guide) —— 日常巡检与修改必读】
+【运维速查手册 (Ops Quick Guide) —— 免登主干 + 登录态最小特权架构】
 ================================================================================
-1. 是否使用登录账号 & 账号安全隔离铁律？
-   - **专用爬虫小号会话隔离**：默认绑定 `config/config.json` 中的 `x_xiaohao_browser_session_dir`
-     （即 `W:\\temp\\x_xiaohao`），**严禁触碰主号 `x_myself` (`W:\\temp\\x_myself`)**！
-   - 若外部误传 `x_myself` 路径，初始化守卫会自动拦截并重定向回 `x_xiaohao` 同时发出健康预警。
-   - 若 `x_xiaohao` 未登录或登录态失效，系统会立即抛出 `CRITICAL` 健康告警 (`X_BURNER_AUTH_MISSING` / `X_SESSION_LOGGED_OUT`)，绝不静默伪装正常。
+1. 核心设计原则（零账号优先 + 登录态最小特权）：
+   - **免登零风控主干（100% 不用小号，永不触发 326 锁号）**：
+     ① 实时热搜榜：`getdaytrends.com`（美国榜 + 全球榜，备选 `trends24.in`）；
+     ② 核心大 V 实时流：免登 `Guest Token` + `curl_cffi` Chrome 指纹直连秒级同步大 V；
+     ③ 全站关键词搜索与热搜穿透：`Yahoo Search (site:x.com)` 24h/7d 多页分时检索 + 雪花 ID 秒级时间预筛；
+     ④ 单帖完整正文/原图/引用帖/外链/互动数据：`api.fxtwitter.com`（支持 X Article 长文）+ `cdn.syndication.twimg.com` 双镜像热备。
+   - **小号最小特权增强（仅做必须登录且风控极低的两件事）**：
+     ① 首页推荐流 (`HomeTimeline`)：小号可用时每轮仅请求 **1 次**，不可用时自动静默回退免登聚合热帖；
+     ② 重点帖慢速补神评 (`TweetDetail`)：单线程串行慢速（随机间隔 `1.5~2.8s`），广谱仅限 Top 8 帖、深挖每方向仅限 Top 5 帖。
+   - **严守账号安全隔离铁律**：
+     默认仅读取 `x_xiaohao_browser_session_dir` (`W:\\temp\\x_xiaohao`) 的 Cookie，**彻底废除 X 无头浏览器搜索**，**严禁触碰主号 `x_myself`**！
 
-2. 两大核心采集能力（热门榜单 + 指定关键词搜索）：
-   - **能力 A：热门榜单与广谱爆款 (`harvest` / `fetch_hot_or_recommended` / `fetch_trending_topics`)**
-     ① 小号 `HomeTimeline` 算法推荐流；
-     ② X 官方全球/美国实时热搜榜 (`/1.1/trends/place.json`, WOEID `23424977` & `1`) -> 自动穿透抓取热搜词下的高赞爆款帖；
-     ③ 核心垂直大 V 实时时间线 (`UserTweets` 登录态跳过置顶旧帖)。
-   - **能力 B：指定关键词精准搜索 (`search_or_topic_posts`)**
-     ① 主通道：复用 `x_xiaohao` 持久化无头浏览器访问 X 搜索页 (`f=top` 热门 + `f=live` 最新)，直接拦截官方 `SearchTimeline` GraphQL 响应包，几秒内拿齐高赞真实推文；
-     ② 兜底补充通道：仅当小号未就绪或主通道结果不足时，启用 Yahoo/Bing `site:x.com` 索引 + `TweetDetail` 补齐，并明确记录降级告警。
-
-3. 异常感知与数据质量自检：
-   - 全程监控 HTTP `401/403`（登录掉线）、`/i/flow/login` 重定向、`/account/access` 风控锁号、`400/404`（GraphQL `queryId` 漂移）、`429` 限流、评论接口失灵及图片下载失败，统一汇总至 `get_health_summary()`。
+2. 自动风控熔断与静默自愈 (`logs/runtime/x_burner_health_state.json`)：
+   - 全部 HTTP 请求统一走 `curl_cffi` (`impersonate="chrome"`) 真实浏览器 TLS 指纹；
+   - 一旦检测到 `code=326` 临时验证锁或 `401/403` 掉线，立即写入 6 小时静默冷却状态，后续模块与轮次自动跳过登录态步骤、100% 依靠免登主干无感运行，绝不反复撞击风控页；
+   - 若检测到 `x_xiaohao` Cookie 已刷新解锁或冷却期满探活成功，自动恢复增强能力。
 ================================================================================
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,15 +65,38 @@ logger = logging.getLogger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 REQUEST_TIMEOUT = 15
+BURNER_COOLDOWN_SECONDS = 6 * 3600
+MAX_SAFE_COMMENT_POSTS_HARD_CAP = 10
+
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
+CHROME_BASE_HEADERS = {
+    "user-agent": DEFAULT_UA,
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
 X_WEB_BEARER_TOKEN = (
     "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D"
     "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 )
+
+
+def _snowflake_to_unix_ts(tweet_id: str) -> int:
+    """利用 X (Twitter) Snowflake ID 零网络开销直接换算精确发布秒级时间戳。"""
+    s = str(tweet_id or "").strip()
+    if not s.isdigit():
+        return 0
+    val = int(s)
+    if val < 300000000000000000:
+        return 0
+    return int(((val >> 22) + 1288834974657) // 1000)
 
 X_GQL_QUERY_IDS = {
     "UserByScreenName": "AMIBMjtxEEATh4z8V9GtRg",
@@ -254,9 +276,14 @@ class XHarvester(BasePlatformHarvester):
         self.session = requests.Session()
         self.guest_token: Optional[str] = None
         self.guest_req_count = 0
+        self.burner_health_path = get_runtime_file_path("x_burner_health_state.json")
+        self._burner_cooldown_entry: Optional[Dict[str, Any]] = None
 
+        explicit_zero_auth = burner_user_data_dir is not None and str(burner_user_data_dir).strip() == ""
         default_xiaohao_dir = resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao")
-        effective_dir = default_xiaohao_dir if burner_user_data_dir is None else str(burner_user_data_dir).strip()
+        effective_dir = "" if explicit_zero_auth else (
+            default_xiaohao_dir if burner_user_data_dir is None else str(burner_user_data_dir).strip()
+        )
         if effective_dir and "x_myself" in os.path.normcase(os.path.abspath(effective_dir)):
             self.record_health_issue(
                 code="X_MYSELF_ISOLATION_GUARD",
@@ -275,20 +302,75 @@ class XHarvester(BasePlatformHarvester):
         self.burner_cookies = burner_cookies or ""
         self.cookie_dict = _parse_cookie_dict(self.burner_cookies)
 
-        if not self.has_burner_account:
+        if not explicit_zero_auth and not self.has_burner_account:
             self.record_health_issue(
                 code="X_BURNER_AUTH_MISSING",
                 message=(
-                    f"专用爬虫小号目录 `{self.burner_user_data_dir or '未配置'}` 未检测到有效 X 登录态 (auth_token/ct0)！"
-                    f"原生搜索、热搜榜与神评拉取将受限，请在 `x_xiaohao` 浏览器窗口重新登录小号。"
+                    f"专用小号目录 `{self.burner_user_data_dir or '未配置'}` 未检测到登录态，已自动运行在纯免登主干模式（仅跳过推荐流与补评）。"
                 ),
-                level="critical",
+                level="info",
                 channel="auth",
                 persistent=True,
             )
 
         self.uid_cache_path = get_runtime_file_path("x_uid_cache.json")
         self.uid_cache = self._load_uid_cache()
+
+    def _http_get(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = REQUEST_TIMEOUT,
+    ):
+        """统一走 curl_cffi Chrome TLS 指纹发起线程安全 GET 请求，消除 Python urllib3 指纹暴露。"""
+        merged_headers = dict(CHROME_BASE_HEADERS)
+        if headers:
+            merged_headers.update(headers)
+        if cffi_requests is not None:
+            return cffi_requests.get(
+                url,
+                headers=merged_headers,
+                params=params,
+                impersonate="chrome",
+                proxies=self.proxies,
+                timeout=timeout,
+            )
+        return self.session.get(
+            url,
+            headers=merged_headers,
+            params=params,
+            proxies=self.proxies,
+            timeout=timeout,
+        )
+
+    def _http_post(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Any] = None,
+        timeout: int = REQUEST_TIMEOUT,
+    ):
+        """统一走 curl_cffi Chrome TLS 指纹发起线程安全 POST 请求。"""
+        merged_headers = dict(CHROME_BASE_HEADERS)
+        if headers:
+            merged_headers.update(headers)
+        if cffi_requests is not None:
+            return cffi_requests.post(
+                url,
+                headers=merged_headers,
+                data=data,
+                impersonate="chrome",
+                proxies=self.proxies,
+                timeout=timeout,
+            )
+        return self.session.post(
+            url,
+            headers=merged_headers,
+            data=data,
+            proxies=self.proxies,
+            timeout=timeout,
+        )
 
     @property
     def has_burner_account(self) -> bool:
@@ -304,13 +386,147 @@ class XHarvester(BasePlatformHarvester):
         return raw_twid or "未知UID"
 
     @property
-    def burner_account_summary(self) -> str:
-        """返回供运维日志展示的账号状态摘要"""
+    def _burner_state_fingerprint(self) -> str:
+        """结合 token 尾号与浏览器 Cookies 文件修改时间，一旦人工解锁关闭窗口即可自动感知解除冷却。"""
+        auth_tail = (self.cookie_dict.get("auth_token") or "")[-6:]
+        ct0_tail = (self.cookie_dict.get("ct0") or "")[-8:]
+        mtime_int = 0
+        if self.burner_user_data_dir and os.path.isdir(self.burner_user_data_dir):
+            for rel in (os.path.join("Default", "Network", "Cookies"), os.path.join("Default", "Cookies")):
+                p = os.path.join(self.burner_user_data_dir, rel)
+                if os.path.exists(p):
+                    try:
+                        mtime_int = max(mtime_int, int(os.path.getmtime(p)))
+                    except Exception:
+                        pass
+        return f"{auth_tail}:{ct0_tail}:{mtime_int}"
+
+    def _load_burner_health_map(self) -> Dict[str, Any]:
+        if os.path.exists(self.burner_health_path):
+            try:
+                data = read_json(self.burner_health_path)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    def _save_burner_health_map(self, data: Dict[str, Any]) -> None:
+        try:
+            save_json(self.burner_health_path, data)
+        except Exception:
+            pass
+
+    @property
+    def is_burner_usable(self) -> bool:
+        """判断当前小号是否可安全调用（既有 Cookie 且未处于 326/掉线静默冷却期）。"""
         if not self.has_burner_account:
-            return f"🚨小号未就绪(降级免登 Guest Token, dir={self.burner_user_data_dir or '未配置'})"
+            return False
+        now_ts = int(time.time())
+        if self._burner_cooldown_entry and now_ts < safe_int(self._burner_cooldown_entry.get("cooldown_until"), 0):
+            return False
+
+        uid_key = self.burner_account_uid
+        state_map = self._load_burner_health_map()
+        entry = state_map.get(uid_key)
+        if not isinstance(entry, dict):
+            self._burner_cooldown_entry = None
+            return True
+
+        cur_fp = self._burner_state_fingerprint
+        saved_fp = str(entry.get("fingerprint") or "")
+        cooldown_until = safe_int(entry.get("cooldown_until"), 0)
+        if saved_fp and saved_fp != cur_fp:
+            # 检测到浏览器会话目录已更新（例如用户已顺手点过验证），立即自动解除冷却
+            state_map.pop(uid_key, None)
+            self._save_burner_health_map(state_map)
+            self._burner_cooldown_entry = None
+            return True
+
+        if now_ts < cooldown_until:
+            self._burner_cooldown_entry = entry
+            return False
+
+        self._burner_cooldown_entry = None
+        return True
+
+    def _mark_burner_cooldown(
+        self,
+        status: str,
+        reason: str,
+        channel: str,
+        cooldown_sec: int = BURNER_COOLDOWN_SECONDS,
+    ) -> None:
+        now_ts = int(time.time())
+        entry = {
+            "status": status,
+            "reason": reason,
+            "channel": channel,
+            "locked_at": now_ts,
+            "cooldown_until": now_ts + max(300, int(cooldown_sec)),
+            "fingerprint": self._burner_state_fingerprint,
+        }
+        self._burner_cooldown_entry = entry
+        state_map = self._load_burner_health_map()
+        state_map[self.burner_account_uid] = entry
+        self._save_burner_health_map(state_map)
+        self.record_health_issue(
+            code="X_BURNER_COOLDOWN_ACTIVE",
+            message=f"{reason}（已进入 {cooldown_sec // 3600}h 静默保护，热榜/大V/搜索自动走免登主干不受影响）",
+            level="warning",
+            channel=channel,
+        )
+
+    def _mark_burner_healthy(self) -> None:
+        self._burner_cooldown_entry = None
+        state_map = self._load_burner_health_map()
+        if self.burner_account_uid in state_map:
+            state_map.pop(self.burner_account_uid, None)
+            self._save_burner_health_map(state_map)
+
+    def _check_gql_burner_response(self, resp: Any, payload: Optional[Dict[str, Any]], channel: str) -> bool:
+        """检查小号 GraphQL 响应是否触发 326 安全验证或 401/403 鉴权失效；若异常则自动转入静默冷却。"""
+        status_code = safe_int(getattr(resp, "status_code", 0), 0)
+        err_codes = set()
+        if isinstance(payload, dict) and isinstance(payload.get("errors"), list):
+            err_codes = {safe_int(e.get("code"), 0) for e in payload["errors"] if isinstance(e, dict)}
+
+        if 326 in err_codes:
+            self._mark_burner_cooldown(
+                status="locked_326",
+                reason=f"X 小号 (UID={self.burner_account_uid}) 处于安全验证锁定期 (code=326)",
+                channel=channel,
+            )
+            return False
+
+        if status_code in (401, 403) or (err_codes & {32, 64, 89}):
+            invalidate_burner_cookie_cache(self.burner_user_data_dir)
+            self._mark_burner_cooldown(
+                status="auth_expired",
+                reason=f"X 小号 (UID={self.burner_account_uid}) 登录态不可用 (HTTP {status_code}, codes={sorted(err_codes)})",
+                channel=channel,
+            )
+            return False
+
+        return status_code == 200
+
+    @property
+    def burner_account_summary(self) -> str:
+        """返回供运维日志展示的账号与通道状态摘要"""
+        if not self.has_burner_account:
+            return "纯免登主干模式 (热榜+大V+多页搜索+fxtwitter，未配小号)"
         session_dir_name = os.path.basename(os.path.normpath(self.burner_user_data_dir)) if self.burner_user_data_dir else "直接Cookie注入"
         auth_tail = (self.cookie_dict.get("auth_token") or "")[-6:]
-        return f"专用小号在线 (UID={self.burner_account_uid}, Session={session_dir_name}, token尾号=...{auth_tail})"
+        if not self.is_burner_usable:
+            rem_min = max(
+                1,
+                (safe_int((self._burner_cooldown_entry or {}).get("cooldown_until"), 0) - int(time.time())) // 60,
+            )
+            return (
+                f"免登主干运行中 | 小号静默冷却保护 (UID={self.burner_account_uid}, "
+                f"Session={session_dir_name}, 剩余{rem_min}分钟)"
+            )
+        return f"免登主干 + 小号低频增强在线 (UID={self.burner_account_uid}, Session={session_dir_name}, token尾号=...{auth_tail})"
 
     def _load_uid_cache(self) -> Dict[str, str]:
         cache = {}
@@ -333,11 +549,10 @@ class XHarvester(BasePlatformHarvester):
             pass
 
     def _refresh_guest_token(self) -> str:
-        headers = {"authorization": f"Bearer {X_WEB_BEARER_TOKEN}", "user-agent": DEFAULT_UA}
-        resp = self.session.post(
+        headers = {"authorization": f"Bearer {X_WEB_BEARER_TOKEN}"}
+        resp = self._http_post(
             "https://api.x.com/1.1/guest/activate.json",
             headers=headers,
-            proxies=self.proxies,
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
@@ -351,9 +566,9 @@ class XHarvester(BasePlatformHarvester):
         self.guest_req_count += 1
         return {
             "authorization": f"Bearer {X_WEB_BEARER_TOKEN}",
-            "x-guest-token": self.guest_token,
-            "user-agent": DEFAULT_UA,
-            "accept": "*/*",
+            "x-guest-token": self.guest_token or "",
+            "x-twitter-active-user": "yes",
+            "x-twitter-client-language": "en",
             "referer": "https://x.com/",
         }
 
@@ -365,8 +580,6 @@ class XHarvester(BasePlatformHarvester):
             "x-twitter-active-user": "yes",
             "x-twitter-auth-type": "OAuth2Session",
             "x-twitter-client-language": "en",
-            "user-agent": DEFAULT_UA,
-            "accept": "*/*",
             "referer": "https://x.com/home",
         }
 
@@ -381,14 +594,13 @@ class XHarvester(BasePlatformHarvester):
 
         url = f"https://x.com/i/api/graphql/{X_GQL_QUERY_IDS['UserByScreenName']}/UserByScreenName"
         try:
-            resp = self.session.get(
+            resp = self._http_get(
                 url,
                 headers=self._get_guest_headers(),
                 params={
                     "variables": json.dumps({"screen_name": clean_name, "withSafetyModeUserFields": True}),
                     "features": json.dumps(X_USER_FEATURES_2026),
                 },
-                proxies=self.proxies,
                 timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code == 200:
@@ -404,7 +616,7 @@ class XHarvester(BasePlatformHarvester):
     def fetch_user_profile_detail(self, screen_name: str) -> Optional[Dict[str, Any]]:
         """
         拉取指定 `@screen_name` 的精确账号画像与双向关注状态：
-        优先走当前小号登录态请求头（可准确返回 `is_following` 与 `is_followed_by`），失败时自动回退免登请求头。
+        若小号健康可用则优先走小号请求头（可返回 `is_following`/`is_followed_by`），否则直接走免登请求头。
         """
         clean_name = str(screen_name or "").lstrip("@").strip()
         if not clean_name:
@@ -414,23 +626,26 @@ class XHarvester(BasePlatformHarvester):
             "variables": json.dumps({"screen_name": clean_name, "withSafetyModeUserFields": True}, separators=(",", ":")),
             "features": json.dumps(X_USER_FEATURES_2026, separators=(",", ":")),
         }
-        headers_chain = (
-            [self._get_burner_headers(), self._get_guest_headers()]
-            if self.has_burner_account
-            else [self._get_guest_headers()]
-        )
-        for hdrs in headers_chain:
+        modes = ["burner", "guest"] if self.is_burner_usable else ["guest"]
+        for mode in modes:
+            hdrs = self._get_burner_headers() if mode == "burner" else self._get_guest_headers()
             try:
-                resp = self.session.get(
+                resp = self._http_get(
                     url,
                     headers=hdrs,
                     params=req_params,
-                    proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
-                if resp.status_code != 200:
+                payload = None
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = None
+                if mode == "burner" and not self._check_gql_burner_response(resp, payload, "UserByScreenName"):
                     continue
-                res = (((resp.json().get("data") or {}).get("user") or {}).get("result")) or {}
+                if resp.status_code != 200 or not isinstance(payload, dict):
+                    continue
+                res = (((payload.get("data") or {}).get("user") or {}).get("result")) or {}
                 if res.get("__typename") == "UserUnavailable" or not res.get("rest_id"):
                     continue
                 uleg = res.get("legacy") or {}
@@ -677,15 +892,16 @@ class XHarvester(BasePlatformHarvester):
     ) -> List[Dict[str, Any]]:
         """
         原语 2：拉取指定大 V (`@handle` 或数字 UID) 的推文。
-        自动路由策略：
-        - 若当前已配只读小号 (`has_burner_account=True`)，默认统一走小号登录态并跳过主页置顶旧帖 (`skip_pinned=True`)；
-        - 若小号接口异常，明确记录健康降级预警后再平滑回退免登 Guest Token 通道。
+        安全路由策略：
+        - 默认 (`force_burner=False`) 100% 走免登 Guest Token + Chrome TLS 指纹，零小号消耗，跳过置顶旧帖并过滤超期归档帖；
+        - 仅在调用方显式指定 `force_burner=True` 且小号健康可用时才使用登录态，遇异常立即转冷却并回退免登。
         """
         clean_name = str(user_id).lstrip("@").strip()
         meta_info = VERIFIED_X_ACCOUNTS.get(clean_name) or {}
         category = meta_info.get("category", "x_kol")
-        prefer_guest = bool(kwargs.get("prefer_guest", False)) and not force_burner
-        use_burner = self.has_burner_account and not prefer_guest
+        max_age_hours = safe_int(kwargs.get("max_age_hours"), 168)
+        min_ts = int(time.time() - max_age_hours * 3600) if max_age_hours > 0 else 0
+        use_burner = bool(force_burner and self.is_burner_usable)
 
         known_uid = str(kwargs.get("known_uid") or "").strip()
         uid = known_uid if known_uid.isdigit() else self.resolve_user_id(clean_name)
@@ -707,53 +923,37 @@ class XHarvester(BasePlatformHarvester):
         }
         headers = self._get_burner_headers() if use_burner else self._get_guest_headers()
         try:
-            resp = self.session.get(
+            resp = self._http_get(
                 url,
                 headers=headers,
                 params=req_params,
-                proxies=self.proxies,
                 timeout=REQUEST_TIMEOUT,
             )
-            if resp.status_code != 200 and use_burner:
-                if resp.status_code in (401, 403):
-                    invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                    self.record_health_issue(
-                        code="X_USER_AUTH_DEGRADED",
-                        message=f"X 小号拉取 UserTweets 返回 HTTP {resp.status_code}，已回退免登 Guest Token（请检查小号登录态）",
-                        level="critical",
-                        channel="UserTweets",
-                    )
-                elif resp.status_code in (400, 404):
-                    self.record_health_issue(
-                        code="X_USERTWEETS_GQL_DRIFT",
-                        message=f"X UserTweets 接口返回 HTTP {resp.status_code}，疑似 GraphQL queryId 或 features 已过期",
-                        level="critical",
-                        channel="UserTweets",
-                    )
-                elif resp.status_code == 429:
-                    self.record_health_issue(
-                        code="X_USER_RATE_LIMITED",
-                        message="X 小号拉取 UserTweets 触发 HTTP 429 限流，已临时回退免登 Guest Token",
-                        level="warning",
-                        channel="UserTweets",
-                    )
-                resp = self.session.get(
+            payload = None
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+
+            if use_burner and not self._check_gql_burner_response(resp, payload, "UserTweets"):
+                resp = self._http_get(
                     url,
                     headers=self._get_guest_headers(),
                     params=req_params,
-                    proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
+                payload = resp.json() if resp.status_code == 200 else None
             elif resp.status_code == 429 and not use_burner:
                 self._refresh_guest_token()
-                resp = self.session.get(
+                resp = self._http_get(
                     url,
                     headers=self._get_guest_headers(),
                     params=req_params,
-                    proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
-            if resp.status_code != 200:
+                payload = resp.json() if resp.status_code == 200 else None
+
+            if resp.status_code != 200 or not isinstance(payload, dict):
                 if resp.status_code in (400, 404):
                     self.record_health_issue(
                         code="X_USERTWEETS_GQL_DRIFT",
@@ -763,27 +963,7 @@ class XHarvester(BasePlatformHarvester):
                     )
                 return []
 
-            payload = resp.json()
             raw_nodes = _extract_gql_tweet_objects(payload, skip_pinned=True)
-            if not raw_nodes and use_burner and isinstance(payload, dict) and payload.get("errors"):
-                err_codes = {safe_int(e.get("code"), 0) for e in payload.get("errors") if isinstance(e, dict)}
-                if 326 in err_codes:
-                    setattr(self, "_burner_locked_326", True)
-                    self.record_health_issue(
-                        code="X_ACCOUNT_LOCKED_326",
-                        message="X 登录态触发安全验证临时锁定 (code=326, https://x.com/account/access)，请打开对应浏览器目录解锁账号",
-                        level="critical",
-                        channel="UserTweets",
-                    )
-                    guest_resp = self.session.get(
-                        url,
-                        headers=self._get_guest_headers(),
-                        params=req_params,
-                        proxies=self.proxies,
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                    if guest_resp.status_code == 200:
-                        raw_nodes = _extract_gql_tweet_objects(guest_resp.json(), skip_pinned=True)
             by_id = {}
             for node in raw_nodes:
                 legacy_node = node.get("legacy") or {}
@@ -795,6 +975,9 @@ class XHarvester(BasePlatformHarvester):
                 if node_uid and node_uid != str(uid):
                     continue
                 item = self._convert_raw_tweet(node, fallback_screen_name=clean_name, category=category)
+                pub_ts = safe_int(item.get("publish_time"), 0) or _snowflake_to_unix_ts(item.get("post_id", ""))
+                if min_ts > 0 and pub_ts > 0 and pub_ts < min_ts:
+                    continue
                 by_id[item["post_id"]] = item
 
             posts = sorted(by_id.values(), key=lambda x: int(x["post_id"]), reverse=True)
@@ -809,290 +992,77 @@ class XHarvester(BasePlatformHarvester):
         limit: int = 8,
     ) -> List[Dict[str, Any]]:
         """
-        拉取 X 官方实时热搜榜 (`/1.1/trends/place.json`)：
-        默认合并美国热搜 (`WOEID=23424977`) 与全球热搜 (`WOEID=1`)，自动过滤广告推广词。
+        100% 免登拉取 X 全球/美国实时热搜榜：
+        主源抓取 `getdaytrends.com`（美国榜 + 全球榜），二级免登热备 `trends24.in`，零账号消耗、永不触发风控。
         """
-        if not self.has_burner_account:
-            return []
+        import html as _html
 
         merged: List[Dict[str, Any]] = []
         seen_names = set()
-        got_200 = False
 
+        def _append_trends(raw_names: Sequence[str], woeid_val: int) -> int:
+            added_cnt = 0
+            for idx, raw_n in enumerate(raw_names):
+                name = _html.unescape(str(raw_n or "")).strip()
+                if not name or len(name) < 2:
+                    continue
+                key = name.lower()
+                if key in seen_names:
+                    continue
+                seen_names.add(key)
+                merged.append({
+                    "name": name,
+                    "tweet_volume": 0,
+                    "woeid": int(woeid_val),
+                    "rank": idx + 1,
+                })
+                added_cnt += 1
+            return added_cnt
+
+        primary_sources = []
         for woeid in woeid_list:
+            if int(woeid) == 23424977:
+                primary_sources.append((23424977, "https://getdaytrends.com/united-states/", r'<a[^>]+href="/united-states/trend/[^"]+"[^>]*>([^<]+)</a>'))
+            elif int(woeid) == 1:
+                primary_sources.append((1, "https://getdaytrends.com/", r'<a[^>]+href="/trend/[^"]+"[^>]*>([^<]+)</a>'))
+
+        if not primary_sources:
+            primary_sources.append((23424977, "https://getdaytrends.com/united-states/", r'<a[^>]+href="/united-states/trend/[^"]+"[^>]*>([^<]+)</a>'))
+
+        for w_id, t_url, pattern in primary_sources:
             try:
-                resp = self.session.get(
-                    "https://api.x.com/1.1/trends/place.json",
-                    headers=self._get_burner_headers(),
-                    params={"id": int(woeid)},
-                    proxies=self.proxies,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                if resp.status_code in (401, 403):
-                    invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                    self.record_health_issue(
-                        code="X_TRENDS_AUTH_EXPIRED",
-                        message=f"X 热搜榜接口 (/1.1/trends/place.json) 返回 HTTP {resp.status_code}，小号登录态疑似过期",
-                        level="critical",
-                        channel="trends",
-                    )
-                    break
-                if resp.status_code == 429:
-                    self.record_health_issue(
-                        code="X_TRENDS_RATE_LIMITED",
-                        message=f"X 热搜榜接口触发 HTTP 429 限流 (woeid={woeid})",
-                        level="warning",
-                        channel="trends",
-                    )
-                    continue
-                if resp.status_code != 200:
-                    self.record_health_issue(
-                        code="X_TRENDS_HTTP_ERROR",
-                        message=f"X 热搜榜接口返回 HTTP {resp.status_code} (woeid={woeid})",
-                        level="warning",
-                        channel="trends",
-                    )
-                    continue
-
-                got_200 = True
-                payload = resp.json()
-                blocks = payload if isinstance(payload, list) else []
-                for blk in blocks:
-                    if not isinstance(blk, dict):
-                        continue
-                    for rank_idx, tr in enumerate(blk.get("trends") or []):
-                        if not isinstance(tr, dict) or tr.get("promoted_content"):
-                            continue
-                        name = str(tr.get("name") or "").strip()
-                        if not name or len(name) < 2:
-                            continue
-                        key = name.lower()
-                        if key in seen_names:
-                            continue
-                        seen_names.add(key)
-                        merged.append({
-                            "name": name,
-                            "tweet_volume": safe_int(tr.get("tweet_volume"), 0),
-                            "woeid": int(woeid),
-                            "rank": rank_idx + 1,
-                        })
+                resp = self._http_get(t_url, timeout=10)
+                if resp.status_code == 200 and resp.text:
+                    hits = re.findall(pattern, resp.text)
+                    _append_trends(hits[:25], w_id)
             except Exception as e:
-                self.record_health_issue(
-                    code="X_TRENDS_EXCEPTION",
-                    message=f"拉取 X 热搜榜异常 (woeid={woeid}): {e}",
-                    level="warning",
-                    channel="trends",
-                )
+                logger.debug(f"[X适配器] getdaytrends 拉取异常 ({t_url}): {e}")
 
-        if got_200 and not merged:
+        # 二级免登备选：trends24.in
+        if not merged:
+            backup_sources = [
+                (23424977, "https://trends24.in/united-states/"),
+                (1, "https://trends24.in/"),
+            ]
+            for w_id, b_url in backup_sources:
+                try:
+                    resp = self._http_get(b_url, timeout=10)
+                    if resp.status_code == 200 and resp.text:
+                        hits = re.findall(r'<a[^>]*class=[^>]*trend-link[^>]*>([^<]+)</a>', resp.text)
+                        _append_trends(hits[:25], w_id)
+                except Exception as e:
+                    logger.debug(f"[X适配器] trends24 备选拉取异常 ({b_url}): {e}")
+
+        if not merged:
             self.record_health_issue(
-                code="X_TRENDS_EMPTY_SCHEMA",
-                message="X 热搜榜接口返回 HTTP 200 但解析出 0 个热搜词，疑似返回结构变更",
+                code="X_PUBLIC_TRENDS_UNAVAILABLE",
+                message="免登公开热搜源 (getdaytrends / trends24) 均返回 0 个热搜词，请检查代理连通性",
                 level="warning",
                 channel="trends",
             )
 
-        merged.sort(key=lambda x: (1 if x["tweet_volume"] > 0 else 0, x["tweet_volume"], -x["rank"]), reverse=True)
+        merged.sort(key=lambda x: x["rank"])
         return merged[: max(1, limit)]
-
-    def _search_x_native_via_xiaohao(
-        self,
-        keywords: Sequence[str],
-        per_kw_count: int = 15,
-        hours_back: int = 72,
-        include_latest: bool = True,
-        exclude_retweets: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """
-        使用专用爬虫小号会话 (`x_xiaohao_browser_session_dir`) 无头启动持久化浏览器，
-        访问 X 原生搜索页 (`f=top` 热门榜 + 可选 `f=live` 实时流) 并拦截官方 `SearchTimeline` 响应包。
-        内置登录重定向 (`/i/flow/login`)、风控解锁挑战 (`/account/access`)、GraphQL 400/404 漂移与空解析自检。
-        """
-        if not self.has_burner_account or not self.burner_user_data_dir or not os.path.isdir(self.burner_user_data_dir):
-            return []
-
-        clean_kws: List[str] = []
-        seen_kw = set()
-        for raw_k in keywords or []:
-            k = str(raw_k or "").strip()
-            if k and k.lower() not in seen_kw:
-                seen_kw.add(k.lower())
-                clean_kws.append(k)
-        if not clean_kws:
-            return []
-
-        min_ts = int(time.time() - max(1, hours_back) * 3600)
-        collected_by_id: Dict[str, Dict[str, Any]] = {}
-        current_kw_items: Dict[str, Dict[str, Any]] = {}
-        auth_failed = False
-
-        try:
-            from playwright.sync_api import sync_playwright
-            from platforms.playwright_base import _launch_persistent
-        except Exception as e:
-            self.record_health_issue(
-                code="X_PLAYWRIGHT_UNAVAILABLE",
-                message=f"无法加载 Playwright 执行 X 原生搜索: {e}",
-                level="critical",
-                channel="x_native_search",
-            )
-            return []
-
-        proxy_server = self.proxies.get("http") if isinstance(self.proxies, dict) else None
-
-        try:
-            with sync_playwright() as p:
-                context = _launch_persistent(
-                    p,
-                    user_data_dir=self.burner_user_data_dir,
-                    args=["--disable-blink-features=AutomationControlled"],
-                    debug=False,
-                    proxy=proxy_server,
-                )
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-
-                    def _on_response(resp) -> None:
-                        nonlocal auth_failed
-                        r_url = resp.url or ""
-                        if "SearchTimeline" not in r_url:
-                            return
-                        status = resp.status
-                        if status in (401, 403):
-                            auth_failed = True
-                            invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                            self.record_health_issue(
-                                code="X_SEARCH_AUTH_EXPIRED",
-                                message=f"X SearchTimeline 返回 HTTP {status}，小号登录态已失效！",
-                                level="critical",
-                                channel="x_native_search",
-                            )
-                            return
-                        if status == 429:
-                            self.record_health_issue(
-                                code="X_SEARCH_RATE_LIMITED",
-                                message="X SearchTimeline 触发 HTTP 429 频率限制",
-                                level="warning",
-                                channel="x_native_search",
-                            )
-                            return
-                        if status in (400, 404):
-                            self.record_health_issue(
-                                code="X_SEARCH_GQL_DRIFT",
-                                message=f"X SearchTimeline 返回 HTTP {status}，疑似搜索接口签名或参数异常",
-                                level="critical",
-                                channel="x_native_search",
-                            )
-                            return
-                        if status != 200:
-                            return
-                        try:
-                            data = resp.json()
-                        except Exception:
-                            return
-                        nodes = _extract_gql_tweet_objects(data, skip_pinned=True)
-                        if not nodes and isinstance(data, dict) and data.get("errors"):
-                            self.record_health_issue(
-                                code="X_SEARCH_GQL_ERRORS",
-                                message=f"X SearchTimeline 返回 GraphQL errors: {str(data.get('errors'))[:160]}",
-                                level="warning",
-                                channel="x_native_search",
-                            )
-                            return
-                        for node in nodes:
-                            legacy_node = node.get("legacy") or {}
-                            if exclude_retweets and legacy_node.get("retweeted_status_result"):
-                                continue
-                            parsed = self._convert_raw_tweet(node, category="x_search")
-                            pid = str(parsed.get("post_id") or "")
-                            if not pid or not self.is_valuable_post(parsed):
-                                continue
-                            if safe_int(parsed.get("publish_time"), 0) < min_ts:
-                                continue
-                            current_kw_items[pid] = parsed
-                            collected_by_id[pid] = parsed
-
-                    page.on("response", _on_response)
-
-                    def _check_session_redirect() -> bool:
-                        cur_u = (page.url or "").lower()
-                        if "/i/flow/login" in cur_u or cur_u.rstrip("/").endswith("/login"):
-                            invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                            self.record_health_issue(
-                                code="X_SESSION_LOGGED_OUT",
-                                message=f"X 小号访问搜索页被重定向至登录页 ({page.url})，登录态已掉线！请重新打开 x_xiaohao 登录。",
-                                level="critical",
-                                channel="x_native_search",
-                            )
-                            return True
-                        if "/account/access" in cur_u or "arkose" in cur_u:
-                            self.record_health_issue(
-                                code="X_ACCOUNT_CHALLENGED",
-                                message=f"X 小号触发安全解锁验证 ({page.url})！请人工打开 x_xiaohao 解锁。",
-                                level="critical",
-                                channel="x_native_search",
-                            )
-                            return True
-                        return False
-
-                    for kw in clean_kws[:6]:
-                        if auth_failed:
-                            break
-                        current_kw_items = {}
-                        top_url = f"https://x.com/search?q={quote(kw)}&src=typed_query&f=top"
-                        try:
-                            with page.expect_response(lambda r: "SearchTimeline" in r.url, timeout=9000):
-                                page.goto(top_url, wait_until="domcontentloaded", timeout=15000)
-                        except Exception:
-                            pass
-                        page.wait_for_timeout(300)
-                        if _check_session_redirect():
-                            auth_failed = True
-                            break
-
-                        # 若单关键词期望条数较多且首屏有结果，向下滚动一屏追加高赞推文
-                        if per_kw_count > 12 and 4 <= len(current_kw_items) < per_kw_count:
-                            try:
-                                with page.expect_response(lambda r: "SearchTimeline" in r.url, timeout=3500):
-                                    page.mouse.wheel(0, 2600)
-                            except Exception:
-                                pass
-                            page.wait_for_timeout(200)
-
-                        # 若 Top 榜近期新帖较少且开启了实时流补充，再看一眼 Latest 流
-                        if include_latest and not auth_failed and len(current_kw_items) < max(6, per_kw_count // 2):
-                            live_url = f"https://x.com/search?q={quote(kw)}&src=typed_query&f=live"
-                            try:
-                                with page.expect_response(lambda r: "SearchTimeline" in r.url, timeout=7500):
-                                    page.goto(live_url, wait_until="domcontentloaded", timeout=15000)
-                            except Exception:
-                                pass
-                            page.wait_for_timeout(250)
-                            if _check_session_redirect():
-                                auth_failed = True
-                                break
-
-                    # 顺手同步最新 ct0 / auth_token 到内存，保持后续 TweetDetail 评论请求新鲜
-                    try:
-                        fresh_cookies = context.cookies(["https://x.com", "https://twitter.com"])
-                        fresh_str = "; ".join(f"{c['name']}={c['value']}" for c in fresh_cookies if c.get("name"))
-                        fresh_dict = _parse_cookie_dict(fresh_str)
-                        if fresh_dict.get("auth_token") and fresh_dict.get("ct0"):
-                            self.burner_cookies = fresh_str
-                            self.cookie_dict = fresh_dict
-                    except Exception:
-                        pass
-                finally:
-                    context.close()
-        except Exception as e:
-            self.record_health_issue(
-                code="X_NATIVE_SEARCH_ERROR",
-                message=f"X 专用小号无头浏览器原生搜索异常: {e}",
-                level="warning",
-                channel="x_native_search",
-            )
-
-        return list(collected_by_id.values())
 
     def fetch_hot_or_recommended(
         self,
@@ -1104,11 +1074,10 @@ class XHarvester(BasePlatformHarvester):
     ) -> List[Dict[str, Any]]:
         """
         原语 1：拉取 X 平台热榜 / 首页推荐流。
-        - 若指定了 `list_id` 且有小号：1 次请求拉取 `ListLatestTweetsTimeline`；
-        - 若有小号：1 次请求拉取 `HomeTimeline`（For You 算法推荐流）或 `HomeLatestTimeline`（关注流）；
-        - 若无小号或主通道异常：明确记录健康告警后再回退免登大 V 流。
+        - 若小号健康可用 (`is_burner_usable=True`)：仅发 1 次 `curl_cffi` 请求拉取 `HomeTimeline`（或 `ListLatestTweetsTimeline`）；
+        - 若无小号或处于静默冷却保护期：自动回退免登头部实时大 V 热帖聚合，全程零阻塞。
         """
-        if self.has_burner_account:
+        if self.is_burner_usable:
             if list_id:
                 op = "ListLatestTweetsTimeline"
                 variables = {"listId": str(list_id), "count": max(count, 25)}
@@ -1124,18 +1093,23 @@ class XHarvester(BasePlatformHarvester):
             qid = X_GQL_QUERY_IDS[op]
             url = f"https://x.com/i/api/graphql/{qid}/{op}"
             try:
-                resp = self.session.get(
+                resp = self._http_get(
                     url,
                     headers=self._get_burner_headers(),
                     params={
                         "variables": json.dumps(variables, separators=(",", ":")),
                         "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
                     },
-                    proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
-                if resp.status_code == 200:
-                    nodes = _extract_gql_tweet_objects(resp.json())
+                payload = None
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = None
+
+                if self._check_gql_burner_response(resp, payload, op) and isinstance(payload, dict):
+                    nodes = _extract_gql_tweet_objects(payload)
                     by_id = {}
                     for node in nodes:
                         if (node.get("legacy") or {}).get("retweeted_status_result"):
@@ -1143,34 +1117,19 @@ class XHarvester(BasePlatformHarvester):
                         item = self._convert_raw_tweet(node, category=f"x_{op.lower()}")
                         if self.is_valuable_post(item):
                             by_id[item["post_id"]] = item
-                    if not by_id:
-                        self.record_health_issue(
-                            code="X_HOME_EMPTY_PARSE",
-                            message=f"X 小号 {op} 返回 HTTP 200 但解析有效推文为 0 条，疑似返回结构变化或推荐流异常",
-                            level="warning",
-                            channel=op,
-                        )
-                    else:
+                    if by_id:
+                        self._mark_burner_healthy()
                         return sorted(by_id.values(), key=lambda x: x["engagement"]["like_count"], reverse=True)[:count]
-                elif resp.status_code in (401, 403):
-                    invalidate_burner_cookie_cache(self.burner_user_data_dir)
                     self.record_health_issue(
-                        code="X_HOME_AUTH_EXPIRED",
-                        message=f"X 小号 {op} 返回 HTTP {resp.status_code}，小号登录态已过期，已降级免登流！",
-                        level="critical",
+                        code="X_HOME_EMPTY_PARSE",
+                        message=f"X 小号 {op} 返回 HTTP 200 但解析有效推文为 0 条，已自动回退免登大 V 热帖流",
+                        level="warning",
                         channel=op,
                     )
                 elif resp.status_code in (400, 404):
                     self.record_health_issue(
                         code="X_HOME_GQL_DRIFT",
-                        message=f"X 小号 {op} 返回 HTTP {resp.status_code}，疑似 GraphQL queryId ({qid}) 过期！",
-                        level="critical",
-                        channel=op,
-                    )
-                else:
-                    self.record_health_issue(
-                        code="X_HOME_HTTP_DEGRADED",
-                        message=f"X 小号 {op} 返回 HTTP {resp.status_code}，已降级免登流",
+                        message=f"X 小号 {op} 返回 HTTP {resp.status_code}，疑似 GraphQL queryId ({qid}) 过期，已回退免登流",
                         level="warning",
                         channel=op,
                     )
@@ -1182,23 +1141,79 @@ class XHarvester(BasePlatformHarvester):
                     channel=op,
                 )
 
-        handles = fallback_handles or ["Polymarket", "KobeissiLetter", "WatcherGuru", "Dexerto", "wallstreetbets"]
+        handles = fallback_handles or [
+            "Polymarket",
+            "KobeissiLetter",
+            "WatcherGuru",
+            "Dexerto",
+            "MarioNawfal",
+            "MorningBrew",
+            "wallstreetbets",
+            "OpenAI",
+        ]
         combined = []
         for h in handles:
             combined.extend(self.fetch_user_posts(h, count=max(5, count // len(handles))))
-            time.sleep(0.25)
+            time.sleep(0.15)
         combined.sort(key=lambda x: x["engagement"]["like_count"], reverse=True)
         return combined[:count]
 
     def _convert_fxtwitter_tweet(self, tw: Dict[str, Any], fallback_screen_name: str = "") -> Optional[Dict[str, Any]]:
-        """免登兜底：将公开镜像 `api.fxtwitter.com` 的 tweet 对象转换为项目统一标准 Schema。"""
+        """免登主力详情转换：将公开镜像 `api.fxtwitter.com` 的 tweet 对象（含长文 Article、引用帖与外链）转换为标准 Schema。"""
         if not isinstance(tw, dict) or not tw.get("id"):
             return None
         tid = str(tw["id"]).strip()
         author = tw.get("author") or {}
         screen_name = str(author.get("screen_name") or fallback_screen_name or "unknown").strip()
         author_name = str(author.get("name") or screen_name).strip()
-        text = clean_post_text(str(tw.get("text") or ""))
+
+        raw_text_str = str(tw.get("text") or "")
+        article_obj = tw.get("article")
+        title_val: Optional[str] = None
+        is_long_article = False
+        if isinstance(article_obj, dict):
+            art_title = clean_post_text(str(article_obj.get("title") or "")).strip()
+            blocks = ((article_obj.get("content") or {}).get("blocks")) or []
+            art_paragraphs = [
+                str(b.get("text") or "").strip()
+                for b in blocks
+                if isinstance(b, dict) and str(b.get("text") or "").strip()
+            ]
+            art_body = "\n".join(art_paragraphs).strip() or str(article_obj.get("preview_text") or "").strip()
+            if art_title:
+                title_val = art_title
+            if art_body and len(art_body) > len(raw_text_str):
+                raw_text_str = art_body
+                is_long_article = True
+
+        text = clean_post_text(raw_text_str)
+
+        hashtags: List[str] = []
+        mentioned_coins: List[str] = []
+        external_url = ""
+        facets = ((tw.get("raw_text") or {}).get("facets")) or []
+        for fc in facets:
+            if not isinstance(fc, dict):
+                continue
+            ftype = str(fc.get("type") or "").lower()
+            if ftype == "url":
+                cand_u = str(fc.get("replacement") or fc.get("original") or "").strip()
+                if not external_url and is_fetchable_external_article_url(cand_u):
+                    external_url = cand_u
+            elif ftype == "hashtag":
+                ht = str(fc.get("original") or "").lstrip("#").strip()
+                if ht and ht not in hashtags:
+                    hashtags.append(ht)
+            elif ftype in ("cashtag", "symbol"):
+                sym = str(fc.get("original") or "").lstrip("$").strip().upper()
+                if sym and sym not in mentioned_coins:
+                    mentioned_coins.append(sym)
+
+        if not external_url:
+            for u_match in re.findall(r"https?://[^\s<>\"')]+", text):
+                if is_fetchable_external_article_url(u_match):
+                    external_url = u_match
+                    break
 
         media_obj = tw.get("media") or {}
         photos = media_obj.get("photos") or []
@@ -1208,11 +1223,24 @@ class XHarvester(BasePlatformHarvester):
         video_url = videos[0].get("url") if videos and isinstance(videos[0], dict) else None
         video_duration = int(safe_int(videos[0].get("duration"), 1)) if video_url else 0
 
+        if isinstance(article_obj, dict):
+            cov_url = (((article_obj.get("cover_media") or {}).get("media_info") or {}).get("original_img_url"))
+            if cov_url and cov_url not in images:
+                images.insert(0, cov_url)
+                main_images.insert(0, cov_url)
+
         quoted_data = None
         qt = tw.get("quote")
         if isinstance(qt, dict) and qt.get("id"):
             q_author = qt.get("author") or {}
             q_txt = clean_post_text(str(qt.get("text") or ""))
+            if not external_url:
+                for qfc in ((qt.get("raw_text") or {}).get("facets") or []):
+                    if isinstance(qfc, dict) and str(qfc.get("type") or "").lower() == "url":
+                        q_u = str(qfc.get("replacement") or "").strip()
+                        if is_fetchable_external_article_url(q_u):
+                            external_url = q_u
+                            break
             q_media = qt.get("media") or {}
             q_photos = [p["url"] for p in (q_media.get("photos") or []) if isinstance(p, dict) and p.get("url")]
             q_vids = q_media.get("videos") or []
@@ -1233,9 +1261,14 @@ class XHarvester(BasePlatformHarvester):
             if q_txt and q_txt not in text:
                 text = f"{text}\n[引用 @{quoted_data['username']}]: {q_txt}".strip()
 
-        item = self.create_empty_post(card_type="BUZZ_VIDEO" if video_url else "BUZZ_SHORT")
+        card_type = "BUZZ_VIDEO" if video_url else ("BUZZ_LONG" if (is_long_article or len(text) >= 500) else "BUZZ_SHORT")
+        item = self.create_empty_post(card_type=card_type)
         item["post_id"] = tid
-        item["publish_time"] = safe_int(tw.get("created_timestamp"), 0) or normalize_publish_timestamp(tw.get("created_at"))
+        item["publish_time"] = (
+            safe_int(tw.get("created_timestamp"), 0)
+            or normalize_publish_timestamp(tw.get("created_at"))
+            or _snowflake_to_unix_ts(tid)
+        )
         item["author_id"] = str(author.get("id") or "") or None
         item["author"].update({
             "username": screen_name,
@@ -1244,10 +1277,10 @@ class XHarvester(BasePlatformHarvester):
             "followers_count": safe_int(author.get("followers"), 0),
         })
         item["content"].update({
-            "title": None,
+            "title": title_val,
             "text_content": text,
-            "hashtags": [],
-            "mentioned_coins": [],
+            "hashtags": hashtags,
+            "mentioned_coins": mentioned_coins,
         })
         item["media"].update({
             "cover_image": images[0] if images else None,
@@ -1263,14 +1296,163 @@ class XHarvester(BasePlatformHarvester):
             "quote_count": safe_int(tw.get("quotes"), 0),
             "bookmark_count": safe_int(tw.get("bookmarks"), 0),
         })
-        item["metadata"].update({
+        meta_payload: Dict[str, Any] = {
             "url": str(tw.get("url") or f"https://x.com/{screen_name}/status/{tid}"),
             "lang": tw.get("lang"),
             "category": "x_search",
             "main_images": main_images,
             "quoted_post": quoted_data,
-        })
+        }
+        if external_url:
+            meta_payload["external_url"] = external_url
+        item["metadata"].update(meta_payload)
         return self.normalize_post(item, download_media=False)
+
+    def _convert_syndication_tweet(self, syn: Dict[str, Any], fallback_screen_name: str = "") -> Optional[Dict[str, Any]]:
+        """免登二级详情转换：将官方嵌入接口 `cdn.syndication.twimg.com/tweet-result` 响应转为标准 Schema。"""
+        if not isinstance(syn, dict) or not syn.get("id_str"):
+            return None
+        tid = str(syn["id_str"]).strip()
+        user_obj = syn.get("user") or {}
+        screen_name = str(user_obj.get("screen_name") or fallback_screen_name or "unknown").strip()
+        author_name = str(user_obj.get("name") or screen_name).strip()
+
+        entities = syn.get("entities") or {}
+        text = _clean_x_text_with_entities(str(syn.get("text") or ""), {"entities": entities})
+
+        external_url = ""
+        for u_obj in entities.get("urls") or []:
+            if isinstance(u_obj, dict):
+                exp_u = str(u_obj.get("expanded_url") or "").strip()
+                if is_fetchable_external_article_url(exp_u):
+                    external_url = exp_u
+                    break
+
+        main_images: List[str] = []
+        for p in syn.get("photos") or []:
+            if isinstance(p, dict) and p.get("url") and p["url"] not in main_images:
+                main_images.append(p["url"])
+        for m in syn.get("mediaDetails") or []:
+            if isinstance(m, dict) and m.get("type") == "photo" and m.get("media_url_https"):
+                if m["media_url_https"] not in main_images:
+                    main_images.append(m["media_url_https"])
+        images = list(main_images)
+
+        video_url = None
+        video_duration = 0
+        vid_obj = syn.get("video")
+        if isinstance(vid_obj, dict):
+            poster = vid_obj.get("poster")
+            if poster and poster not in images:
+                images.append(poster)
+            mp4s = [
+                v for v in (vid_obj.get("variants") or [])
+                if isinstance(v, dict) and v.get("type") == "video/mp4" and v.get("src")
+            ]
+            if mp4s:
+                video_url = mp4s[-1]["src"]
+            video_duration = max(1, int(safe_int(vid_obj.get("durationMs"), 0) / 1000)) if video_url else 0
+
+        quoted_data = None
+        qt = syn.get("quoted_tweet")
+        if isinstance(qt, dict) and qt.get("id_str"):
+            q_user = qt.get("user") or {}
+            q_txt = _clean_x_text_with_entities(str(qt.get("text") or ""), {"entities": qt.get("entities") or {}})
+            q_photos = [
+                p["url"] for p in (qt.get("photos") or [])
+                if isinstance(p, dict) and p.get("url")
+            ]
+            for qp in q_photos:
+                if qp not in images:
+                    images.append(qp)
+            quoted_data = {
+                "post_id": str(qt.get("id_str")),
+                "username": str(q_user.get("screen_name") or ""),
+                "text": q_txt,
+                "likes": safe_int(qt.get("favorite_count"), 0),
+                "images": q_photos,
+                "has_video": bool(qt.get("video")),
+            }
+            if q_txt and q_txt not in text:
+                text = f"{text}\n[引用 @{quoted_data['username']}]: {q_txt}".strip()
+
+        item = self.create_empty_post(card_type="BUZZ_VIDEO" if video_url else "BUZZ_SHORT")
+        item["post_id"] = tid
+        item["publish_time"] = normalize_publish_timestamp(syn.get("created_at")) or _snowflake_to_unix_ts(tid)
+        item["author_id"] = str(user_obj.get("id_str") or "") or None
+        item["author"].update({
+            "username": screen_name,
+            "author_name": author_name,
+            "is_verified": bool(user_obj.get("is_blue_verified") or user_obj.get("verified")),
+            "followers_count": 0,
+        })
+        item["content"].update({
+            "title": None,
+            "text_content": text,
+            "hashtags": [
+                str(h.get("text")).strip()
+                for h in (entities.get("hashtags") or [])
+                if isinstance(h, dict) and h.get("text")
+            ],
+            "mentioned_coins": [],
+        })
+        item["media"].update({
+            "cover_image": images[0] if images else None,
+            "images": images,
+            "video_url": video_url,
+            "video_duration": video_duration,
+        })
+        item["engagement"].update({
+            "view_count": 0,
+            "like_count": safe_int(syn.get("favorite_count"), 0),
+            "comment_count": safe_int(syn.get("conversation_count"), 0),
+            "share_count": 0,
+            "quote_count": 0,
+            "bookmark_count": 0,
+        })
+        meta_payload: Dict[str, Any] = {
+            "url": f"https://x.com/{screen_name}/status/{tid}",
+            "lang": syn.get("lang"),
+            "category": "x_search",
+            "main_images": main_images,
+            "quoted_post": quoted_data,
+        }
+        if external_url:
+            meta_payload["external_url"] = external_url
+        item["metadata"].update(meta_payload)
+        return self.normalize_post(item, download_media=False)
+
+    def _fetch_tweet_zero_auth(self, tweet_id: str, screen_name: str = "") -> Optional[Dict[str, Any]]:
+        """100% 免登拉取单条推文全量详情：主走 `api.fxtwitter.com`，失败自动热备切换 `cdn.syndication.twimg.com`。"""
+        tid = str(tweet_id or "").strip()
+        if not tid.isdigit():
+            return None
+        handle_seg = str(screen_name or "i").strip() or "i"
+
+        try:
+            rfx = self._http_get(f"https://api.fxtwitter.com/{handle_seg}/status/{tid}", timeout=10)
+            if rfx.status_code == 200:
+                tw_obj = (rfx.json() or {}).get("tweet")
+                if isinstance(tw_obj, dict):
+                    parsed = self._convert_fxtwitter_tweet(tw_obj, fallback_screen_name=screen_name)
+                    if parsed:
+                        return parsed
+        except Exception as e:
+            logger.debug(f"[X适配器] fxtwitter 拉取 {tid} 异常，尝试 syndication 备份: {e}")
+
+        try:
+            rsyn = self._http_get(
+                f"https://cdn.syndication.twimg.com/tweet-result?id={tid}&lang=en&token=42",
+                timeout=10,
+            )
+            if rsyn.status_code == 200:
+                syn_obj = rsyn.json()
+                if isinstance(syn_obj, dict) and syn_obj.get("id_str"):
+                    return self._convert_syndication_tweet(syn_obj, fallback_screen_name=screen_name)
+        except Exception as e:
+            logger.debug(f"[X适配器] syndication 备份拉取 {tid} 失败: {e}")
+
+        return None
 
     def fetch_tweet_with_comments(
         self,
@@ -1279,15 +1461,15 @@ class XHarvester(BasePlatformHarvester):
         max_comments: int = 10,
     ) -> Optional[Dict[str, Any]]:
         """
-        根据单条推文 ID 一次请求同时拿齐「完整主帖正文 + 全部高清原图 + 引用原帖 + 前排高赞评论」：
-        - 若启用只读小号：单次请求 `TweetDetail` 同时解析主推文节点与前排评论节点；
-        - 若无小号或临时受限：自动回退公开镜像 `api.fxtwitter.com` 免登拉取完整推文。
+        根据单条推文 ID 拿齐推文详情与（可选）前排神评：
+        - 当 `max_comments <= 0` 或小号处于冷却/未配状态时：100% 走免登 `_fetch_tweet_zero_auth`，零小号消耗；
+        - 仅当调用方显式要求拿评论 (`max_comments > 0`) 且小号健康可用时，才使用 `curl_cffi` 调 1 次 `TweetDetail`。
         """
         tid = str(tweet_id or "").strip()
         if not tid.isdigit():
             return None
 
-        if self.has_burner_account:
+        if max_comments > 0 and self.is_burner_usable:
             qid = X_GQL_QUERY_IDS["TweetDetail"]
             url = f"https://x.com/i/api/graphql/{qid}/TweetDetail"
             variables = {
@@ -1301,18 +1483,23 @@ class XHarvester(BasePlatformHarvester):
                 "withV2Timeline": True,
             }
             try:
-                resp = requests.get(
+                resp = self._http_get(
                     url,
                     headers=self._get_burner_headers(),
                     params={
                         "variables": json.dumps(variables, separators=(",", ":")),
                         "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
                     },
-                    proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
                 )
-                if resp.status_code == 200:
-                    nodes = _extract_gql_tweet_objects(resp.json())
+                payload = None
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = None
+
+                if self._check_gql_burner_response(resp, payload, "TweetDetail") and isinstance(payload, dict):
+                    nodes = _extract_gql_tweet_objects(payload)
                     focal_item: Optional[Dict[str, Any]] = None
                     raw_replies = []
                     comment_authors_map: Dict[str, Dict[str, Any]] = {}
@@ -1351,10 +1538,11 @@ class XHarvester(BasePlatformHarvester):
                             "images": (parsed.get("media") or {}).get("images") or [],
                         })
                     if focal_item is not None:
+                        self._mark_burner_healthy()
                         if comment_authors_map:
                             pextra = (focal_item.setdefault("metadata", {})).setdefault("platform_extra", {})
                             pextra["comment_authors"] = list(comment_authors_map.values())
-                        if max_comments > 0 and raw_replies:
+                        if raw_replies:
                             focal_username = str(
                                 (focal_item.get("author") or {}).get("username")
                                 or focal_item.get("author_id")
@@ -1376,116 +1564,135 @@ class XHarvester(BasePlatformHarvester):
                             )
                         return focal_item
             except Exception as e:
-                logger.debug(f"[X适配器] TweetDetail 单帖拉取 {tid} 回退 fxtwitter: {e}")
+                logger.debug(f"[X适配器] TweetDetail 单帖拉取 {tid} 回退免登镜像: {e}")
 
-        # 0账号免登兜底：api.fxtwitter.com
-        handle_seg = str(screen_name or "i").strip() or "i"
-        try:
-            rfx = requests.get(
-                f"https://api.fxtwitter.com/{handle_seg}/status/{tid}",
-                headers={"User-Agent": DEFAULT_UA},
-                proxies=self.proxies,
-                timeout=10,
-            )
-            if rfx.status_code == 200:
-                tw_obj = (rfx.json() or {}).get("tweet")
-                if isinstance(tw_obj, dict):
-                    return self._convert_fxtwitter_tweet(tw_obj, fallback_screen_name=screen_name)
-        except Exception as e:
-            logger.debug(f"[X适配器] fxtwitter 拉取 {tid} 失败: {e}")
-        return None
+        return self._fetch_tweet_zero_auth(tid, screen_name=screen_name)
 
-    def _discover_x_tweets_via_yahoo(self, keywords: List[str], per_kw_limit: int = 12) -> List[Tuple[str, str]]:
-        """利用 Yahoo + Bing RSS 双搜索引擎发现全站公开推文 `(screen_name, tweet_id)`，无需接触 X 搜索风控。"""
-        discovered: List[Tuple[str, str]] = []
-        seen_tids = set()
+    def _discover_x_tweets_zero_auth(
+        self,
+        keywords: Sequence[str],
+        per_kw_limit: int = 15,
+        hours_back: int = 72,
+    ) -> List[Tuple[str, str]]:
+        """
+        100% 免登全站推文发现引擎：
+        - 优先提炼英文精准短语，辅以核心双词组与精简中文词；
+        - 并发检索 `Yahoo Search (site:x.com)` 的 24h (`btf=d`) 与 7d (`btf=w` 前两页 `b=1, 8`)；
+        - 利用推文 Snowflake ID 在发起详情请求前零开销过滤掉超出 `hours_back` 的陈旧归档帖。
+        """
+        min_ts = int(time.time() - max(1, hours_back) * 3600)
 
-        search_terms: List[str] = []
+        en_terms: List[str] = []
+        cn_terms: List[str] = []
         seen_terms = set()
-        for raw_kw in keywords[:6]:
+
+        def _add_term(term: str, bucket: List[str]) -> None:
+            t = str(term or "").strip()
+            if len(t) < 2:
+                return
+            low = t.lower()
+            if low not in seen_terms:
+                seen_terms.add(low)
+                bucket.append(t)
+
+        for raw_kw in keywords or []:
             kw = str(raw_kw or "").strip()
             if not kw:
                 continue
-            if kw.lower() not in seen_terms:
-                seen_terms.add(kw.lower())
-                search_terms.append(kw)
-            parts = [p for p in kw.split() if p]
-            if len(parts) >= 3:
-                for short_kw in (" ".join(parts[:2]), " ".join(parts[-2:])):
-                    if short_kw.lower() not in seen_terms:
-                        seen_terms.add(short_kw.lower())
-                        search_terms.append(short_kw)
-
-        def _fetch_text(target_url: str) -> str:
-            if cffi_requests is not None:
-                rs = cffi_requests.get(
-                    target_url,
-                    headers={"User-Agent": DEFAULT_UA},
-                    impersonate="chrome",
-                    proxies=self.proxies,
-                    timeout=10,
-                )
+            has_cjk = bool(re.search(r"[\u4e00-\u9fff]", kw))
+            if not has_cjk:
+                _add_term(kw, en_terms)
+                parts = [p for p in kw.split() if p]
+                if len(parts) >= 3:
+                    _add_term(" ".join(parts[:2]), en_terms)
+                    _add_term(" ".join(parts[-2:]), en_terms)
             else:
-                rs = requests.get(
-                    target_url,
-                    headers={"User-Agent": DEFAULT_UA},
-                    proxies=self.proxies,
-                    timeout=10,
-                )
-            return unquote(rs.text or "") if rs.status_code == 200 else ""
+                # 混合词组（如 '支付风控 Chargeback'）中提取英文专有名词优先查 X，同时保留精简中文词
+                ascii_chunks = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\- ]{1,40}[A-Za-z0-9]", kw)
+                for ac in ascii_chunks:
+                    _add_term(ac.strip(), en_terms)
+                cjk_only = re.sub(r"[A-Za-z0-9_.\-]+", " ", kw).strip()
+                if 2 <= len(cjk_only) <= 10:
+                    _add_term(cjk_only, cn_terms)
+                elif len(kw) <= 10:
+                    _add_term(kw, cn_terms)
 
-        def _collect_pairs(text_blob: str, max_add: int) -> int:
-            added = 0
-            for handle, tid in re.findall(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d{18,22})", text_blob):
-                if handle.lower() in ("i", "intent", "share", "home", "search"):
-                    continue
-                if tid in seen_tids:
-                    continue
-                seen_tids.add(tid)
-                discovered.append((handle, tid))
-                added += 1
-                if added >= max_add:
+        search_terms = (en_terms + cn_terms)[:8]
+        if not search_terms:
+            return []
+
+        def _search_single_term(term: str) -> List[Tuple[str, str]]:
+            local_pairs: List[Tuple[str, str]] = []
+            local_seen = set()
+            q_encoded = quote(f"site:x.com {term}")
+            # 依次查 24h 最新窗 -> 7d 热门第 1 页 -> 若仍不足再翻 7d 第 2 页
+            page_specs = [
+                f"https://search.yahoo.com/search?p={q_encoded}&btf=d",
+                f"https://search.yahoo.com/search?p={q_encoded}&btf=w",
+                f"https://search.yahoo.com/search?p={q_encoded}&btf=w&b=8",
+            ]
+            for idx, target_url in enumerate(page_specs):
+                if idx == 2 and len(local_pairs) >= per_kw_limit:
                     break
-            return added
-
-        for kw in search_terms[:6]:
-            hits_for_kw = 0
-            for btf in ("&btf=w", ""):
-                search_url = f"https://search.yahoo.com/search?p={quote('site:x.com ' + kw)}{btf}&n=30"
                 try:
-                    decoded = _fetch_text(search_url)
-                    if decoded:
-                        hits_for_kw += _collect_pairs(decoded, max(1, per_kw_limit - hits_for_kw))
-                    if hits_for_kw >= max(4, per_kw_limit // 2):
-                        break
-                except Exception:
-                    continue
+                    rs = self._http_get(target_url, timeout=10)
+                    if rs.status_code != 200 or not rs.text:
+                        continue
+                    decoded = unquote(rs.text)
+                    for handle, tid in re.findall(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d{18,22})", decoded):
+                        if handle.lower() in ("i", "intent", "share", "home", "search", "hashtag"):
+                            continue
+                        if tid in local_seen:
+                            continue
+                        est_ts = _snowflake_to_unix_ts(tid)
+                        if est_ts > 0 and est_ts < min_ts:
+                            continue
+                        local_seen.add(tid)
+                        local_pairs.append((handle, tid))
+                        if len(local_pairs) >= per_kw_limit * 2:
+                            break
+                except Exception as e:
+                    logger.debug(f"[X适配器] Yahoo 检索词 `{term}` 异常: {e}")
+            return local_pairs
 
-            bing_url = f"https://www.bing.com/search?q={quote('site:x.com ' + kw)}&format=rss&count=30"
-            try:
-                decoded_bing = _fetch_text(bing_url)
-                if decoded_bing:
-                    _collect_pairs(decoded_bing, per_kw_limit)
-            except Exception:
-                pass
+        discovered: List[Tuple[str, str]] = []
+        seen_tids = set()
+        with ThreadPoolExecutor(max_workers=min(3, len(search_terms))) as pool:
+            ordered_results = list(pool.map(_search_single_term, search_terms))
+            for pairs in ordered_results:
+                for handle, tid in pairs:
+                    if tid not in seen_tids:
+                        seen_tids.add(tid)
+                        discovered.append((handle, tid))
 
         return discovered
 
-    def _attach_comments_concurrent(
+    def _discover_x_tweets_via_yahoo(self, keywords: List[str], per_kw_limit: int = 12) -> List[Tuple[str, str]]:
+        """向后兼容别名：转发至升级后的免登分时多页发现引擎。"""
+        return self._discover_x_tweets_zero_auth(keywords=keywords, per_kw_limit=per_kw_limit, hours_back=72)
+
+    def _attach_comments_safely(
         self,
         posts: List[Dict[str, Any]],
-        top_n_for_comments: int = 80,
+        top_n_for_comments: int = 8,
         max_comments_per_post: int = 10,
-        max_workers: int = 4,
-    ) -> None:
-        if not self.has_burner_account or top_n_for_comments <= 0 or not posts:
-            return
+    ) -> int:
+        """
+        登录态最小特权补评：
+        仅在小号健康可用时，对互动最高的前 `top_n_for_comments`（硬上限 10 条）重点帖，
+        采用【单线程串行 + 1.5~2.8s 真人节奏随机间隔】拉取前排高赞神评；一旦遇到 326/掉线立即熔断退出。
+        """
+        if not self.is_burner_usable or top_n_for_comments <= 0 or not posts:
+            return 0
+
+        effective_n = min(safe_int(top_n_for_comments, 8), MAX_SAFE_COMMENT_POSTS_HARD_CAP)
         candidates = [
             p for p in posts
             if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0 and not (p.get("comments") or [])
         ]
         if not candidates:
-            return
+            return 0
+
         candidates.sort(
             key=lambda p: (
                 safe_int((p.get("engagement") or {}).get("like_count"), 0) * 2
@@ -1493,22 +1700,34 @@ class XHarvester(BasePlatformHarvester):
             ),
             reverse=True,
         )
-        selected = candidates[:top_n_for_comments]
+        selected = candidates[:effective_n]
+        attached_posts = 0
 
-        def _worker(post_obj: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-            time.sleep(random.uniform(0.05, 0.2))
+        for idx, post_obj in enumerate(selected):
+            if not self.is_burner_usable:
+                break
+            if idx > 0:
+                time.sleep(random.uniform(1.5, 2.8))
             cmts = self.fetch_post_comments(post_obj["post_id"], max_comments=max_comments_per_post)
-            return post_obj, cmts
+            if cmts:
+                post_obj["comments"] = cmts
+                attached_posts += 1
 
-        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(selected)))) as pool:
-            futures = [pool.submit(_worker, p) for p in selected]
-            for fut in as_completed(futures):
-                try:
-                    post_obj, cmts = fut.result()
-                    if cmts:
-                        post_obj["comments"] = cmts
-                except Exception:
-                    pass
+        return attached_posts
+
+    def _attach_comments_concurrent(
+        self,
+        posts: List[Dict[str, Any]],
+        top_n_for_comments: int = 8,
+        max_comments_per_post: int = 10,
+        max_workers: int = 1,
+    ) -> None:
+        """兼容旧调用签名，内部强制走安全的单线程慢速点穴补评。"""
+        self._attach_comments_safely(
+            posts=posts,
+            top_n_for_comments=top_n_for_comments,
+            max_comments_per_post=max_comments_per_post,
+        )
 
     def search_or_topic_posts(
         self,
@@ -1522,10 +1741,10 @@ class XHarvester(BasePlatformHarvester):
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词全站定向检索推文（「指哪打哪」多级通道 + 异常降级感知）：
-        1) 主力通道 1：专用爬虫小号 (`x_xiaohao`) 无头持久化浏览器直接拦截官方 `SearchTimeline` (`f=top` 热门 + `f=live` 最新)；
-        2) 兜底补充通道 2：仅当小号未就绪或原生搜索结果较少时，启用 Yahoo + Bing RSS 全网索引发现 -> `TweetDetail` 补齐；
-        3) 可选指定博主补充：若调用方传入 `handles` 则额外补充对应博主近期匹配帖。
+        原语 3：按关键词全站定向检索推文（100% 免登搜索主力 + 可选重点帖低频补评）：
+        1) 主力通道（0 账号消耗）：Yahoo 24h/7d 多页分时发现 + 雪花 ID 秒级预筛 + `fxtwitter/syndication` 并发全量富化；
+        2) 指定大 V 补充（0 账号消耗）：若传入 `handles` 则通过免登 Guest Token 补充匹配；
+        3) 重点帖慢速补评（最小特权）：仅在小号健康可用时，为热度排名前 5 的核心主帖单线程慢速补齐评论。
         """
         reset_health = bool(kwargs.pop("_reset_health", True))
         if reset_health:
@@ -1541,63 +1760,36 @@ class XHarvester(BasePlatformHarvester):
             return self.fetch_hot_or_recommended(count=count, fallback_handles=handles)
 
         by_id: Dict[str, Dict[str, Any]] = {}
-        native_hit_count = 0
+        enriched_hit_count = 0
 
-        # 通道 1（主力）：专用爬虫小号原生 SearchTimeline 检索
-        if self.has_burner_account:
-            native_posts = self._search_x_native_via_xiaohao(
-                keywords=raw_keywords,
-                per_kw_count=max(10, count),
-                hours_back=hours_back,
-                include_latest=True,
-                exclude_retweets=True,
-            )
-            for np in native_posts:
-                if self.is_valuable_post(np) and safe_int(np.get("publish_time"), 0) >= min_ts:
-                    by_id[np["post_id"]] = np
-            native_hit_count = len(by_id)
+        # 通道 1（100% 免登主力）：多页分时索引发现 + 雪花ID过滤 + fxtwitter/syndication 并发详情富化
+        discovered_pairs = self._discover_x_tweets_zero_auth(
+            keywords=raw_keywords,
+            per_kw_limit=max(12, count),
+            hours_back=hours_back,
+        )
+        if discovered_pairs:
+            candidate_pairs = discovered_pairs[: max(count * 2, 36)]
+            with ThreadPoolExecutor(max_workers=min(6, len(candidate_pairs))) as pool:
+                fut_map = {
+                    pool.submit(self._fetch_tweet_zero_auth, tid, handle): tid
+                    for handle, tid in candidate_pairs
+                }
+                for fut in as_completed(fut_map):
+                    try:
+                        tw_item = fut.result()
+                    except Exception:
+                        tw_item = None
+                    if tw_item and self.is_valuable_post(tw_item):
+                        if safe_int(tw_item.get("publish_time"), 0) >= min_ts:
+                            by_id[tw_item["post_id"]] = tw_item
+                            enriched_hit_count += 1
 
-        # 通道 2（补充/兜底）：仅当无小号或原生搜索命中不足一半时，用 Yahoo/Bing 搜索引擎补充
-        yahoo_hit_count = 0
-        if len(by_id) < max(5, count // 2):
-            discovered_pairs = self._discover_x_tweets_via_yahoo(raw_keywords, per_kw_limit=max(10, count))
-            if discovered_pairs:
-                max_cmts = 10 if fetch_comments else 0
-                candidate_pairs = [
-                    (h, tid) for h, tid in discovered_pairs if tid not in by_id
-                ][: max(count * 2, 24)]
-                if candidate_pairs:
-                    with ThreadPoolExecutor(max_workers=min(6, len(candidate_pairs))) as pool:
-                        fut_map = {
-                            pool.submit(self.fetch_tweet_with_comments, tid, handle, max_cmts): tid
-                            for handle, tid in candidate_pairs
-                        }
-                        for fut in as_completed(fut_map):
-                            try:
-                                tw_item = fut.result()
-                            except Exception:
-                                tw_item = None
-                            if tw_item and self.is_valuable_post(tw_item):
-                                if safe_int(tw_item.get("publish_time"), 0) >= min_ts:
-                                    by_id[tw_item["post_id"]] = tw_item
-                                    yahoo_hit_count += 1
-
-            if self.has_burner_account and native_hit_count == 0 and yahoo_hit_count > 0:
-                self.record_health_issue(
-                    code="X_NATIVE_SEARCH_FALLBACK",
-                    message=(
-                        f"X 原生搜索关键词 {raw_keywords} 返回 0 条，但外部搜索引擎发现了 {yahoo_hit_count} 条近期推文！"
-                        f"疑似小号搜索受限或 SearchTimeline 页面结构变更"
-                    ),
-                    level="warning",
-                    channel="x_native_search",
-                )
-
-        # 通道 3：调用方显式指定 handles 时补充匹配
+        # 通道 2：调用方显式指定 handles 时免登补充匹配
         if handles:
             pool_posts: List[Dict[str, Any]] = []
             for h in handles:
-                pool_posts.extend(self.fetch_user_posts(h, count=6))
+                pool_posts.extend(self.fetch_user_posts(h, count=6, force_burner=False, max_age_hours=hours_back))
             keyword_token_groups = [[t for t in k.split() if t] for k in low_keywords if k.strip()]
             for p in pool_posts:
                 if p["post_id"] in by_id or safe_int(p.get("publish_time"), 0) < min_ts:
@@ -1610,26 +1802,38 @@ class XHarvester(BasePlatformHarvester):
             by_id.values(),
             key=lambda x: (
                 safe_int((x.get("engagement") or {}).get("like_count"), 0) * 2
-                + safe_int((x.get("engagement") or {}).get("comment_count"), 0) * 5,
+                + safe_int((x.get("engagement") or {}).get("comment_count"), 0) * 5
+                + safe_int((x.get("engagement") or {}).get("quote_count"), 0) * 4
+                + safe_int((x.get("engagement") or {}).get("bookmark_count"), 0) * 3,
                 safe_int(x.get("publish_time"), 0),
             ),
             reverse=True,
         )[:count]
 
-        self.last_search_note = f"原生搜索命中={native_hit_count}条, 索引补充={yahoo_hit_count}条, 最终保留={len(results)}条"
+        cmt_posts_cnt = 0
+        top_n_cmts = safe_int(kwargs.get("top_n_for_comments"), 5)
+        if fetch_comments and results and self.is_burner_usable and top_n_cmts > 0:
+            cmt_posts_cnt = self._attach_comments_safely(
+                results,
+                top_n_for_comments=min(top_n_cmts, len(results)),
+                max_comments_per_post=10,
+            )
 
-        if fetch_comments and results:
-            self._attach_comments_concurrent(results, top_n_for_comments=len(results), max_comments_per_post=10)
+        cmt_suffix = f", 重点帖补评={cmt_posts_cnt}帖" if self.has_burner_account else ""
+        self.last_search_note = (
+            f"免登发现近期帖={len(discovered_pairs)}条, 详情富化={enriched_hit_count}条 -> 保留={len(results)}条{cmt_suffix}"
+        )
+
         if fetch_external_links and results:
             enrich_posts_with_external_articles(results, proxies=self.proxies)
-        if download_media or fetch_external_links or fetch_comments:
+        if download_media or fetch_external_links or cmt_posts_cnt > 0:
             results = self.normalize_batch(results, download_media=download_media)
 
         if reset_health:
             self.audit_posts_quality(
                 results,
                 scene="search",
-                expect_comments=(fetch_comments and self.has_burner_account),
+                expect_comments=(fetch_comments and self.is_burner_usable and top_n_cmts > 0),
                 expect_media_download=download_media,
                 max_fresh_age_hours=max(168, hours_back * 2),
             )
@@ -1642,8 +1846,8 @@ class XHarvester(BasePlatformHarvester):
         max_comments: int = 10,
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        """原语 4：使用只读小号调用 `TweetDetail` 拉取指定推文底下的前排高赞神评（线程安全 + 异常感知）"""
-        if not self.has_burner_account or not post_id:
+        """原语 4：仅在小号健康可用时，使用 `curl_cffi` Chrome 指纹拉取指定重点帖的前排神评；遇 326 自动转静默冷却。"""
+        if not self.is_burner_usable or not post_id:
             return []
         qid = X_GQL_QUERY_IDS["TweetDetail"]
         url = f"https://x.com/i/api/graphql/{qid}/TweetDetail"
@@ -1658,26 +1862,25 @@ class XHarvester(BasePlatformHarvester):
             "withV2Timeline": True,
         }
         try:
-            resp = requests.get(
+            resp = self._http_get(
                 url,
                 headers=self._get_burner_headers(),
                 params={
                     "variables": json.dumps(variables, separators=(",", ":")),
                     "features": json.dumps(X_GQL_FEATURES_2026, separators=(",", ":")),
                 },
-                proxies=self.proxies,
                 timeout=REQUEST_TIMEOUT,
             )
-            if resp.status_code != 200:
-                if resp.status_code in (401, 403):
-                    invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                    self.record_health_issue(
-                        code="X_COMMENTS_AUTH_EXPIRED",
-                        message=f"X TweetDetail 评论接口返回 HTTP {resp.status_code}，小号登录态已失效",
-                        level="critical",
-                        channel="TweetDetail",
-                    )
-                elif resp.status_code in (400, 404):
+            payload = None
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+
+            if not self._check_gql_burner_response(resp, payload, "TweetDetail"):
+                return []
+            if resp.status_code != 200 or not isinstance(payload, dict):
+                if resp.status_code in (400, 404):
                     self.record_health_issue(
                         code="X_TWEETDETAIL_GQL_DRIFT",
                         message=f"X TweetDetail 评论接口返回 HTTP {resp.status_code}，疑似 queryId ({qid}) 漂移",
@@ -1685,7 +1888,9 @@ class XHarvester(BasePlatformHarvester):
                         channel="TweetDetail",
                     )
                 return []
-            nodes = _extract_gql_tweet_objects(resp.json())
+
+            self._mark_burner_healthy()
+            nodes = _extract_gql_tweet_objects(payload)
             raw_replies = []
             seen = set()
             for node in nodes:
@@ -1715,7 +1920,7 @@ class XHarvester(BasePlatformHarvester):
             return []
 
     # ==========================================================================
-    # 标准调度入口：供上层定时任务调用（热门榜单 + 推荐流 + 垂直大V + 数据体检）
+    # 标准调度入口：供上层定时任务调用（免登热搜+免登大V主干 + 可选小号1次推荐流与Top8补评）
     # ==========================================================================
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         self.reset_health_state()
@@ -1729,11 +1934,13 @@ class XHarvester(BasePlatformHarvester):
             "wallstreetbets",
             "MarioNawfal",
             "MorningBrew",
+            "StockMKTNewz",
+            "OpenAI",
             "CoinGlass_com",
             "whale_alert",
             "NoContextHumans",
-            "unusual_whales",
-            "AutismCapital",
+            "WuBlockchain",
+            "arkham",
         ]
         tweets_per_handle = safe_int(cfg.get("tweets_per_handle"), 5)
         include_home_feed = bool(cfg.get("include_home_feed", True))
@@ -1741,70 +1948,76 @@ class XHarvester(BasePlatformHarvester):
         trending_topic_count = safe_int(cfg.get("trending_topic_count"), 5)
         tweets_per_trend = safe_int(cfg.get("tweets_per_trend"), 5)
         list_id = cfg.get("list_id")
-        top_n_for_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 80)
+        top_n_for_comments = min(safe_int(cfg.get("fetch_comments_for_top_n"), 8), MAX_SAFE_COMMENT_POSTS_HARD_CAP)
         fetch_ext_links = bool(cfg.get("fetch_external_links", True))
         download_media = bool(cfg.get("download_media", True))
 
         self.last_channel_stats = {}
         collected_by_id: Dict[str, Dict[str, Any]] = {}
 
-        # 1. 小号主页推荐流 / List 列表流（广谱热点底座）
-        if self.has_burner_account and (include_home_feed or list_id):
-            feed_posts = self.fetch_hot_or_recommended(count=safe_int(cfg.get("home_feed_count"), 30), list_id=list_id)
+        # 1. 小号主页推荐流（每轮仅在健康可用时请求 1 次；若冷却中则静默跳过，绝不硬撞）
+        if (include_home_feed or list_id) and self.is_burner_usable:
+            feed_posts = self.fetch_hot_or_recommended(
+                count=safe_int(cfg.get("home_feed_count"), 30),
+                list_id=list_id,
+            )
             self.last_channel_stats["主页推荐流"] = len(feed_posts)
             for p in feed_posts:
                 if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
 
-        # 2. X 官方全球/美国实时热搜榜 (`/1.1/trends/place.json`) -> 穿透抓取热搜爆款推文
-        if self.has_burner_account and include_trending and trending_topic_count > 0:
+        # 2. 100% 免登全球/美国实时热搜榜 (`getdaytrends` / `trends24`) -> 免登穿透抓取热搜爆款推文
+        if include_trending and trending_topic_count > 0:
             trends = self.fetch_trending_topics(limit=trending_topic_count)
             trend_names = [t["name"] for t in trends if t.get("name")]
             if trend_names:
-                trend_posts = self._search_x_native_via_xiaohao(
-                    keywords=trend_names,
-                    per_kw_count=max(3, tweets_per_trend),
+                trend_target_cnt = max(10, trending_topic_count * max(2, tweets_per_trend))
+                trend_posts = self.search_or_topic_posts(
+                    query="|".join(trend_names),
+                    count=trend_target_cnt,
                     hours_back=48,
-                    include_latest=False,
-                    exclude_retweets=True,
+                    fetch_comments=False,
+                    fetch_external_links=False,
+                    download_media=False,
+                    _reset_health=False,
                 )
-                self.last_channel_stats[f"官方热搜榜({len(trend_names)}词)"] = len(trend_posts)
+                self.last_channel_stats[f"实时热搜榜({len(trend_names)}词)"] = len(trend_posts)
                 for tp in trend_posts:
                     if self.is_valuable_post(tp):
                         collected_by_id[tp["post_id"]] = tp
             else:
-                self.last_channel_stats["官方热搜榜"] = 0
+                self.last_channel_stats["实时热搜榜"] = 0
 
-        # 3. 核心垂直大 V 实时时间线（容忍个别博主当日未发帖，仅当 >=50% 集体返回 0 条时发出通道退化告警）
+        # 3. 100% 免登核心垂直大 V 实时时间线（Guest Token + Chrome TLS，不消耗小号配额）
         zero_kols: List[str] = []
         for handle in handles:
             clean_h = str(handle).lstrip("@").strip()
-            posts = self.fetch_user_posts(clean_h, count=tweets_per_handle)
+            posts = self.fetch_user_posts(clean_h, count=tweets_per_handle, force_burner=False, max_age_hours=168)
             self.last_channel_stats[f"@{clean_h}"] = len(posts)
             if not posts:
                 zero_kols.append(f"@{clean_h}")
             for p in posts:
                 if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
-            time.sleep(random.uniform(0.12, 0.25))
+            time.sleep(random.uniform(0.10, 0.22))
 
-        if handles and len(zero_kols) >= max(3, len(handles) // 2):
+        if handles and len(zero_kols) >= max(4, len(handles) // 2):
             self.record_health_issue(
                 code="X_KOL_BATCH_DEGRADED",
-                message=f"多达 {len(zero_kols)}/{len(handles)} 个 X 监控大 V 返回 0 条推文 ({', '.join(zero_kols[:6])})，疑似 UserTweets 限流或接口退化",
+                message=f"多达 {len(zero_kols)}/{len(handles)} 个 X 监控大 V 返回 0 条近期推文 ({', '.join(zero_kols[:6])})，疑似 Guest Token 限流",
                 level="warning",
                 channel="UserTweets",
             )
 
         all_posts = list(collected_by_id.values())
 
-        # 4. 并发为有评论的推文拉齐前排评论树
-        self._attach_comments_concurrent(
-            all_posts,
-            top_n_for_comments=top_n_for_comments,
-            max_comments_per_post=10,
-            max_workers=4,
-        )
+        # 4. 仅在小号健康可用时，为互动最高的 Top N（默认 8 条）重点帖单线程慢速补齐评论
+        if self.is_burner_usable and top_n_for_comments > 0:
+            self._attach_comments_safely(
+                all_posts,
+                top_n_for_comments=top_n_for_comments,
+                max_comments_per_post=10,
+            )
 
         # 5. 对推文中携带的外部新闻/Substack/博客长文链接提取正文统一拼入 text_content
         if fetch_ext_links and all_posts:
@@ -1812,12 +2025,12 @@ class XHarvester(BasePlatformHarvester):
             if ext_cnt > 0:
                 self.last_channel_stats["外链正文富化"] = ext_cnt
 
-        # 6. 统一抹平差异、并发下载原图至本地 `media_downloads/`，并执行严苛数据质量体检
+        # 6. 统一抹平差异、并发下载原图至本地 `media_downloads/`，并执行数据质量体检
         normalized_posts = self.normalize_batch(all_posts, download_media=download_media)
         self.audit_posts_quality(
             normalized_posts,
             scene="harvest",
-            expect_comments=self.has_burner_account,
+            expect_comments=(self.is_burner_usable and top_n_for_comments > 0),
             expect_media_download=download_media,
             max_fresh_age_hours=168,
         )

@@ -112,9 +112,9 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
     "x": {
         "burner_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
         "burner_cookies": "",
-        "include_home_feed": True,        # 小号算法推荐流 HomeTimeline
+        "include_home_feed": True,        # 小号健康可用时每轮仅拉 1 次 HomeTimeline；冷却中自动静默跳过
         "home_feed_count": 30,
-        "include_trending": True,         # X 官方全球/美国实时热搜榜 (/1.1/trends/place.json) -> 穿透热搜爆款推文
+        "include_trending": True,         # 100% 免登全球/美国实时热搜榜 (getdaytrends) -> 免登穿透热搜爆款推文
         "trending_topic_count": 5,
         "tweets_per_trend": 5,
         "kol_handles": [
@@ -126,14 +126,16 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
             "wallstreetbets",
             "MarioNawfal",
             "MorningBrew",
+            "StockMKTNewz",
+            "OpenAI",
             "CoinGlass_com",
             "whale_alert",
             "NoContextHumans",
-            "unusual_whales",
-            "AutismCapital",
+            "WuBlockchain",
+            "arkham",
         ],
         "tweets_per_handle": 5,
-        "fetch_comments_for_top_n": 80,   # 并发为有评论推文拉齐前排热评
+        "fetch_comments_for_top_n": 8,    # 最小特权：仅在小号健康时为互动最高的 Top 8 重点帖单线程慢速补评论
         "fetch_external_links": True,
     },
     "reddit": {
@@ -322,7 +324,7 @@ def _summarize_platform_execution(
         detail_str = ", ".join(f"{k}:{v}" for k, v in channel_stats.items())
         channel_summary = f"子通道({ok_ch}/{total_ch}命中): {detail_str}"
         if zero_core_ch:
-            _push_alert(f"⚠️ [x] 核心主干流返回 0 条: {', '.join(zero_core_ch)} (请检查小号 `x_xiaohao` 状态)")
+            _push_alert(f"⚠️ [x] 核心主干流返回 0 条: {', '.join(zero_core_ch)} (请检查代理网络或推荐流/热榜源状态)")
         elif len(zero_kol_ch) >= 4:
             _push_alert(f"⚠️ [x] 多个监控博主本轮返回 0 条: {', '.join(zero_kol_ch)}")
     elif plat_name == "reddit":
