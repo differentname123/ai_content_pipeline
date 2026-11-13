@@ -525,7 +525,10 @@ ALL_POST_SOURCES = (
 )
 
 BINANCE_ACCOUNTS = ["qiqi", "ruru"]
-OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
+# OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
+OKX_ACCOUNTS = ["myself", "nana"]
+
+
 PLATFORM_ACCOUNTS = {
     PLATFORM_BINANCE: BINANCE_ACCOUNTS,
     PLATFORM_OKX: OKX_ACCOUNTS,
