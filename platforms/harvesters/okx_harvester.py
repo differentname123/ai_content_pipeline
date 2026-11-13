@@ -188,13 +188,14 @@ class OkxHarvester(BasePlatformHarvester):
         query: str,
         count: int = 20,
         is_coin_token: bool = False,
-        hours_back: int = 72,
+        hours_back: int = 0,
         download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
         原语 3：按币种标的（如 `BTC`, `比特币`, `Ethereum`, `SOL`）或关键词组（`|` 分隔）精确检索欧易广场讨论流。
-        严禁调用假命中的 `/public/search`，确保所有返回结果 100% 真实匹配对应币种流或关键词。
+        - 默认 `hours_back=0` 不在拉取层做时间丢弃，时间窗口筛选统一交由下游处理；
+        - 严禁调用假命中的 `/public/search`，确保所有返回结果 100% 真实匹配对应币种流或关键词。
         """
         reset_health = bool(kwargs.get("reset_health", True))
         if reset_health:
@@ -220,7 +221,7 @@ class OkxHarvester(BasePlatformHarvester):
             self.last_search_note = f"币种专流:{coin}"
         else:
             ticker_kws = _resolve_crypto_tickers_from_keywords(keywords)
-            for coin in ticker_kws[:4]:
+            for coin in ticker_kws:
                 raw_coin_posts = fetch_okx_feed(count=max(count, 12), token=coin, download_media=False) or []
                 if not raw_coin_posts:
                     self.record_health_issue(
@@ -253,7 +254,7 @@ class OkxHarvester(BasePlatformHarvester):
                         by_id[p["post_id"]] = p
 
             if ticker_kws:
-                self.last_search_note = f"命中加密标的流:{','.join(ticker_kws[:4])}"
+                self.last_search_note = f"命中加密标的流:{','.join(ticker_kws)}"
             elif not by_id:
                 self.last_search_note = "非加密货币话题（OKX Orbit为纯币圈交易社区，天然少圈外内容）"
             else:
@@ -278,7 +279,7 @@ class OkxHarvester(BasePlatformHarvester):
                 scene="search",
                 expect_comments=True,
                 expect_media_download=download_media,
-                max_fresh_age_hours=max(72, hours_back or 72),
+                max_fresh_age_hours=max(168, hours_back or 168),
             )
             results = [p for p in results if self.is_valuable_post(p)]
         return results
@@ -294,8 +295,8 @@ class OkxHarvester(BasePlatformHarvester):
         self.reset_health_state()
         cfg = config or {}
         recommend_count = safe_int(cfg.get("recommend_count"), 15)
-        include_hot_coins_rank = bool(cfg.get("include_hot_coins_rank", True))
-        hot_coins_rank_count = safe_int(cfg.get("hot_coins_rank_count"), 6)
+        include_hot_coins_rank = bool(cfg.get("include_hot_coins", cfg.get("include_hot_coins_rank", True)))
+        hot_coins_rank_count = safe_int(cfg.get("hot_coin_count", cfg.get("hot_coins_rank_count", 10)), 10)
         configured_coins = [str(c).strip().upper() for c in (cfg.get("coins") or []) if str(c).strip()]
         author_ids = cfg.get("author_ids") or []
         download_media = bool(cfg.get("download_media", True))
@@ -314,8 +315,9 @@ class OkxHarvester(BasePlatformHarvester):
 
         # 2. 官方实时热门币榜 (hot-rank) + 固定核心币种去重合并
         merged_coins: List[str] = []
-        if include_hot_coins_rank and hot_coins_rank_count > 0:
-            hot_rank_coins = fetch_okx_hot_coins(num=max(12, hot_coins_rank_count * 2)) or []
+        if include_hot_coins_rank and hot_coins_rank_count != 0:
+            req_num = 25 if hot_coins_rank_count < 0 else max(15, hot_coins_rank_count * 2)
+            hot_rank_coins = fetch_okx_hot_coins(num=req_num) or []
             if not hot_rank_coins:
                 self.record_health_issue(
                     code="OKX_HOT_RANK_EMPTY",
@@ -323,7 +325,9 @@ class OkxHarvester(BasePlatformHarvester):
                     level="warning",
                     channel="官方热门币榜",
                 )
-            self.last_hot_coins = hot_rank_coins[:hot_coins_rank_count]
+            self.last_hot_coins = (
+                list(hot_rank_coins) if hot_coins_rank_count < 0 else hot_rank_coins[:hot_coins_rank_count]
+            )
             for hc in self.last_hot_coins:
                 if hc and hc not in merged_coins:
                     merged_coins.append(hc)

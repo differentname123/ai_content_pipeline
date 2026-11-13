@@ -30,9 +30,12 @@ Reddit 平台专用采集与差异抹平适配器 (RedditHarvester)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 from html.parser import HTMLParser
+import json
 import logging
 import os
+from pathlib import Path
 import re
+import threading
 import time
 from urllib.parse import quote, unquote
 import xml.etree.ElementTree as ET
@@ -46,6 +49,7 @@ except ImportError:
     cffi_requests = None
 
 from common.common_utils import (
+    DEFAULT_RUNTIME_DIR,
     PLATFORM_REDDIT,
     clean_post_text,
     normalize_publish_timestamp,
@@ -67,6 +71,10 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 15
 FIREFOX_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+
+REDDIT_BURNER_COOLDOWN_SECONDS = 6 * 3600
+_REDDIT_BURNER_HEALTH_STATE_PATH: Path = DEFAULT_RUNTIME_DIR / "reddit_burner_health_state.json"
+_REDDIT_BURNER_HEALTH_LOCK = threading.Lock()
 
 # 覆盖全球突发新闻、科技/AI巨头、商业吃瓜、美股期权与加密圈的 15 大黄金板块
 DEFAULT_GOLDMINE_SUBREDDITS = [
@@ -338,6 +346,7 @@ class RedditHarvester(BasePlatformHarvester):
             effective_dir = default_xiaohao_dir
 
         self.burner_user_data_dir = effective_dir
+        self._explicit_zero_auth = bool(burner_user_data_dir is not None and not str(burner_user_data_dir).strip() and not burner_cookies)
         if not burner_cookies and self.burner_user_data_dir and os.path.exists(self.burner_user_data_dir):
             burner_cookies = extract_domain_cookies_from_user_data_dir(
                 user_data_dir=self.burner_user_data_dir,
@@ -346,28 +355,108 @@ class RedditHarvester(BasePlatformHarvester):
             )
         self.burner_cookies = burner_cookies or ""
 
-        if not self.has_burner_account:
+        if not self.has_burner_account and not self._explicit_zero_auth:
             self.record_health_issue(
                 code="REDDIT_BURNER_AUTH_MISSING",
                 message=(
                     f"专用小号目录 `{self.burner_user_data_dir or '未配置'}` 未检测到 Reddit 登录 Cookie (reddit_session)，"
-                    f"已降级为受限免登 RSS 模式；建议运行 `open_xiaohao_for_reddit_login()` 登录小号。"
+                    f"已自动切换免登双源热榜+镜像搜索模式；建议有空运行 `open_xiaohao_for_reddit_login()` 登录小号。"
                 ),
                 level="warning",
                 channel="auth",
                 persistent=True,
             )
 
+    def _burner_state_fingerprint(self) -> str:
+        cookie_tail = self.burner_cookies[-24:] if self.burner_cookies else ""
+        mtime_part = "0"
+        if self.burner_user_data_dir:
+            for cand in (
+                os.path.join(self.burner_user_data_dir, "Default", "Network", "Cookies"),
+                os.path.join(self.burner_user_data_dir, "Default", "Cookies"),
+            ):
+                if os.path.exists(cand):
+                    try:
+                        mtime_part = str(int(os.path.getmtime(cand)))
+                    except OSError:
+                        pass
+                    break
+        return f"{cookie_tail}:{mtime_part}"
+
+    def _is_burner_cooling_down(self) -> Tuple[bool, int, str]:
+        if not self.has_burner_account:
+            return False, 0, ""
+        try:
+            with _REDDIT_BURNER_HEALTH_LOCK:
+                if not _REDDIT_BURNER_HEALTH_STATE_PATH.exists():
+                    return False, 0, ""
+                state = json.loads(_REDDIT_BURNER_HEALTH_STATE_PATH.read_text(encoding="utf-8") or "{}")
+            until_ts = safe_int(state.get("cooldown_until_ts"), 0)
+            now_ts = int(time.time())
+            if until_ts <= now_ts:
+                return False, 0, ""
+            if state.get("fingerprint") and state.get("fingerprint") != self._burner_state_fingerprint():
+                return False, 0, ""
+            return True, until_ts - now_ts, str(state.get("reason") or "401/403")
+        except Exception:
+            return False, 0, ""
+
+    def _mark_burner_cooldown(self, reason: str, channel: str = "reddit_auth") -> None:
+        now_ts = int(time.time())
+        until_ts = now_ts + REDDIT_BURNER_COOLDOWN_SECONDS
+        payload = {
+            "updated_at_ts": now_ts,
+            "cooldown_until_ts": until_ts,
+            "reason": str(reason or "Reddit auth blocked"),
+            "fingerprint": self._burner_state_fingerprint(),
+        }
+        try:
+            with _REDDIT_BURNER_HEALTH_LOCK:
+                _REDDIT_BURNER_HEALTH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _REDDIT_BURNER_HEALTH_STATE_PATH.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception as e:
+            logger.debug(f"[Reddit适配器] 写入冷却状态失败: {e}")
+        invalidate_burner_cookie_cache(self.burner_user_data_dir)
+        self.record_health_issue(
+            code="REDDIT_BURNER_COOLDOWN_ENTERED",
+            message=f"Reddit 小号鉴权受限 ({reason})，已进入 6h 静默保护并无缝切换至 100% 免登双源热榜+镜像检索通道",
+            level="warning",
+            channel=channel,
+        )
+
+    def _mark_burner_healthy(self) -> None:
+        try:
+            with _REDDIT_BURNER_HEALTH_LOCK:
+                if _REDDIT_BURNER_HEALTH_STATE_PATH.exists():
+                    state = json.loads(_REDDIT_BURNER_HEALTH_STATE_PATH.read_text(encoding="utf-8") or "{}")
+                    if safe_int(state.get("cooldown_until_ts"), 0) > 0:
+                        _REDDIT_BURNER_HEALTH_STATE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     @property
     def has_burner_account(self) -> bool:
         return bool("reddit_session=" in self.burner_cookies or "token_v2=" in self.burner_cookies)
 
     @property
+    def is_burner_usable(self) -> bool:
+        if not self.has_burner_account:
+            return False
+        cooling, _, _ = self._is_burner_cooling_down()
+        return not cooling
+
+    @property
     def burner_account_summary(self) -> str:
         if not self.has_burner_account:
-            return "⚠️小号未登录 (降级免登15板块RSS+镜像)"
+            return "免登独立运行 (r/popular+15板块双RSS + ArcticShift镜像检索与评论)"
+        cooling, rem_s, reason = self._is_burner_cooling_down()
         session_dir_name = os.path.basename(os.path.normpath(self.burner_user_data_dir)) if self.burner_user_data_dir else "直接Cookie注入"
-        return f"专用小号在线 (Session={session_dir_name}, 原生JSON热榜+shreddit全站检索)"
+        if cooling:
+            return f"免登主干运行中 | 小号静默冷却剩余 {round(rem_s / 60)}min ({reason}, Session={session_dir_name})"
+        return f"专用小号在线 (Session={session_dir_name}, 原生JSON全量热榜+shreddit全站检索)"
 
     def _parse_atom_entries(self, xml_text: str) -> List[Dict[str, Any]]:
         """内部核心：解析 Reddit Atom XML 中的 `<entry>` 列表并转换为统一标准 Schema"""
@@ -547,7 +636,7 @@ class RedditHarvester(BasePlatformHarvester):
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.reddit.com/",
         }
-        if self.has_burner_account and self.burner_cookies:
+        if self.is_burner_usable and self.burner_cookies:
             headers["Cookie"] = self.burner_cookies
 
         if cffi_requests is not None:
@@ -581,9 +670,16 @@ class RedditHarvester(BasePlatformHarvester):
             return None
 
         title = clean_post_text(html.unescape(str(meta.get("title") or "")))
-        selftext = clean_post_text(html.unescape(str(meta.get("selftext") or "")))
-        if selftext.lower() in ("[deleted]", "[removed]"):
-            selftext = ""
+        raw_selftext = clean_post_text(html.unescape(str(meta.get("selftext") or "")))
+        is_deleted_body = raw_selftext.lower() in ("[deleted]", "[removed]")
+        # 【保留过滤原因说明】剔除已被版主/反垃圾系统删空的纯文字废帖 (`removed_by_category` 或 `is_self` 且正文为 `[removed]`/`[deleted]`)：
+        # Reddit 删帖后会保留光秃秃的标题但清空正文；若为无外链无媒体的纯文字帖 (`is_self=True`)，继续拉评论和送入下游纯属浪费时间。
+        if meta.get("removed_by_category") and bool(meta.get("is_self")):
+            return None
+        if is_deleted_body and bool(meta.get("is_self")):
+            return None
+
+        selftext = "" if is_deleted_body else raw_selftext
         if not title and not selftext:
             return None
 
@@ -615,8 +711,57 @@ class RedditHarvester(BasePlatformHarvester):
         self._apply_arctic_shift_meta_to_item(item, meta)
         return self.normalize_post(item, download_media=False)
 
+    _ARCTIC_GATE_LOCK = threading.Lock()
+    _ARCTIC_WAIT_UNTIL_MONO: float = 0.0
+
+    def _arctic_shift_get(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = 12,
+    ) -> Optional[requests.Response]:
+        """
+        统一调用 `ArcticShift` 公开镜像并精确遵循 `x-ratelimit-reset` 令牌桶窗口：
+        一旦检测到瞬时 `HTTP 429`，全线程共享等待 `x-ratelimit-reset + 1s` 后自动重试 1 次，杜绝并发雪崩丢评论/丢帖。
+        """
+        url = f"{self.ARCTIC_SHIFT_BASE}/{endpoint.lstrip('/')}"
+        headers = {"User-Agent": FIREFOX_UA}
+        for attempt in range(2):
+            with self._ARCTIC_GATE_LOCK:
+                wait_s = self.__class__._ARCTIC_WAIT_UNTIL_MONO - time.monotonic()
+            if wait_s > 0:
+                time.sleep(min(wait_s, 30.0))
+
+            try:
+                resp = requests.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    proxies=self.proxies,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.debug(f"[Reddit适配器] ArcticShift {endpoint} 请求异常: {e}")
+                return None
+
+            if resp.status_code != 429:
+                return resp
+
+            if attempt == 0:
+                try:
+                    reset_s = float(resp.headers.get("x-ratelimit-reset", "10"))
+                except ValueError:
+                    reset_s = 10.0
+                cool_s = min(28.0, max(2.0, reset_s)) + 1.2
+                with self._ARCTIC_GATE_LOCK:
+                    target_mono = time.monotonic() + cool_s
+                    if target_mono > self.__class__._ARCTIC_WAIT_UNTIL_MONO:
+                        self.__class__._ARCTIC_WAIT_UNTIL_MONO = target_mono
+                        logger.debug(f"[Reddit适配器] ArcticShift 触发每分钟配额窗口，平滑等待 {cool_s:.1f}s 后继续")
+        return None
+
     def _enrich_posts_via_arctic_shift(self, posts: List[Dict[str, Any]]) -> None:
-        """分批（每批最多 40 个 ID）请求公开镜像 `posts/ids`，补齐赞评数、外链、多图相册与视频标记。"""
+        """分批（每批最多 50 个 ID）请求公开镜像 `posts/ids`，补齐赞评数、外链、多图相册与视频标记。"""
         if not posts:
             return
         id_map: Dict[str, Dict[str, Any]] = {}
@@ -628,16 +773,15 @@ class RedditHarvester(BasePlatformHarvester):
             return
 
         all_ids = list(id_map.keys())
-        for start_idx in range(0, len(all_ids), 40):
-            batch_ids = all_ids[start_idx : start_idx + 40]
+        for start_idx in range(0, len(all_ids), 50):
+            batch_ids = all_ids[start_idx : start_idx + 50]
             try:
-                resp = self.session.get(
-                    f"{self.ARCTIC_SHIFT_BASE}/posts/ids",
+                resp = self._arctic_shift_get(
+                    "posts/ids",
                     params={"ids": ",".join(batch_ids)},
-                    proxies=self.proxies,
                     timeout=12,
                 )
-                if resp.status_code != 200:
+                if resp is None or resp.status_code != 200:
                     continue
                 for meta in (resp.json().get("data") or []):
                     if not isinstance(meta, dict):
@@ -654,23 +798,22 @@ class RedditHarvester(BasePlatformHarvester):
         base36_ids: Sequence[str],
         min_publish_ts: int = 0,
     ) -> Tuple[List[Dict[str, Any]], set]:
-        """根据帖子 ID 列表分批从 Arctic Shift 构建标准帖子，返回 `(已构建列表, 镜像库已命中的ID集合)`。"""
+        """根据帖子 ID 列表分批（每批 50 个，无总上限截断）从 Arctic Shift 构建标准帖子，返回 `(已构建列表, 镜像库已命中的ID集合)`。"""
         clean_ids = list(dict.fromkeys(str(i).strip() for i in base36_ids if i and str(i).strip()))
         if not clean_ids:
             return [], set()
 
         built: List[Dict[str, Any]] = []
         found_raw_ids: set = set()
-        for start_idx in range(0, min(len(clean_ids), 80), 40):
-            batch_ids = clean_ids[start_idx : start_idx + 40]
+        for start_idx in range(0, len(clean_ids), 50):
+            batch_ids = clean_ids[start_idx : start_idx + 50]
             try:
-                resp = self.session.get(
-                    f"{self.ARCTIC_SHIFT_BASE}/posts/ids",
+                resp = self._arctic_shift_get(
+                    "posts/ids",
                     params={"ids": ",".join(batch_ids)},
-                    proxies=self.proxies,
                     timeout=12,
                 )
-                if resp.status_code != 200:
+                if resp is None or resp.status_code != 200:
                     continue
                 for meta in (resp.json().get("data") or []):
                     if not isinstance(meta, dict) or not meta.get("id"):
@@ -696,7 +839,7 @@ class RedditHarvester(BasePlatformHarvester):
         一次请求同时拿回「实时主帖完整 `t3` 数据（解决突发新帖尚未入镜像库的问题）+ 实时前排高赞 `t1` 神评」。
         """
         clean_id = _extract_reddit_base36_id(base36_id)
-        if not clean_id or not self.has_burner_account:
+        if not clean_id or not self.is_burner_usable:
             return None, []
         clean_sub = _strip_reddit_prefix(subreddit)
         url = (
@@ -712,17 +855,12 @@ class RedditHarvester(BasePlatformHarvester):
                 timeout=12,
             )
             if resp.status_code in (401, 403):
-                invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                self.record_health_issue(
-                    code="REDDIT_DETAIL_JSON_BLOCKED",
-                    message=f"Reddit 单帖 JSON 接口 ({url}) 返回 HTTP {resp.status_code}，请检查小号 Cookie 状态",
-                    level="warning",
-                    channel="post_detail_json",
-                )
+                self._mark_burner_cooldown(f"HTTP {resp.status_code} on post_detail_json", channel="post_detail_json")
                 return None, []
             if resp.status_code != 200:
                 return None, []
 
+            self._mark_burner_healthy()
             payload = resp.json()
             if not isinstance(payload, list) or not payload:
                 return None, []
@@ -742,6 +880,8 @@ class RedditHarvester(BasePlatformHarvester):
                         continue
                     d = c_node.get("data") or {}
                     author = _strip_reddit_prefix(str(d.get("author") or ""))
+                    # 【保留过滤原因说明】跳过版块管理机器人 (`AutoModerator` / `VisualMod`) 自动置顶声明与已删空评论，
+                    # 防止千篇一律的版规模板话术霸占前排高赞评论名额。
                     if not author or author.lower() in ("automoderator", "visualmod", "[deleted]", "none"):
                         continue
                     body = clean_post_text(html.unescape(str(d.get("body") or "")))
@@ -786,14 +926,14 @@ class RedditHarvester(BasePlatformHarvester):
         `GET https://www.reddit.com/svc/shreddit/search/?q={kw}&type=posts&t={time_filter}&sort={top|relevance|new}`
         返回去重后的 `[(subreddit, base36_post_id), ...]`。
         """
-        if not self.has_burner_account:
+        if not self.is_burner_usable:
             return []
 
         discovered: List[Tuple[str, str]] = []
         seen_ids = set()
         blocked = False
 
-        for kw in list(keywords or [])[:5]:
+        for kw in list(keywords or []):
             if blocked:
                 break
             kw_str = str(kw or "").strip()
@@ -817,14 +957,8 @@ class RedditHarvester(BasePlatformHarvester):
                     )
                     if resp.status_code in (401, 403):
                         blocked = True
-                        invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                        self.record_health_issue(
-                            code="REDDIT_SHREDDIT_AUTH_BLOCKED",
-                            message=(
-                                f"Reddit `/svc/shreddit/search/` 返回 HTTP {resp.status_code}！"
-                                f"小号 Cookie 疑似失效或触发风控，已自动回退外部搜索索引"
-                            ),
-                            level="critical",
+                        self._mark_burner_cooldown(
+                            f"HTTP {resp.status_code} on /svc/shreddit/search/",
                             channel="shreddit_search",
                         )
                         break
@@ -845,6 +979,7 @@ class RedditHarvester(BasePlatformHarvester):
                         )
                         continue
 
+                    self._mark_burner_healthy()
                     html_body = resp.text or ""
                     for sub, pid in re.findall(r"/r/([A-Za-z0-9_]+)/comments/([a-z0-9]{5,9})/", html_body):
                         if pid not in seen_ids:
@@ -864,14 +999,20 @@ class RedditHarvester(BasePlatformHarvester):
 
         return discovered
 
-    def _discover_reddit_ids_via_yahoo(self, keywords: Sequence[str]) -> List[Tuple[str, str]]:
-        """利用 Yahoo + Bing RSS 双搜索引擎补充检索近期 Reddit 讨论帖 `(subreddit, post_id)`。"""
-        discovered: List[Tuple[str, str]] = []
-        seen = set()
-
+    def _discover_reddit_ids_via_yahoo(
+        self,
+        keywords: Sequence[str],
+        hours_back: int = 0,
+    ) -> List[Tuple[str, str]]:
+        """
+        100% 免登全站搜索主干 A（无关键词个数截断）：
+        并发检索 `Yahoo Search (site:reddit.com)` 的 24h (`btf=d`) 与 7d (`btf=w` 前两页 `b=1, 8`)，
+        若冷门词无近期结果则自动兜底不限时间页与 Bing RSS，保障新帖优先的同时绝不漏抓。
+        """
         search_terms: List[str] = []
         seen_terms = set()
-        for raw_kw in list(keywords or [])[:6]:
+        raw_kw_list = list(keywords or [])
+        for raw_kw in raw_kw_list:
             kw = str(raw_kw or "").strip()
             if not kw:
                 continue
@@ -879,17 +1020,20 @@ class RedditHarvester(BasePlatformHarvester):
                 seen_terms.add(kw.lower())
                 search_terms.append(kw)
             parts = [p for p in kw.split() if p]
-            if len(parts) >= 3:
+            if len(parts) >= 3 and len(raw_kw_list) <= 6:
                 for short_kw in (" ".join(parts[:2]), " ".join(parts[-2:])):
                     if short_kw.lower() not in seen_terms:
                         seen_terms.add(short_kw.lower())
                         search_terms.append(short_kw)
 
+        if not search_terms:
+            return []
+
         def _fetch_text(target_url: str) -> str:
             if cffi_requests is not None:
                 resp = cffi_requests.get(
                     target_url,
-                    headers={"User-Agent": CHROME_UA},
+                    headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
                     impersonate="chrome",
                     proxies=self.proxies,
                     timeout=10,
@@ -897,41 +1041,174 @@ class RedditHarvester(BasePlatformHarvester):
             else:
                 resp = requests.get(
                     target_url,
-                    headers={"User-Agent": CHROME_UA},
+                    headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
                     proxies=self.proxies,
                     timeout=10,
                 )
             return unquote(resp.text or "") if resp.status_code == 200 else ""
 
-        for kw in search_terms[:6]:
-            for btf in ("&btf=w", ""):
-                url = f"https://search.yahoo.com/search?p={quote('site:reddit.com ' + kw)}{btf}&n=30"
+        def _search_one_term(kw: str) -> List[Tuple[str, str]]:
+            local_pairs: List[Tuple[str, str]] = []
+            local_seen = set()
+            q_enc = quote(f"site:reddit.com {kw}")
+            yahoo_pages = [
+                f"https://search.yahoo.com/search?p={q_enc}&btf=d",
+                f"https://search.yahoo.com/search?p={q_enc}&btf=w",
+                f"https://search.yahoo.com/search?p={q_enc}&btf=w&b=8",
+                f"https://search.yahoo.com/search?p={q_enc}",
+            ]
+
+            for p_idx, u in enumerate(yahoo_pages):
+                if p_idx >= 2 and len(local_pairs) >= 12:
+                    break
+                if p_idx == 3 and (len(local_pairs) > 0 or (hours_back and 0 < hours_back <= 168)):
+                    break
                 try:
-                    decoded = _fetch_text(url)
+                    decoded = _fetch_text(u)
                     if not decoded:
                         continue
-                    kw_hits = 0
                     for sub, rid in re.findall(r"reddit\.com/r/([A-Za-z0-9_]+)/comments/([a-z0-9]{5,9})", decoded):
-                        if rid not in seen:
-                            seen.add(rid)
-                            discovered.append((sub, rid))
-                            kw_hits += 1
-                    if kw_hits >= 5:
-                        break
+                        if rid not in local_seen:
+                            local_seen.add(rid)
+                            local_pairs.append((sub, rid))
                 except Exception:
                     continue
 
-            bing_url = f"https://www.bing.com/search?q={quote('site:reddit.com ' + kw)}&format=rss&count=30"
-            try:
-                decoded_bing = _fetch_text(bing_url)
-                for sub, rid in re.findall(r"reddit\.com/r/([A-Za-z0-9_]+)/comments/([a-z0-9]{5,9})", decoded_bing):
-                    if rid not in seen:
-                        seen.add(rid)
+            if len(local_pairs) < 8:
+                bing_url = f"https://www.bing.com/search?q={q_enc}&format=rss&count=30"
+                try:
+                    decoded_bing = _fetch_text(bing_url)
+                    for sub, rid in re.findall(r"reddit\.com/r/([A-Za-z0-9_]+)/comments/([a-z0-9]{5,9})", decoded_bing):
+                        if rid not in local_seen:
+                            local_seen.add(rid)
+                            local_pairs.append((sub, rid))
+                except Exception:
+                    pass
+            return local_pairs
+
+        discovered: List[Tuple[str, str]] = []
+        seen_global = set()
+        with ThreadPoolExecutor(max_workers=min(3, len(search_terms))) as pool:
+            for pairs in pool.map(_search_one_term, search_terms):
+                for sub, rid in pairs:
+                    if rid not in seen_global:
+                        seen_global.add(rid)
                         discovered.append((sub, rid))
+        return discovered
+
+    def _search_reddit_via_arctic_shift(
+        self,
+        keywords: Sequence[str],
+        min_publish_ts: int = 0,
+        subreddits: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        100% 免登全站搜索主干 B（零账号）：
+        受控并发调用公开镜像 `ArcticShift /api/posts/search?subreddit={sub}&title={kw}&sort=desc`，
+        直接拿回带完整 `score`、`num_comments` 与原图相册的最新匹配帖子（`min_publish_ts<=0` 时不加时间下限，按时间倒序自然取最新）。
+        """
+        ascii_kws = [
+            str(k).strip()
+            for k in (keywords or [])
+            if str(k).strip() and not _CJK_RE.search(str(k))
+        ]
+        if not ascii_kws:
+            return []
+
+        title_terms: List[str] = []
+        for ak in ascii_kws:
+            if ak.lower() not in {x.lower() for x in title_terms}:
+                title_terms.append(ak)
+            parts = [p for p in ak.split() if len(p) >= 2]
+            if len(parts) >= 3 and len(ascii_kws) <= 4:
+                short_entity = " ".join(parts[:2])
+                if short_entity.lower() not in {x.lower() for x in title_terms}:
+                    title_terms.append(short_entity)
+
+        if subreddits:
+            target_subs = [_strip_reddit_prefix(s) for s in subreddits if _strip_reddit_prefix(s)]
+        else:
+            joined_low = " ".join(ascii_kws).lower()
+            if any(k in joined_low for k in ("btc", "bitcoin", "eth", "ethereum", "crypto", "sol", "binance", "coin")):
+                target_subs = ["CryptoCurrency", "Bitcoin", "wallstreetbets", "FluentInFinance", "news"]
+            elif any(k in joined_low for k in ("ai", "openai", "nvidia", "jensen", "gpt", "agent", "tech", "microsoft", "apple", "google")):
+                target_subs = ["technology", "nvidia", "openai", "wallstreetbets", "Fauxmoi"]
+            else:
+                target_subs = ["news", "worldnews", "technology", "wallstreetbets", "Fauxmoi"]
+
+        # 【保留配额保护说明】ArcticShift 公开镜像对单 IP 设有约 45 次/分钟的窗口限流；
+        # 笛卡尔积任务按「每个关键词优先轮询各核心板块」排序并控制在 15 次请求以内，为后续 ID 水合与评论树拉取预留安全配额，防止触发 429 等待。
+        tasks: List[Tuple[str, str]] = [
+            (sub, kw) for kw in title_terms for sub in target_subs
+        ][:15]
+        found_by_id: Dict[str, Dict[str, Any]] = {}
+
+        def _query_sub_title(pair: Tuple[str, str]) -> List[Dict[str, Any]]:
+            sub_name, t_kw = pair
+            out_items: List[Dict[str, Any]] = []
+            req_params: Dict[str, Any] = {
+                "subreddit": sub_name,
+                "title": t_kw,
+                "limit": 15,
+                "sort": "desc",
+            }
+            if min_publish_ts > 0:
+                req_params["after"] = min_publish_ts
+            try:
+                resp = self._arctic_shift_get(
+                    "posts/search",
+                    params=req_params,
+                    timeout=10,
+                )
+                if resp is not None and resp.status_code == 200:
+                    for meta in (resp.json().get("data") or []):
+                        post_obj = self._build_post_from_reddit_dict(meta, min_publish_ts=min_publish_ts)
+                        if post_obj and self.is_valuable_post(post_obj):
+                            out_items.append(post_obj)
             except Exception:
                 pass
+            return out_items
 
-        return discovered
+        with ThreadPoolExecutor(max_workers=min(2, max(1, len(tasks)))) as pool:
+            for item_list in pool.map(_query_sub_title, tasks):
+                for p_obj in item_list:
+                    found_by_id[p_obj["post_id"]] = p_obj
+
+        return list(found_by_id.values())
+
+    def _fetch_single_post_rss_fallback(
+        self,
+        subreddit: str,
+        base36_id: str,
+        min_publish_ts: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """零账号模式下，对极少数刚发出尚未进入 ArcticShift 的突发新帖，在 RSS 令牌桶充裕时单条安全兜底还原。"""
+        clean_id = _extract_reddit_base36_id(base36_id)
+        if not clean_id or self._last_rss_rl_remaining < 1.0:
+            return None
+        clean_sub = _strip_reddit_prefix(subreddit)
+        rss_url = (
+            f"https://www.reddit.com/r/{clean_sub}/comments/{clean_id}/.rss?limit=12"
+            if clean_sub and clean_sub.lower() != "reddit"
+            else f"https://www.reddit.com/comments/{clean_id}/.rss?limit=12"
+        )
+        try:
+            resp = self.session.get(rss_url, proxies=self.proxies, timeout=10)
+            try:
+                self._last_rss_rl_remaining = float(resp.headers.get("x-ratelimit-remaining", "0.0"))
+            except ValueError:
+                self._last_rss_rl_remaining = 0.0
+            if resp.status_code != 200:
+                return None
+            entries = self._parse_atom_entries(resp.text)
+            if not entries:
+                return None
+            post_item = entries[0]
+            if min_publish_ts > 0 and safe_int(post_item.get("publish_time"), 0) < min_publish_ts:
+                return None
+            return post_item
+        except Exception:
+            return None
 
     def _attach_comments_concurrent(
         self,
@@ -941,7 +1218,16 @@ class RedditHarvester(BasePlatformHarvester):
     ) -> None:
         if top_n_comments <= 0 or not posts:
             return
-        targets = [p for p in posts[:top_n_comments] if not (p.get("comments") or [])]
+        # 【保留过滤与配额保护说明】
+        # 1) 跳过 `comment_count == 0` 的无评论帖，避免空跑网络请求浪费耗时；
+        # 2) 零账号模式下评论源 `ArcticShift` 有单 IP 约 45 次/分钟的窗口配额限制，因此免登态单轮最多为前 22 条热帖补评论，避免触发 429 罚站。
+        eff_cap = top_n_comments if self.is_burner_usable else min(top_n_comments, 22)
+        candidates = [
+            p for p in posts
+            if not (p.get("comments") or [])
+            and safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0
+        ]
+        targets = candidates[:eff_cap]
         if not targets:
             return
 
@@ -951,13 +1237,15 @@ class RedditHarvester(BasePlatformHarvester):
             sub = str(meta.get("subreddit") or pextra.get("subreddit") or "")
             return _strip_reddit_prefix(sub)
 
-        with ThreadPoolExecutor(max_workers=min(6, len(targets))) as pool:
+        workers = min(5 if self.is_burner_usable else 3, len(targets))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             fut_map = {
                 pool.submit(
                     self.fetch_post_comments,
                     item["post_id"],
                     max_comments=max_comments_per_post,
                     subreddit=_sub_hint_for(item),
+                    allow_rss_fallback=False,
                 ): item
                 for item in targets
             }
@@ -978,45 +1266,58 @@ class RedditHarvester(BasePlatformHarvester):
     # ==========================================================================
     def fetch_hot_or_recommended(
         self,
-        count: int = 30,
+        count: int = 80,
         subreddits: Optional[List[str]] = None,
         sort: str = "top",
         time_filter: str = "day",
         include_popular: Optional[bool] = None,
+        popular_limit: int = 50,
+        subreddits_limit: int = 50,
+        preserve_all_hot: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 1：拉取 Reddit 热门榜单与垂直高信噪比板块爆款。
-        - 主通道（已登录小号 Cookie）：同时拉取全站热榜 `/r/popular/{sort}.json` + 15 大板块聚合 `/r/{subs}/{sort}.json`；
-        - 降级通道（未登录或 JSON 通道报错）：单次聚合 `.rss`（带 120s 缓存防 429）+ ArcticShift 富化。
+        原语 1：全量拉取 Reddit 全站热门榜与垂直高信噪比板块爆款（零主观过滤，不混排截断）：
+        - 主通道（小号健康可用）：分别拉满全站热榜 `/r/popular/{sort}.json` (`popular_limit`) + 15 大板块聚合 `/r/{subs}/{sort}.json` (`subreddits_limit`)；
+        - 免登主干 / 自动降级通道（零账号或小号冷却）：分别拉取 `/r/popular/{sort}/.rss` + `/r/{subs}/{sort}/.rss`（带 180s 缓存严控 2次/60s 令牌桶）+ `ArcticShift` 批量富化赞评数与原图相册。
         """
         subs = subreddits or DEFAULT_GOLDMINE_SUBREDDITS
         combined = "+".join(_strip_reddit_prefix(s) for s in subs if _strip_reddit_prefix(s))
         want_popular = (subreddits is None) if include_popular is None else bool(include_popular)
+        eff_pop_lim = max(1, min(100, safe_int(popular_limit, max(count, 50))))
+        eff_sub_lim = max(1, min(100, safe_int(subreddits_limit, max(count, 50))))
 
-        if self.has_burner_account:
+        def _rank_posts(items_iter) -> List[Dict[str, Any]]:
+            return sorted(
+                items_iter,
+                key=lambda p: (
+                    safe_int((p.get("engagement") or {}).get("like_count"), 0)
+                    + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2,
+                    safe_int(p.get("publish_time"), 0),
+                ),
+                reverse=True,
+            )
+
+        if self.is_burner_usable:
             by_id: Dict[str, Dict[str, Any]] = {}
             json_endpoints: List[Tuple[str, str, int]] = []
             if want_popular:
-                json_endpoints.append(("r/popular全站热榜", f"https://www.reddit.com/r/popular/{sort}.json", max(20, count)))
+                json_endpoints.append(("r/popular全站热榜", f"https://www.reddit.com/r/popular/{sort}.json", eff_pop_lim))
             if combined:
-                json_endpoints.append(("黄金垂直板块聚合", f"https://www.reddit.com/r/{combined}/{sort}.json", max(30, count)))
+                json_endpoints.append(("黄金垂直板块聚合", f"https://www.reddit.com/r/{combined}/{sort}.json", eff_sub_lim))
 
             auth_blocked = False
             for ch_label, j_url, lim in json_endpoints:
                 try:
                     resp = self._reddit_cffi_get(
                         j_url,
-                        params={"t": time_filter, "limit": min(75, lim), "raw_json": 1},
+                        params={"t": time_filter, "limit": lim, "raw_json": 1},
                         timeout=REQUEST_TIMEOUT,
                     )
                     if resp.status_code in (401, 403):
                         auth_blocked = True
-                        invalidate_burner_cookie_cache(self.burner_user_data_dir)
-                        self.record_health_issue(
-                            code="REDDIT_JSON_AUTH_BLOCKED",
-                            message=f"Reddit {ch_label} ({j_url}) 返回 HTTP {resp.status_code}，小号 Cookie 已失效，降级免登 RSS",
-                            level="critical",
+                        self._mark_burner_cooldown(
+                            f"HTTP {resp.status_code} on {ch_label}",
                             channel=ch_label,
                         )
                         break
@@ -1043,6 +1344,8 @@ class RedditHarvester(BasePlatformHarvester):
                         if not isinstance(child, dict) or child.get("kind") != "t3":
                             continue
                         d = child.get("data") or {}
+                        # 【保留过滤原因说明】跳过版块置顶公告帖 (`stickied=True`)：
+                        # 版块顶部常年挂着固定不变的版规说明或每日水楼导航帖，非真实热点，跳过以节省评论与外链请求耗时。
                         if sort != "new" and d.get("stickied"):
                             continue
                         p_obj = self._build_post_from_reddit_dict(d)
@@ -1065,64 +1368,136 @@ class RedditHarvester(BasePlatformHarvester):
                     )
 
             if by_id and not auth_blocked:
-                ranked = sorted(
-                    by_id.values(),
-                    key=lambda p: (
-                        safe_int((p.get("engagement") or {}).get("like_count"), 0)
-                        + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2,
-                        safe_int(p.get("publish_time"), 0),
-                    ),
-                    reverse=True,
-                )
-                return ranked[:count]
+                self._mark_burner_healthy()
+                ranked = _rank_posts(by_id.values())
+                return ranked if preserve_all_hot else ranked[:count]
 
-        # 降级免登 RSS 通道（带 120s 内存缓存，严防 1 次/60s 免登令牌桶触发 429）
-        cache_key = f"{combined}|{sort}|{time_filter}"
-        cached = self._rss_feed_cache.get(cache_key)
-        now_mono = time.monotonic()
-        if cached and (now_mono - cached[0]) < 120.0:
-            return list(cached[1])[:count]
+        # 100% 免登热榜通道（严格遵循 Reddit 免登 RSS 每分钟 1 次令牌桶：单次 limit=100 拉满全站热榜，视 x-ratelimit-reset 智能拉取第二源或由 ArcticShift 补齐垂直板块）
+        rss_pop_lim = 100 if preserve_all_hot else max(eff_pop_lim, 75)
+        rss_sub_lim = 100 if preserve_all_hot else max(eff_sub_lim, 75)
 
-        rss_url = f"https://www.reddit.com/r/{combined}/{sort}/.rss?t={time_filter}&limit={max(count, 35)}"
-        try:
-            resp = self.session.get(rss_url, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+        merged_rss_by_id: Dict[str, Dict[str, Any]] = {}
+        fresh_un_enriched: List[Dict[str, Any]] = []
+        fresh_cache_buckets: List[Tuple[str, List[Dict[str, Any]]]] = []
+        rss_errors: List[str] = []
+
+        def _consume_rss_feed(ch_label: str, cache_key: str, rss_url: str) -> Tuple[bool, float]:
+            now_mono = time.monotonic()
+            cached = self._rss_feed_cache.get(cache_key)
+            if cached and (now_mono - cached[0]) < 180.0:
+                for cp in cached[1]:
+                    if cp.get("post_id") and cp["post_id"] not in merged_rss_by_id:
+                        merged_rss_by_id[cp["post_id"]] = cp
+                return True, 0.0
+
             try:
-                self._last_rss_rl_remaining = float(resp.headers.get("x-ratelimit-remaining", "1.0"))
-            except ValueError:
-                self._last_rss_rl_remaining = 0.0
-            if resp.status_code != 200:
+                resp = self.session.get(rss_url, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+                try:
+                    self._last_rss_rl_remaining = float(resp.headers.get("x-ratelimit-remaining", "0.0"))
+                except ValueError:
+                    self._last_rss_rl_remaining = 0.0
+                try:
+                    rl_reset_s = float(resp.headers.get("x-ratelimit-reset", "60.0"))
+                except ValueError:
+                    rl_reset_s = 60.0
+
+                if resp.status_code != 200:
+                    rss_errors.append(f"{ch_label} HTTP {resp.status_code}")
+                    return False, rl_reset_s
+
+                parsed_entries = [p for p in self._parse_atom_entries(resp.text) if self.is_valuable_post(p)]
+                fresh_cache_buckets.append((cache_key, parsed_entries))
+                for p_obj in parsed_entries:
+                    pid = p_obj["post_id"]
+                    if pid not in merged_rss_by_id:
+                        merged_rss_by_id[pid] = p_obj
+                        fresh_un_enriched.append(p_obj)
+                return True, rl_reset_s
+            except Exception as e:
+                rss_errors.append(f"{ch_label} 异常: {e}")
+                return False, 60.0
+
+        pop_reset_s = 0.0
+        if want_popular:
+            _, pop_reset_s = _consume_rss_feed(
+                "r/popular全站热榜RSS",
+                f"popular|{sort}|{time_filter}|{rss_pop_lim}",
+                f"https://www.reddit.com/r/popular/{sort}/.rss?t={time_filter}&limit={rss_pop_lim}",
+            )
+
+        if combined:
+            sub_cache_key = f"{combined}|{sort}|{time_filter}|{rss_sub_lim}"
+            sub_cached = self._rss_feed_cache.get(sub_cache_key)
+            if not want_popular or (sub_cached and (time.monotonic() - sub_cached[0]) < 180.0):
+                _consume_rss_feed(
+                    "黄金垂直板块聚合RSS",
+                    sub_cache_key,
+                    f"https://www.reddit.com/r/{combined}/{sort}/.rss?t={time_filter}&limit={rss_sub_lim}",
+                )
+            elif self._last_rss_rl_remaining >= 1.0 or (0.0 < pop_reset_s <= 18.0):
+                if self._last_rss_rl_remaining < 1.0:
+                    time.sleep(pop_reset_s + 1.2)
+                _consume_rss_feed(
+                    "黄金垂直板块聚合RSS",
+                    sub_cache_key,
+                    f"https://www.reddit.com/r/{combined}/{sort}/.rss?t={time_filter}&limit={rss_sub_lim}",
+                )
+            else:
+                # 当前分钟 RSS 令牌已用于拉满 100 条 r/popular，直接用 ArcticShift 零消耗按时间倒序补齐核心垂直板块最新帖（不做硬性时间丢弃）
+                supplement_subs = [s for s in ("nvidia", "openai", "CryptoCurrency", "Bitcoin", "technology") if s.lower() in combined.lower()]
+                for v_sub in supplement_subs[:4]:
+                    resp_v = self._arctic_shift_get(
+                        "posts/search",
+                        params={"subreddit": v_sub, "limit": 12, "sort": "desc"},
+                        timeout=10,
+                    )
+                    if resp_v is not None and resp_v.status_code == 200:
+                        for meta in (resp_v.json().get("data") or []):
+                            vp = self._build_post_from_reddit_dict(meta)
+                            if vp and self.is_valuable_post(vp) and vp["post_id"] not in merged_rss_by_id:
+                                merged_rss_by_id[vp["post_id"]] = vp
+
+        if fresh_un_enriched:
+            self._enrich_posts_via_arctic_shift(fresh_un_enriched)
+            save_mono = time.monotonic()
+            for cache_key, bucket_entries in fresh_cache_buckets:
+                enriched_bucket = [merged_rss_by_id.get(p["post_id"], p) for p in bucket_entries]
+                self._rss_feed_cache[cache_key] = (save_mono, enriched_bucket)
+
+        if merged_rss_by_id:
+            if rss_errors:
                 self.record_health_issue(
-                    code="REDDIT_RSS_HTTP_ERROR",
-                    message=f"Reddit 免登聚合 RSS 返回 HTTP {resp.status_code}",
-                    level="critical",
+                    code="REDDIT_RSS_PARTIAL_DEGRADED",
+                    message=f"Reddit 部分免登 RSS 子通道波动 ({'; '.join(rss_errors)})，其余热榜通道正常返回 {len(merged_rss_by_id)} 条",
+                    level="warning",
                     channel="rss_fallback",
                 )
-                return []
-            posts = self._parse_atom_entries(resp.text)
-            self._enrich_posts_via_arctic_shift(posts)
-            self._rss_feed_cache[cache_key] = (now_mono, list(posts))
-            return posts[:count]
-        except Exception as e:
-            self.record_health_issue(
-                code="REDDIT_RSS_EXCEPTION",
-                message=f"Reddit 免登聚合 RSS 异常: {e}",
-                level="critical",
-                channel="rss_fallback",
-            )
-            return []
+            ranked_rss = _rank_posts(merged_rss_by_id.values())
+            return ranked_rss if preserve_all_hot else ranked_rss[:count]
+
+        self.record_health_issue(
+            code="REDDIT_RSS_HTTP_ERROR",
+            message=f"Reddit 免登热榜 RSS 失败: {'; '.join(rss_errors) or '返回 0 条'}",
+            level="critical",
+            channel="rss_fallback",
+        )
+        return []
 
     def fetch_user_posts(self, user_id: str, count: int = 15, **kwargs) -> List[Dict[str, Any]]:
         """原语 2：拉取指定 Reddit 用户 (`/u/username`) 发布的帖子"""
         clean_user = _strip_reddit_prefix(user_id)
         if not clean_user:
             return []
-        if self.has_burner_account:
+        if self.is_burner_usable:
             try:
                 resp = self._reddit_cffi_get(
                     f"https://www.reddit.com/user/{clean_user}/submitted.json",
                     params={"limit": max(count, 20), "raw_json": 1},
                 )
-                if resp.status_code == 200:
+                if resp.status_code in (401, 403):
+                    self._mark_burner_cooldown(f"HTTP {resp.status_code} on user_submitted_json", channel="user_json")
+                elif resp.status_code == 200:
+                    self._mark_burner_healthy()
                     children = ((resp.json() or {}).get("data") or {}).get("children") or []
                     out = []
                     for ch in children:
@@ -1153,18 +1528,20 @@ class RedditHarvester(BasePlatformHarvester):
         count: int = 20,
         subreddits: Optional[List[str]] = None,
         time_filter: str = "",
-        hours_back: int = 72,
+        hours_back: int = 0,
         fetch_comments: bool = False,
         fetch_external_links: bool = False,
         download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词全站精准检索 Reddit 高价值讨论帖：
-        1) 自动将中英混合词/中文常见实体映射为英文优先查询词；
-        2) 主通道：使用专用小号调用 `/svc/shreddit/search/`（全站覆盖、600次/10min 配额）；
-        3) 补充/兜底通道：Yahoo + Bing RSS `site:reddit.com` 索引；
-        4) 双级帖子还原：先经 `ArcticShift /api/posts/ids` 批量秒级还原，对尚未入镜像库的实时突发新帖直接走 `/r/{sub}/comments/{id}.json` 还原主帖+神评！
+        原语 3：按关键词全站精准检索 Reddit 高价值讨论帖（100% 零账号高召回主干 + 小号可选加速）：
+        1) 自动将中英混合词/中文常见实体映射为英文优先查询词（无关键词个数截断，默认 `hours_back=0` 不做时间硬删）；
+        2) 若小号健康可用：调用 `/svc/shreddit/search/` 全站实时检索；
+        3) 100% 免登双引擎主干（零账号或结果不足时自动全开）：
+           - 引擎 A：并发检索 `Yahoo Search (site:reddit.com)` 24h (`btf=d`) + 7d (`btf=w` 翻页) + Bing RSS；
+           - 引擎 B：并发检索公开镜像 `ArcticShift /api/posts/search?subreddit={sub}&title={kw}&sort=desc`；
+        4) 批量经 `ArcticShift /api/posts/ids` 还原完整互动量与原图相册；若小号在线则补齐刚发出的突发新帖。
         """
         reset_health = bool(kwargs.pop("_reset_health", True))
         if reset_health:
@@ -1174,12 +1551,14 @@ class RedditHarvester(BasePlatformHarvester):
         raw_q = str(query or "").replace(",", "|")
         raw_keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
         prepared_keywords = _prepare_reddit_search_keywords(raw_keywords)
-        min_ts = int(time.time() - max(1, hours_back) * 3600)
+        now_ts = int(time.time())
+        min_ts = int(now_ts - max(1, hours_back) * 3600) if (hours_back and hours_back > 0) else 0
+        recent_priority_ts = int(now_ts - 7 * 86400)
 
         if not time_filter:
-            if hours_back <= 24:
+            if hours_back and 0 < hours_back <= 24:
                 eff_t = "day"
-            elif hours_back <= 168:
+            elif not hours_back or hours_back <= 168:
                 eff_t = "week"
             elif hours_back <= 744:
                 eff_t = "month"
@@ -1203,10 +1582,13 @@ class RedditHarvester(BasePlatformHarvester):
         )
 
         pair_map: Dict[str, str] = {}  # pid -> sub
+        by_id: Dict[str, Dict[str, Any]] = {}
         shreddit_pair_count = 0
+        tried_shreddit = False
 
-        # 通道 1（主力）：Reddit 官方 /svc/shreddit/search/ 全站搜索
-        if self.has_burner_account:
+        # 通道 1（可选小号加速）：Reddit 官方 /svc/shreddit/search/ 全站搜索
+        if self.is_burner_usable:
+            tried_shreddit = True
             sh_pairs = self._search_reddit_via_shreddit(
                 keywords=prepared_keywords,
                 time_filter=eff_t,
@@ -1219,10 +1601,11 @@ class RedditHarvester(BasePlatformHarvester):
                     pair_map[pid] = sub
             shreddit_pair_count = len(pair_map)
 
-        # 通道 2（补充/兜底）：Yahoo + Bing 索引发现
+        # 通道 2（100% 免登双引擎主干）：Yahoo 24h+7d 索引发现 + ArcticShift 直搜
         yahoo_pair_count = 0
-        if len(pair_map) < max(10, count):
-            yh_pairs = self._discover_reddit_ids_via_yahoo(prepared_keywords)
+        arctic_direct_count = 0
+        if len(pair_map) < max(12, count):
+            yh_pairs = self._discover_reddit_ids_via_yahoo(prepared_keywords, hours_back=hours_back)
             for sub, pid in yh_pairs:
                 if sub_filter_set and sub.lower() not in sub_filter_set:
                     continue
@@ -1230,19 +1613,32 @@ class RedditHarvester(BasePlatformHarvester):
                     pair_map[pid] = sub
                     yahoo_pair_count += 1
 
-        by_id: Dict[str, Dict[str, Any]] = {}
-        realtime_hydrated = 0
-
-        if pair_map:
-            all_pids = list(pair_map.keys())
-            arctic_posts, hit_raw_ids = self._build_posts_from_arctic_shift_ids(all_pids, min_publish_ts=min_ts)
-            for ap in arctic_posts:
-                if self.is_valuable_post(ap):
+            arctic_direct_posts = self._search_reddit_via_arctic_shift(
+                prepared_keywords,
+                min_publish_ts=min_ts,
+                subreddits=subreddits,
+            )
+            for ap in arctic_direct_posts:
+                if self.is_valuable_post(ap) and ap["post_id"] not in by_id:
                     by_id[ap["post_id"]] = ap
+                    arctic_direct_count += 1
 
-            # 对刚发布尚未进入 ArcticShift 镜像库的实时新帖，直接用登录态 /r/{sub}/comments/{id}.json 实时拉回！
-            missing_pairs = [(pair_map[pid], pid) for pid in all_pids if pid not in hit_raw_ids][:12]
-            if missing_pairs and self.has_burner_account:
+        realtime_hydrated = 0
+        if pair_map:
+            pending_pids = [pid for pid in pair_map.keys() if f"reddit_{pid}" not in by_id]
+            hit_raw_ids: set = set()
+            if pending_pids:
+                arctic_posts, hit_raw_ids = self._build_posts_from_arctic_shift_ids(
+                    pending_pids,
+                    min_publish_ts=min_ts,
+                )
+                for ap in arctic_posts:
+                    if self.is_valuable_post(ap):
+                        by_id[ap["post_id"]] = ap
+
+            # 对刚发布尚未进入 ArcticShift 镜像库的实时新帖：小号在线走 .json，免登且结果偏少时安全兜底 Top 1
+            missing_pairs = [(pair_map[pid], pid) for pid in pending_pids if pid not in hit_raw_ids][:12]
+            if missing_pairs and self.is_burner_usable:
                 max_cmts_inline = 10 if fetch_comments else 5
                 with ThreadPoolExecutor(max_workers=min(4, len(missing_pairs))) as pool:
                     futs = [
@@ -1263,12 +1659,26 @@ class RedditHarvester(BasePlatformHarvester):
                                 realtime_hydrated += 1
                         except Exception:
                             pass
+            elif (
+                missing_pairs
+                and not self.is_burner_usable
+                and len(by_id) < max(5, count // 2)
+                and self._last_rss_rl_remaining >= 1.0
+            ):
+                rss_salvaged = self._fetch_single_post_rss_fallback(
+                    subreddit=missing_pairs[0][0],
+                    base36_id=missing_pairs[0][1],
+                    min_publish_ts=min_ts,
+                )
+                if rss_salvaged and self.is_valuable_post(rss_salvaged):
+                    by_id[rss_salvaged["post_id"]] = rss_salvaged
+                    realtime_hydrated += 1
 
-        if self.has_burner_account and shreddit_pair_count == 0 and len(by_id) > 0:
+        if tried_shreddit and self.is_burner_usable and shreddit_pair_count == 0 and len(by_id) > 0:
             self.record_health_issue(
                 code="REDDIT_SHREDDIT_DOM_OR_EMPTY",
                 message=(
-                    f"Reddit `/svc/shreddit/search/` 对 {prepared_keywords[:3]} 返回 0 条，但外部搜索发现了 {len(by_id)} 条近期帖！"
+                    f"Reddit `/svc/shreddit/search/` 对 {prepared_keywords[:3]} 返回 0 条，但免登双引擎发现了 {len(by_id)} 条近期帖！"
                     f"请留意 shreddit 搜索 HTML 结构是否改版"
                 ),
                 level="warning",
@@ -1278,6 +1688,7 @@ class RedditHarvester(BasePlatformHarvester):
         results = sorted(
             by_id.values(),
             key=lambda p: (
+                1 if safe_int(p.get("publish_time"), 0) >= recent_priority_ts else 0,
                 safe_int((p.get("engagement") or {}).get("like_count"), 0)
                 + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 3,
                 safe_int(p.get("publish_time"), 0),
@@ -1286,8 +1697,9 @@ class RedditHarvester(BasePlatformHarvester):
         )[:count]
 
         self.last_search_note = (
-            f"检索词={prepared_keywords[:4]} | shreddit发现={shreddit_pair_count}, 索引补充={yahoo_pair_count}, "
-            f"实时直连补齐={realtime_hydrated} -> 保留={len(results)}条"
+            f"检索词={prepared_keywords} | shreddit发现={shreddit_pair_count}, "
+            f"Yahoo索引={yahoo_pair_count}, ArcticShift直搜={arctic_direct_count}, "
+            f"实时补齐={realtime_hydrated} -> 保留={len(results)}条"
         )
 
         if fetch_comments and results:
@@ -1303,17 +1715,23 @@ class RedditHarvester(BasePlatformHarvester):
                 scene="search",
                 expect_comments=fetch_comments,
                 expect_media_download=download_media,
-                max_fresh_age_hours=max(168, hours_back * 2),
+                max_fresh_age_hours=max(168, (hours_back or 168) * 2),
             )
             results = [p for p in results if self.is_valuable_post(p)]
         return results
 
-    def fetch_post_comments(self, post_id: str, max_comments: int = 10, **kwargs) -> List[Dict[str, Any]]:
+    def fetch_post_comments(
+        self,
+        post_id: str,
+        max_comments: int = 10,
+        allow_rss_fallback: bool = True,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
         """
         原语 4：提取指定 Reddit 帖子的前排高赞神评：
-        1) 通道 A：零限流公开镜像 `ArcticShift /comments/tree`；
-        2) 通道 B：若为刚发布的突发新帖（镜像尚未收录）且已登录小号，直连 `/r/{sub}/comments/{id}.json` 拿实时高赞评论；
-        3) 通道 C：无小号且 RSS 令牌桶未耗尽时回退 `.rss`。
+        1) 通道 A（零账号零限流主力）：公开镜像 `ArcticShift /comments/tree`；
+        2) 通道 B：若为刚发布的突发新帖（镜像尚未收录）且小号健康可用，直连 `/r/{sub}/comments/{id}.json` 拿实时高赞评论；
+        3) 通道 C：仅在单帖独立调用 (`allow_rss_fallback=True`) 且免登 RSS 令牌桶充裕时回退 `.rss`，绝不在并发批处理中触碰令牌桶。
         """
         raw_target = str(post_id or "").strip()
         clean_id = _extract_reddit_base36_id(raw_target)
@@ -1327,16 +1745,14 @@ class RedditHarvester(BasePlatformHarvester):
             if m_sub:
                 sub_hint = m_sub.group(1)
 
-        # 通道 A：零限流公开镜像评论树
+        # 通道 A：公开镜像评论树（100% 免账号，自带配额平滑重试）
         try:
-            resp = requests.get(
-                f"{self.ARCTIC_SHIFT_BASE}/comments/tree",
+            resp = self._arctic_shift_get(
+                "comments/tree",
                 params={"link_id": clean_id, "limit": max(25, max_comments * 3)},
-                headers={"User-Agent": FIREFOX_UA},
-                proxies=self.proxies,
                 timeout=10,
             )
-            if resp.status_code == 200:
+            if resp is not None and resp.status_code == 200:
                 nodes = resp.json().get("data") or []
                 parsed_comments: List[Dict[str, Any]] = []
                 for node in nodes:
@@ -1344,6 +1760,8 @@ class RedditHarvester(BasePlatformHarvester):
                         continue
                     d = node.get("data") if isinstance(node.get("data"), dict) else node
                     author = _strip_reddit_prefix(str(d.get("author") or ""))
+                    # 【保留过滤原因说明】跳过版块管理机器人 (`AutoModerator` / `VisualMod`) 自动声明及已被删除 (`[deleted]`/`[removed]`) 的残缺空评论，
+                    # 防止版规套话和无效占位符占据每帖有限的高赞评论名额。
                     if not author or author.lower() in ("automoderator", "visualmod", "[deleted]", "none"):
                         continue
                     body = clean_post_text(html.unescape(str(d.get("body") or "")))
@@ -1364,10 +1782,10 @@ class RedditHarvester(BasePlatformHarvester):
                     parsed_comments.sort(key=lambda x: x["likes"], reverse=True)
                     return self.normalize_comments(parsed_comments[:max_comments], parent_post_id=parent_pid)
         except Exception as e:
-            logger.debug(f"[Reddit适配器] 镜像评论树 {clean_id} 异常: {e}")
+            logger.debug(f"[Reddit适配器] Arctic Shift 评论树 {clean_id} 回退: {e}")
 
-        # 通道 B：小号登录态直连官方单帖 JSON 拿实时神评
-        if self.has_burner_account:
+        # 通道 B：小号在线时直接请求单帖详情 `.json` 拿实时热评
+        if self.is_burner_usable:
             _, live_cmts = self._fetch_reddit_post_and_comments_json(
                 subreddit=sub_hint,
                 base36_id=clean_id,
@@ -1376,8 +1794,8 @@ class RedditHarvester(BasePlatformHarvester):
             if live_cmts:
                 return live_cmts
 
-        # 通道 C：仅在免登且 RSS 令牌桶尚有余量时回退 `.rss`
-        if self._last_rss_rl_remaining <= 0.0:
+        # 通道 C：仅允许单条显式调用且免登 RSS 令牌桶充裕时回退 `.rss`
+        if not allow_rss_fallback or self._last_rss_rl_remaining < 1.0:
             return []
         rss_url = (
             raw_target.rstrip("/") + f"/.rss?limit={max_comments + 4}"
@@ -1400,6 +1818,7 @@ class RedditHarvester(BasePlatformHarvester):
                 c_id = (ent.find("atom:id", ns).text or "").replace("t1_", "") if ent.find("atom:id", ns) is not None else ""
                 author_el = ent.find("atom:author/atom:name", ns)
                 author = _strip_reddit_prefix(author_el.text or "") if author_el is not None else "redditor"
+                # 【保留过滤原因说明】RSS 兜底评论流同样剔除版块管理机器人固定套话。
                 if author.lower() in ("automoderator", "visualmod"):
                     continue
                 updated_str = ent.find("atom:updated", ns).text if ent.find("atom:updated", ns) is not None else ""
@@ -1426,7 +1845,7 @@ class RedditHarvester(BasePlatformHarvester):
             return []
 
     # ==========================================================================
-    # 标准调度入口：供上层定时任务调用（全站热榜 r/popular + 15 大黄金板块 + 数据体检）
+    # 标准调度入口：供上层定时任务调用（全站热榜 r/popular + 15 大黄金板块全量拉取 + 数据体检）
     # ==========================================================================
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         self.reset_health_state()
@@ -1434,9 +1853,12 @@ class RedditHarvester(BasePlatformHarvester):
         subreddits = cfg.get("subreddits") or DEFAULT_GOLDMINE_SUBREDDITS
         sort = cfg.get("sort", "top")
         time_filter = cfg.get("time_filter", "day")
-        limit = safe_int(cfg.get("limit"), 30)
+        limit = safe_int(cfg.get("limit"), 80)
+        popular_limit = safe_int(cfg.get("popular_limit"), 50)
+        subreddits_limit = safe_int(cfg.get("subreddits_limit"), 50)
+        preserve_all_hot = bool(cfg.get("preserve_all_hot", True))
         include_popular = bool(cfg.get("include_popular", True))
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 30)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 40)
         fetch_ext_links = bool(cfg.get("fetch_external_links", True))
         keywords = cfg.get("keywords")
         download_media = bool(cfg.get("download_media", True))
@@ -1444,10 +1866,11 @@ class RedditHarvester(BasePlatformHarvester):
         self.last_channel_stats = {}
         if keywords:
             query_str = "|".join(keywords) if isinstance(keywords, list) else str(keywords)
+            search_subs = cfg.get("subreddits") if cfg.get("restrict_search_to_subreddits") else None
             posts = self.search_or_topic_posts(
                 query=query_str,
                 count=limit,
-                subreddits=subreddits,
+                subreddits=search_subs,
                 time_filter=time_filter,
                 _reset_health=False,
             )
@@ -1458,6 +1881,9 @@ class RedditHarvester(BasePlatformHarvester):
                 sort=sort,
                 time_filter=time_filter,
                 include_popular=include_popular,
+                popular_limit=popular_limit,
+                subreddits_limit=subreddits_limit,
+                preserve_all_hot=preserve_all_hot,
             )
 
         valuable_posts = [p for p in posts if self.is_valuable_post(p, cfg)]

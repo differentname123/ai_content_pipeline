@@ -133,6 +133,9 @@ class BasePlatformHarvester(ABC):
             lmap = media.get("local_mapping") or {}
             has_any_media = bool(imgs or media.get("cover_image") or media.get("video_url"))
 
+            # 【保留过滤原因说明】残缺空壳帖剔除：
+            # 若单条帖子既无任何正文/标题，又无任何图片或视频链接，属于平台接口字段残缺或已被作者/管理员清空的死帖；
+            # 继续保留会白白浪费后续评论拉取、外链解析与下游大模型 Token，故在此直接剔除。
             if not pure_txt and not title_txt and not has_any_media:
                 empty_text_no_media += 1
                 corrupt_dropped += 1
@@ -321,8 +324,10 @@ class BasePlatformHarvester(ABC):
 
     def is_valuable_post(self, post: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> bool:
         """
-        基础数据有效性校验（剔除残缺空壳帖，不做主观流量阈值筛除，把深度质量判断留给下游）：
-        必须包含合法的 `post_id`，且具备真实非空正文（剥离空插图占位后）或有效媒体之一。
+        基础数据有效性校验（仅剔除无内容残缺空壳帖）：
+        【保留过滤原因说明】
+        - 本函数不做任何发布时间、点赞量或字数长短的主观过滤（时间与选题筛选统一交由下游流水线处理）；
+        - 仅剔除缺少 `post_id` 或「既无标题/正文、又无任何图片/视频」的损坏空壳死帖，避免空数据浪费采集富化耗时与下游算力。
         """
         if not isinstance(post, dict) or not str(post.get("post_id") or "").strip():
             return False

@@ -992,7 +992,9 @@ def normalize_and_enrich_post_schema(
     normalized_comments.sort(key=lambda x: safe_int(x.get("likes"), 0), reverse=True)
     base["comments"] = normalized_comments
 
-    # 4. Media 与 Content：只收集图片（排除 .mp4 视频下载），并在正文补齐 `[插图: url]`
+    # 4. Media 与 Content：
+    # 【保留过滤原因说明】仅下载静态图片与视频封面图，跳过 .mp4/.mov 视频原文件落盘：
+    # 视频原文件体积动辄数十至上百 MB，批量落盘会严重拖慢每轮采集并占满磁盘；保留 `media.video_url` 与封面图已满足下游多模态理解与引用需求。
     raw_media = post.get("media") if isinstance(post.get("media"), dict) else {}
     all_images = []
     for img_u in (raw_media.get("images") or []) + (raw_media.get("inline_images") or []):

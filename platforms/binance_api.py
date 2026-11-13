@@ -509,6 +509,8 @@ def clean_universal_posts(final_clean_list):
     unique_count = 0
 
     for item in final_clean_list:
+        # 【保留过滤原因说明】自营账号发帖拦截：
+        # 剔除本系统自有币安主号发布的帖子，防止把先前 AI 生成发出的文章再次抓回来当原材料（防“自产自销”死循环）及浪费富化耗时。
         if _is_self_binance_post(item):
             continue
         post_id = item.get("id")
@@ -610,7 +612,8 @@ def _enrich_single_post(item, session, download_media: bool = True):
         urls_to_download = set()
         if media_info.get("cover_image"):
             urls_to_download.add(media_info["cover_image"])
-        # 仅下载图片资产（封面图/配图/插图），不下载视频文件到本地，视频仅保留 media.video_url 链接
+        # 【保留过滤原因说明】跳过视频二进制文件落盘：
+        # 仅下载图片与视频封面图，视频保留 `media.video_url` 链接，避免动辄数十 MB 的 .mp4 下载严重拖慢整轮拉取。
         for img_url in media_info.get("images", []):
             if img_url:
                 urls_to_download.add(img_url)
@@ -632,6 +635,7 @@ def _enrich_single_post(item, session, download_media: bool = True):
 
         try:
             comment_count = item.get("engagement", {}).get("comment_count", 0)
+            # 【保留过滤原因说明】已知 0 评论帖短路跳过：避免对无评论帖发起注定返回空数组的 HTTP 请求浪费耗时。
             if comment_count == 0:
                 item["comments"] = []
             else:

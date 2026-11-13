@@ -7,8 +7,9 @@
 1. 开关平台：修改下方 `PLATFORM_SWITCHES` 字典（`True` 开启 / `False` 关闭）。
 2. 循环模式：默认直接在 IDE 运行本文件即进入「每 1 小时（3600 秒）自动拉取一轮」的常驻循环；
    若某次调试只想单次跑一轮就退出，将 `GLOBAL_SCHEDULE_CONFIG["continuous_loop"]` 改为 `False` 即可。
-3. 职责边界：本模块仅负责纯粹的跨平台拉取、基础结构清洗、图片按视觉哈希下载与幂等入库 (`harvested_social_posts`)，
-   不做任何主观流量/字数/赞数阈值过滤。
+3. 职责边界（详见根目录 `PROJECT_PRINCIPLES.md`）：
+   - 免登优先、小号最小特权（严禁触碰主号 `x_myself`）；热门榜单 0 过滤全量拉取，不设时间硬删（默认 `hours_back=0`）与关键词个数截断；
+   - 仅允许确定性的损坏死帖剔除与防封号/防限流保护，任何保留或新增的过滤/截断必须在代码处写明 `【保留过滤原因说明】`。
 4. 运维日志：统一输出至控制台与 `logs/harvester_runner.log`，仅打印高信息密度的拉取执行状态、
    子通道命中明细、图片/评论拉取完成度与异常告警。
 ================================================================================
@@ -113,10 +114,10 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
         "burner_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
         "burner_cookies": "",
         "include_home_feed": True,        # 小号健康可用时每轮仅拉 1 次 HomeTimeline；冷却中自动静默跳过
-        "home_feed_count": 30,
-        "include_trending": True,         # 100% 免登全球/美国实时热搜榜 (getdaytrends) -> 免登穿透热搜爆款推文
-        "trending_topic_count": 5,
-        "tweets_per_trend": 5,
+        "home_feed_count": 40,
+        "include_trending": True,         # 100% 免登全球/美国实时热搜榜 (getdaytrends) -> 一次性并发免登穿透全部热搜词（无词数截断、无时间过滤）
+        "trending_topic_count": 25,       # 覆盖前 25 大实时热搜词，避免第 6~25 名的重大科技/商业/政经热搜被截断漏抓
+        "tweets_per_trend": 3,
         "kol_handles": [
             "Polymarket",
             "Kalshi",
@@ -124,13 +125,10 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
             "WatcherGuru",
             "Dexerto",
             "wallstreetbets",
-            "MarioNawfal",
             "MorningBrew",
-            "StockMKTNewz",
+            "Barchart",
             "OpenAI",
             "CoinGlass_com",
-            "whale_alert",
-            "NoContextHumans",
             "WuBlockchain",
             "arkham",
         ],
@@ -141,7 +139,10 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
     "reddit": {
         "burner_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
         "burner_cookies": "",
-        "include_popular": True,          # 同时拉取 Reddit 全站实时热门榜 /r/popular
+        "include_popular": True,          # 全量拉取 Reddit 全站实时热门榜 /r/popular（不再与垂直板块混排截断）
+        "popular_limit": 50,
+        "subreddits_limit": 50,
+        "preserve_all_hot": True,
         "subreddits": [
             "wallstreetbets",
             "stocks",
@@ -161,33 +162,34 @@ PLATFORM_HARVEST_CONFIGS: Dict[str, Dict[str, Any]] = {
         ],
         "sort": "top",
         "time_filter": "day",
-        "limit": 30,
-        "fetch_comments_for_top_n": 30,
+        "limit": 80,
+        "fetch_comments_for_top_n": 40,
         "fetch_external_links": True,
     },
     "hackernews": {
-        "front_page_count": 15,
-        "top_24h_count": 10,              # 补充过去 24h 高分热榜 (points>=50)
+        "front_page_count": 30,           # 完整拉满 HackerNews 首页全部 30 条热榜帖，不做腰斩截断
+        "include_24h_top": True,          # 同时并入过去 24h 全站高分热榜（无 points>=50 人为分数门槛）
+        "preserve_all_hot": True,
         "keywords": ["AI", "OpenAI", "Nvidia", "crypto", "billion"],
         "per_keyword_count": 3,
-        "fetch_comments_for_top_n": 50,
+        "fetch_comments_for_top_n": 60,
         "fetch_external_links": True,
     },
     "binance": {
-        "recommend_count": 15,
+        "recommend_count": 20,
         "include_hot_hashtags": True,     # 币安广场官方热门话题榜 (hashtag/hot-list)
-        "hot_hashtag_count": 4,
-        "per_hashtag_count": 5,
+        "hot_hashtag_count": 0,           # 0 = 全量遍历整张官方热门话题榜全部话题，不做前几名截断
+        "per_hashtag_count": 4,
         "include_hot_coins": True,        # 币安合约热搜币种榜 (topSearchList)
-        "hot_coin_count": 3,
+        "hot_coin_count": 10,             # 覆盖前 10 大合约实时热搜异动币种
         "keywords": [],
         "coins": ["BTC", "ETH", "SOL"],
         "per_coin_count": 5,
     },
     "okx": {
-        "recommend_count": 12,
+        "recommend_count": 20,
         "include_hot_coins": True,        # 欧易官方热门币种排行 (rubik/web/public/hot-rank)
-        "hot_coin_count": 3,
+        "hot_coin_count": 10,             # 覆盖前 10 大实时热榜币种
         "coins": ["BTC", "ETH", "SOL"],
         "per_coin_count": 5,
         "author_ids": [],
@@ -609,7 +611,7 @@ def harvest_by_keywords(
     keywords: Sequence[str],
     platforms: Optional[Sequence[str]] = None,
     per_platform_limit: int = 25,
-    hours_back: int = 72,
+    hours_back: int = 0,
     fetch_comments: bool = True,
     fetch_external_links: bool = True,
     download_media: bool = True,
@@ -619,8 +621,9 @@ def harvest_by_keywords(
 ) -> Dict[str, Any]:
     """
     模块 1B 编程接口：按指定关键词组跨平台并发深挖采集（「指哪打哪」检索），
-    自动拉取外链正文、前排高赞评论、下载主帖与评论区配图，幂等写入 `harvested_social_posts`，
-    并输出分清「垂直社区客观少数据」与「综合大平台爬虫故障/漏搜」的异常感知诊断报告。
+    - 默认 `hours_back=0` 不在拉取层做时间丢弃（时间窗口筛选统一交由下游流水线处理），也不限制传入关键词个数；
+    - 自动拉取外链正文、前排高赞评论、下载主帖与评论区配图，幂等写入 `harvested_social_posts`；
+    - 输出分清「垂直社区客观少数据」与「综合大平台爬虫故障/漏搜」的异常感知诊断报告。
 
     可完全独立于下游或上游任何模块单独调用。
     """

@@ -103,10 +103,15 @@ class BinanceHarvester(BasePlatformHarvester):
 
     def fetch_hot_hashtags_posts(
         self,
-        max_hashtags: int = 5,
+        max_hashtags: int = 0,
         posts_per_hashtag: int = 4,
+        max_age_hours: int = 0,
     ) -> List[Dict[str, Any]]:
-        """拉取币安广场官方实时热门话题榜 (`hashtag/hot-list`) 前排话题下的高热帖子。"""
+        """
+        拉取币安广场官方实时热门话题榜 (`hashtag/hot-list`) 话题下的帖子：
+        - `max_hashtags<=0` 表示全量拉透整张榜单；
+        - `max_age_hours<=0`（默认）表示拉取层不做发布时间丢弃过滤，原样保留完整数据交由下游流水线统一按时间筛选。
+        """
         self.last_hot_hashtags: List[str] = []
         try:
             hot_items = fetch_binance_hot_hashtags() or []
@@ -128,8 +133,10 @@ class BinanceHarvester(BasePlatformHarvester):
             )
             return []
 
+        min_ts = int(time.time() - max_age_hours * 3600) if max_age_hours > 0 else 0
+        selected_items = hot_items if max_hashtags <= 0 else hot_items[:max_hashtags]
         by_id: Dict[str, Dict[str, Any]] = {}
-        for item in hot_items[: max(1, max_hashtags)]:
+        for item in selected_items:
             if not isinstance(item, dict):
                 continue
             tag = str(item.get("hashtag") or item.get("hashtagNormalized") or "").strip()
@@ -138,6 +145,9 @@ class BinanceHarvester(BasePlatformHarvester):
             self.last_hot_hashtags.append(tag)
             raw_posts = fetch_binance_feed(count=max(2, posts_per_hashtag), keyword=tag, download_media=False) or []
             for p in self.normalize_batch(raw_posts, download_media=False):
+                pub_ts = safe_int(p.get("publish_time"), 0)
+                if min_ts > 0 and pub_ts > 0 and pub_ts < min_ts:
+                    continue
                 if p.get("post_id"):
                     by_id[p["post_id"]] = p
 
@@ -155,13 +165,14 @@ class BinanceHarvester(BasePlatformHarvester):
         query: str,
         count: int = 25,
         is_coin_token: bool = False,
-        hours_back: int = 72,
+        hours_back: int = 0,
         download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
         原语 3：按关键词（支持 `|` 或 `,` 分隔多词）或币种代码 (`token="BTC"`) 拉取币安广场垂直内容流。
-        候选检索阶段关闭同步图片下载以大幅提速，筛选出最终 Top `count` 后再并发下载真实原图。
+        - 默认 `hours_back=0` 不在拉取层做时间丢弃，时间窗口过滤统一由下游负责；
+        - 候选检索阶段关闭同步图片下载以大幅提速，筛选出最终 Top `count` 后再并发下载真实原图。
         """
         reset_health = bool(kwargs.get("reset_health", True))
         if reset_health:
@@ -192,13 +203,13 @@ class BinanceHarvester(BasePlatformHarvester):
                         raw_posts.extend(fetch_binance_feed(count=max(6, per_kw // 2), keyword=kw, download_media=False) or [])
                 else:
                     raw_posts = fetch_binance_feed(count=per_kw, keyword=kw, download_media=False) or []
-                    # 币安广场搜索对空格分隔的多词长短语（如 "黄仁勋 出轨"）可能只命中精确连写，补充去空格或核心词检索
+                    # 币安广场搜索对空格分隔的多词长短语（如 "黄仁勋 出轨"）可能只命中精确连写，补充去空格或分词检索
                     if len(raw_posts) < 3 and " " in kw:
                         compact_kw = "".join(kw.split())
                         if not compact_kw.isascii():
                             raw_posts.extend(fetch_binance_feed(count=per_kw, keyword=compact_kw, download_media=False) or [])
                         if not raw_posts:
-                            sub_terms = [t.strip() for t in kw.split() if len(t.strip()) >= 2][:2]
+                            sub_terms = [t.strip() for t in kw.split() if len(t.strip()) >= 2]
                             for st in sub_terms:
                                 raw_posts.extend(fetch_binance_feed(count=per_kw, keyword=st, download_media=False) or [])
             except Exception as e:
@@ -271,12 +282,12 @@ class BinanceHarvester(BasePlatformHarvester):
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         self.reset_health_state()
         cfg = config or {}
-        recommend_count = safe_int(cfg.get("recommend_count"), 15)
+        recommend_count = safe_int(cfg.get("recommend_count"), 20)
         include_hot_hashtags = bool(cfg.get("include_hot_hashtags", True))
-        hot_hashtags_count = safe_int(cfg.get("hot_hashtags_count"), 5)
-        posts_per_hashtag = safe_int(cfg.get("posts_per_hashtag"), 4)
-        include_hot_future_coins = bool(cfg.get("include_hot_future_coins", True))
-        hot_future_coins_count = safe_int(cfg.get("hot_future_coins_count"), 4)
+        hot_hashtags_count = safe_int(cfg.get("hot_hashtag_count", cfg.get("hot_hashtags_count", 0)), 0)
+        posts_per_hashtag = safe_int(cfg.get("per_hashtag_count", cfg.get("posts_per_hashtag", 4)), 4)
+        include_hot_future_coins = bool(cfg.get("include_hot_coins", cfg.get("include_hot_future_coins", True)))
+        hot_future_coins_count = safe_int(cfg.get("hot_coin_count", cfg.get("hot_future_coins_count", 10)), 10)
         keywords = cfg.get("keywords") or []
         configured_coins = [str(c).strip().upper() for c in (cfg.get("coins") or []) if str(c).strip()]
         download_media = bool(cfg.get("download_media", True))
@@ -294,13 +305,13 @@ class BinanceHarvester(BasePlatformHarvester):
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
 
-        # 2. 币安官方实时热搜话题榜 (`hashtag/hot-list`)
-        if include_hot_hashtags and hot_hashtags_count > 0:
+        # 2. 币安官方实时热搜话题榜 (`hashtag/hot-list`，`hot_hashtags_count<=0` 表示全量拉透整张榜单)
+        if include_hot_hashtags:
             tag_posts = self.fetch_hot_hashtags_posts(
                 max_hashtags=hot_hashtags_count,
                 posts_per_hashtag=posts_per_hashtag,
             )
-            self.last_channel_stats["官方热门话题榜"] = len(tag_posts)
+            self.last_channel_stats[f"官方热门话题榜({len(self.last_hot_hashtags)}话题)"] = len(tag_posts)
             for p in tag_posts:
                 if self.is_valuable_post(p, cfg):
                     by_id[p["post_id"]] = p
@@ -321,7 +332,7 @@ class BinanceHarvester(BasePlatformHarvester):
 
         # 4. 币安合约热搜榜异动币 (`topSearchList`) + 固定主流币去重合并
         merged_coins: List[str] = []
-        if include_hot_future_coins and hot_future_coins_count > 0:
+        if include_hot_future_coins and hot_future_coins_count != 0:
             try:
                 raw_hot_futures = fetch_binance_future_hot_coins() or []
                 if not raw_hot_futures:
@@ -337,7 +348,7 @@ class BinanceHarvester(BasePlatformHarvester):
                     base_sym = _strip_quote_asset(fc.get("symbol") or "")
                     if base_sym and base_sym not in self.last_hot_coins:
                         self.last_hot_coins.append(base_sym)
-                        if len(self.last_hot_coins) >= hot_future_coins_count:
+                        if hot_future_coins_count > 0 and len(self.last_hot_coins) >= hot_future_coins_count:
                             break
                 for hc in self.last_hot_coins:
                     if hc not in merged_coins:

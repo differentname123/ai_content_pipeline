@@ -455,6 +455,8 @@ def fetch_okx_feed(
         content_data = raw_item.get("contentData") if "contentData" in raw_item else raw_item
         if not isinstance(content_data, dict):
             continue
+        # 【保留过滤原因说明】自营账号发帖拦截：
+        # 剔除本系统自有欧易账号发布的帖子，防止将先前 AI 生成发出的文章再次抓回当素材造成“自产自销”死循环，并节省富化耗时。
         if _is_self_okx_post(content_data):
             intercepted_count += 1
             continue
@@ -577,6 +579,7 @@ def clean_okx_posts(raw_data_list):
     for raw_wrapper in raw_data_list:
         try:
             content_data = raw_wrapper.get("contentData") if "contentData" in raw_wrapper else raw_wrapper
+            # 【保留过滤原因说明】二次兜底拦截本系统自营欧易主号发帖，防止自产自销闭环污染。
             if not isinstance(content_data, dict) or _is_self_okx_post(content_data):
                 continue
 
@@ -715,6 +718,7 @@ def clean_okx_replies(raw_replies, content_id=""):
     seen_reply_ids = set()
 
     for item in raw_replies:
+        # 【保留过滤原因说明】跳过平台已标记删除 (`isDel=1`) 的残缺空评论，避免无意义占位占用评论配额。
         if not isinstance(item, dict) or str(item.get("isDel", "0")) == "1":
             continue
 
@@ -880,6 +884,7 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
 
         try:
             comment_count = item.get("engagement", {}).get("comment_count", 0)
+            # 【保留过滤原因说明】已知 0 评论帖短路跳过：避免对无评论帖发起注定为空的请求浪费网络耗时。
             if comment_count <= 0:
                 item["comments"] = []
             else:

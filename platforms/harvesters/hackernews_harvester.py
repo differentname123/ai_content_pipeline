@@ -152,6 +152,8 @@ class HackerNewsHarvester(BasePlatformHarvester):
     ) -> None:
         if top_n_comments <= 0 or not posts:
             return
+        # 【保留过滤原因说明】已知 0 评论帖短路跳过：
+        # 仅对接口已明确返回 `comment_count > 0` 的帖子发起 `/items/{id}` 评论树请求，避免空跑无评论新帖浪费网络耗时。
         comment_targets = [
             p for p in posts
             if safe_int((p.get("engagement") or {}).get("comment_count"), 0) > 0 and not (p.get("comments") or [])
@@ -185,12 +187,16 @@ class HackerNewsHarvester(BasePlatformHarvester):
     # ==========================================================================
     def fetch_hot_or_recommended(
         self,
-        count: int = 20,
+        count: int = 30,
         include_24h_top: bool = True,
-        min_24h_points: int = 50,
+        min_24h_points: int = 0,
+        preserve_all: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
-        """原语 1：拉取 HackerNews 首页 (`front_page`) + 过去 24h 高赞故事榜（防止刚滑出前 30 名的当日大爆帖漏抓）"""
+        """
+        原语 1：拉取 HackerNews 首页 (`front_page` 整页全量) + 过去 24h 热门故事榜（不做人为分数门槛过滤）：
+        - `min_24h_points<=0`（默认）：不设 `points>=N` 门槛，直接由 Algolia 按 24h 内热度降序返回前排故事。
+        """
         url = "https://hn.algolia.com/api/v1/search"
         by_id: Dict[str, Dict[str, Any]] = {}
         self._last_fp_count = 0
@@ -199,7 +205,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         try:
             resp = self.session.get(
                 url,
-                params={"tags": "front_page", "hitsPerPage": max(count, 30)},
+                params={"tags": "front_page", "hitsPerPage": max(count, 40)},
                 proxies=self.proxies,
                 timeout=REQUEST_TIMEOUT,
             )
@@ -234,13 +240,18 @@ class HackerNewsHarvester(BasePlatformHarvester):
 
         if include_24h_top:
             min_24h_ts = int(time.time() - 86400)
+            num_filter = (
+                f"created_at_i>={min_24h_ts},points>={min_24h_points}"
+                if min_24h_points > 0
+                else f"created_at_i>={min_24h_ts}"
+            )
             try:
                 resp_24h = self.session.get(
                     url,
                     params={
                         "tags": "story",
-                        "numericFilters": f"created_at_i>={min_24h_ts},points>={max(10, min_24h_points)}",
-                        "hitsPerPage": max(count, 30),
+                        "numericFilters": num_filter,
+                        "hitsPerPage": max(count, 50),
                     },
                     proxies=self.proxies,
                     timeout=REQUEST_TIMEOUT,
@@ -275,7 +286,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
             ),
             reverse=True,
         )
-        return ranked[:count]
+        return ranked if preserve_all else ranked[:count]
 
     def fetch_user_posts(
         self,
@@ -306,15 +317,17 @@ class HackerNewsHarvester(BasePlatformHarvester):
         self,
         query: str,
         count: int = 20,
-        hours_back: int = 72,
+        hours_back: int = 0,
         fetch_comments: bool = False,
         fetch_external_links: bool = False,
         download_media: bool = False,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索近期故事（同时覆盖相关度排序与最新时间排序）。
-        注：HackerNews 为纯英文极客科技社区，自动跳过纯中文词或剥离中英混写中的中文字符，避免 Algolia 全词 AND 误返 0 条。
+        原语 3：按关键词（支持以 `|` 或 `,` 分隔多个关键词）搜索故事（同时覆盖最新时间排序与近期热度排序）。
+        - 默认 `hours_back=0` 不做硬性时间丢弃（冷门词条即便只有较早讨论也会完整返回，时间筛选统一由下游负责）；
+        - 【保留过滤原因说明】HackerNews 为纯英文极客科技社区，全站无中文帖；自动跳过纯中文词或剥离中英混写中的中文字符，
+          是为了避免 Algolia 默认全词 AND 匹配把英文主词拖累成 0 条结果并浪费无效请求。
         """
         import re as _re
 
@@ -324,7 +337,9 @@ class HackerNewsHarvester(BasePlatformHarvester):
 
         raw_q = str(query or "").replace(",", "|")
         raw_keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
-        min_ts = int(time.time() - max(1, hours_back) * 3600)
+        now_ts = int(time.time())
+        min_ts = int(now_ts - max(1, hours_back) * 3600) if (hours_back and hours_back > 0) else 0
+        recent_priority_ts = int(now_ts - 7 * 86400)
 
         english_keywords: List[str] = []
         seen_en = set()
@@ -344,7 +359,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         if raw_keywords and not english_keywords:
             self.last_search_note = "纯中文查询词（HackerNews为纯英文科技社区，无中文帖）"
             return []
-        self.last_search_note = f"英文检索词:{','.join(english_keywords[:4])}"
+        self.last_search_note = f"英文检索词:{','.join(english_keywords)}"
 
         by_id: Dict[str, Dict[str, Any]] = {}
         per_kw = max(10, count)
@@ -354,13 +369,23 @@ class HackerNewsHarvester(BasePlatformHarvester):
         def _query_algolia(q_str: str) -> int:
             nonlocal req_total, req_failed
             added_cnt = 0
-            for endpoint in ("https://hn.algolia.com/api/v1/search", "https://hn.algolia.com/api/v1/search_by_date"):
+            # 1) search_by_date：当 hours_back<=0 时不加任何时间下限，天然返回最新实时故事且冷门话题绝不丢帖；
+            # 2) search（按分数/相关度）：优先查近期（7d）高热讨论，防止十年前的高赞历史归档帖把今日新帖挤出 Top count；若不足再无门槛补齐。
+            specs = [
+                ("https://hn.algolia.com/api/v1/search_by_date", f"created_at_i>={min_ts}" if min_ts > 0 else ""),
+                (
+                    "https://hn.algolia.com/api/v1/search",
+                    f"created_at_i>={min_ts}" if min_ts > 0 else f"created_at_i>={recent_priority_ts}",
+                ),
+            ]
+            for endpoint, num_flt in specs:
                 req_total += 1
-                params = {
+                params: Dict[str, Any] = {
                     "tags": "story",
-                    "numericFilters": f"created_at_i>={min_ts}",
                     "hitsPerPage": per_kw,
                 }
+                if num_flt:
+                    params["numericFilters"] = num_flt
                 if q_str:
                     params["query"] = q_str
                 try:
@@ -407,6 +432,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
         results = sorted(
             by_id.values(),
             key=lambda p: (
+                1 if safe_int(p.get("publish_time"), 0) >= recent_priority_ts else 0,
                 safe_int((p.get("engagement") or {}).get("like_count"), 0)
                 + safe_int((p.get("engagement") or {}).get("comment_count"), 0) * 2,
                 safe_int(p.get("publish_time"), 0),
@@ -427,7 +453,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
                 scene="search",
                 expect_comments=fetch_comments,
                 expect_media_download=download_media,
-                max_fresh_age_hours=max(72, hours_back or 72),
+                max_fresh_age_hours=max(168, hours_back or 168),
             )
         return [p for p in results if self.is_valuable_post(p)]
 
@@ -449,8 +475,12 @@ class HackerNewsHarvester(BasePlatformHarvester):
             children = resp.json().get("children") or []
             raw_comments = []
             for c in children:
+                # 【保留过滤原因说明】跳过已被管理员折叠/删除的垃圾评论 (`dead` / `deleted` / `[dead]`)，
+                # 避免无实质内容的占位符挤占每帖前排有效评论名额。
+                if c.get("dead") or c.get("deleted"):
+                    continue
                 clean_c = _strip_hn_html(c.get("text") or "")
-                if not clean_c:
+                if not clean_c or clean_c.strip().lower() in ("[dead]", "[flagged]"):
                     continue
                 raw_comments.append({
                     "reply_id": str(c.get("id") or ""),
@@ -474,12 +504,13 @@ class HackerNewsHarvester(BasePlatformHarvester):
     def harvest(self, config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         self.reset_health_state()
         cfg = config or {}
-        front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 20)
+        front_page_count = safe_int(cfg.get("front_page_count") or cfg.get("limit"), 30)
         include_24h_top = bool(cfg.get("include_24h_top", True))
-        min_24h_points = safe_int(cfg.get("min_24h_points"), 50)
+        min_24h_points = safe_int(cfg.get("min_24h_points"), 0)
+        preserve_all_hot = bool(cfg.get("preserve_all_hot", True))
         per_keyword_count = safe_int(cfg.get("per_keyword_count"), 4)
         keywords = cfg.get("keywords") or []
-        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 50)
+        top_n_comments = safe_int(cfg.get("fetch_comments_for_top_n"), 60)
         fetch_ext_links = bool(cfg.get("fetch_external_links", True))
         download_media = bool(cfg.get("download_media", True))
 
@@ -490,6 +521,7 @@ class HackerNewsHarvester(BasePlatformHarvester):
             count=front_page_count,
             include_24h_top=include_24h_top,
             min_24h_points=min_24h_points,
+            preserve_all=preserve_all_hot,
         )
         self.last_channel_stats["首页front_page"] = getattr(self, "_last_fp_count", len(fp_posts))
         if include_24h_top:

@@ -61,7 +61,7 @@ logger = setup_logger(app_name="x_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("x_myself_browser_session_dir", "x_myself")
+USER_DATA_DIR = resolve_session_dir("x_xiaohao_browser_session_dir", "x_myself")
 X_HOME_URL = "https://x.com/home"
 X_COMPOSE_URL = "https://x.com/compose/post"
 X_LOGIN_URL = "https://x.com/i/flow/login"

@@ -167,7 +167,8 @@ X_USER_FEATURES_2026 = {
     "responsive_web_graphql_timeline_navigation_enabled": True,
 }
 
-# 经 UserByScreenName 实测验证的高价值英文大 V 映射表 (guest_realtime=True 表示免登直接拿今日新帖，False 表示需小号拿今日实时流)
+# 经 UserByScreenName 与 2026 免登 Guest Token 实测验证的高价值英文大 V 映射表
+# (guest_realtime=True 表示免登直接返回实时时间线新帖，False 表示免登返回历史 Top100 归档旧帖)
 VERIFIED_X_ACCOUNTS = {
     # 疯狂赌局与赔率吃瓜
     "Polymarket": {"uid": "1261335549215989760", "guest_realtime": True, "category": "insane_bets"},
@@ -177,23 +178,23 @@ VERIFIED_X_ACCOUNTS = {
     "KobeissiLetter": {"uid": "3316376038", "guest_realtime": True, "category": "macro_money"},
     "WatcherGuru": {"uid": "1387497871751196672", "guest_realtime": True, "category": "breaking_money"},
     "MorningBrew": {"uid": "3092541736", "guest_realtime": True, "category": "biz_story"},
-    "StockMKTNewz": {"uid": "1250830691824283648", "guest_realtime": True, "category": "macro_money"},
     "Barchart": {"uid": "28212513", "guest_realtime": True, "category": "macro_money"},
-    "charliebilello": {"uid": "1413027896", "guest_realtime": True, "category": "macro_money"},
     # 科技商业暗黑吃瓜与全球猎奇
     "Dexerto": {"uid": "76766018", "guest_realtime": True, "category": "internet_drama"},
-    "MarioNawfal": {"uid": "1319287761048723458", "guest_realtime": True, "category": "viral_news"},
     "OpenAI": {"uid": "4398626122", "guest_realtime": True, "category": "ai_tech"},
-    "NoContextHumans": {"uid": "1138842105856573445", "guest_realtime": True, "category": "viral_hook"},
-    "historyinmemes": {"uid": "855481986290524160", "guest_realtime": True, "category": "viral_hook"},
-    "buitengebieden": {"uid": "1130021685351079938", "guest_realtime": True, "category": "viral_hook"},
     # 链上巨鲸与清算实锤
     "CoinGlass_com": {"uid": "1169095068164050945", "guest_realtime": True, "category": "liquidation_drama"},
     "arkham": {"uid": "1123403704323805184", "guest_realtime": True, "category": "whale_tracker"},
-    "whale_alert": {"uid": "1039833297751302144", "guest_realtime": True, "category": "whale_tracker"},
-    "DefiLlama": {"uid": "1321585610654687241", "guest_realtime": True, "category": "defi_data"},
     "WuBlockchain": {"uid": "111533746", "guest_realtime": True, "category": "crypto_scoop"},
-    # 重度发帖大V（免登返回历史Top100，小号登录态返回今日实时流）
+    # 免登返回历史 Top100 旧帖的大 V（仅小号登录态返回今日实时流，不放入默认免登监控池）
+    "StockMKTNewz": {"uid": "1250830691824283648", "guest_realtime": False, "category": "macro_money"},
+    "charliebilello": {"uid": "1413027896", "guest_realtime": False, "category": "macro_money"},
+    "MarioNawfal": {"uid": "1319287761048723458", "guest_realtime": False, "category": "viral_news"},
+    "NoContextHumans": {"uid": "1138842105856573445", "guest_realtime": False, "category": "viral_hook"},
+    "historyinmemes": {"uid": "855481986290524160", "guest_realtime": False, "category": "viral_hook"},
+    "buitengebieden": {"uid": "1130021685351079938", "guest_realtime": False, "category": "viral_hook"},
+    "whale_alert": {"uid": "1039833297751302144", "guest_realtime": False, "category": "whale_tracker"},
+    "DefiLlama": {"uid": "1321585610654687241", "guest_realtime": False, "category": "defi_data"},
     "unusual_whales": {"uid": "1200616796295847936", "guest_realtime": False, "category": "insider_money"},
     "AutismCapital": {"uid": "1297651178256257024", "guest_realtime": False, "category": "tech_drama"},
     "litcapital": {"uid": "932630991298007041", "guest_realtime": False, "category": "wallstreet_humor"},
@@ -893,13 +894,14 @@ class XHarvester(BasePlatformHarvester):
         """
         原语 2：拉取指定大 V (`@handle` 或数字 UID) 的推文。
         安全路由策略：
-        - 默认 (`force_burner=False`) 100% 走免登 Guest Token + Chrome TLS 指纹，零小号消耗，跳过置顶旧帖并过滤超期归档帖；
+        - 默认 (`force_burner=False`) 100% 走免登 Guest Token + Chrome TLS 指纹，零小号消耗；
+        - 默认 `max_age_hours=0` 不在拉取层做时间丢弃（时间窗口筛选统一由下游流水线处理）；
         - 仅在调用方显式指定 `force_burner=True` 且小号健康可用时才使用登录态，遇异常立即转冷却并回退免登。
         """
         clean_name = str(user_id).lstrip("@").strip()
         meta_info = VERIFIED_X_ACCOUNTS.get(clean_name) or {}
         category = meta_info.get("category", "x_kol")
-        max_age_hours = safe_int(kwargs.get("max_age_hours"), 168)
+        max_age_hours = safe_int(kwargs.get("max_age_hours"), 0)
         min_ts = int(time.time() - max_age_hours * 3600) if max_age_hours > 0 else 0
         use_burner = bool(force_burner and self.is_burner_usable)
 
@@ -963,10 +965,14 @@ class XHarvester(BasePlatformHarvester):
                     )
                 return []
 
+            # 【保留过滤原因说明】跳过主页置顶帖 (`skip_pinned=True`)：
+            # 大 V 主页置顶多为常年不换的个人简介、返佣链接或数年前旧帖，每轮重复拉取会浪费外链/图片富化时间。
             raw_nodes = _extract_gql_tweet_objects(payload, skip_pinned=True)
             by_id = {}
             for node in raw_nodes:
                 legacy_node = node.get("legacy") or {}
+                # 【保留过滤原因说明】跳过无个人评述的纯转发 (`retweeted_status_result`) 与无上下文纯回复：
+                # 带个人观点的引用转发 (Quote Tweet) 会正常保留；纯一键转推与他人评论区碎片回复无独立信息量且浪费富化耗时。
                 if exclude_retweets and legacy_node.get("retweeted_status_result"):
                     continue
                 if exclude_replies and legacy_node.get("in_reply_to_status_id_str"):
@@ -1034,7 +1040,7 @@ class XHarvester(BasePlatformHarvester):
                 resp = self._http_get(t_url, timeout=10)
                 if resp.status_code == 200 and resp.text:
                     hits = re.findall(pattern, resp.text)
-                    _append_trends(hits[:25], w_id)
+                    _append_trends(hits[:50], w_id)
             except Exception as e:
                 logger.debug(f"[X适配器] getdaytrends 拉取异常 ({t_url}): {e}")
 
@@ -1049,7 +1055,7 @@ class XHarvester(BasePlatformHarvester):
                     resp = self._http_get(b_url, timeout=10)
                     if resp.status_code == 200 and resp.text:
                         hits = re.findall(r'<a[^>]*class=[^>]*trend-link[^>]*>([^<]+)</a>', resp.text)
-                        _append_trends(hits[:25], w_id)
+                        _append_trends(hits[:50], w_id)
                 except Exception as e:
                     logger.debug(f"[X适配器] trends24 备选拉取异常 ({b_url}): {e}")
 
@@ -1062,7 +1068,7 @@ class XHarvester(BasePlatformHarvester):
             )
 
         merged.sort(key=lambda x: x["rank"])
-        return merged[: max(1, limit)]
+        return merged if limit <= 0 else merged[:limit]
 
     def fetch_hot_or_recommended(
         self,
@@ -1112,6 +1118,7 @@ class XHarvester(BasePlatformHarvester):
                     nodes = _extract_gql_tweet_objects(payload)
                     by_id = {}
                     for node in nodes:
+                        # 【保留过滤原因说明】推荐流跳过无个人评述的纯转推 (`RT @xxx`)，保留带观点的引用转发 (Quote Tweet)，防止重复噪音。
                         if (node.get("legacy") or {}).get("retweeted_status_result"):
                             continue
                         item = self._convert_raw_tweet(node, category=f"x_{op.lower()}")
@@ -1146,7 +1153,7 @@ class XHarvester(BasePlatformHarvester):
             "KobeissiLetter",
             "WatcherGuru",
             "Dexerto",
-            "MarioNawfal",
+            "Barchart",
             "MorningBrew",
             "wallstreetbets",
             "OpenAI",
@@ -1572,15 +1579,15 @@ class XHarvester(BasePlatformHarvester):
         self,
         keywords: Sequence[str],
         per_kw_limit: int = 15,
-        hours_back: int = 72,
+        hours_back: int = 0,
     ) -> List[Tuple[str, str]]:
         """
         100% 免登全站推文发现引擎：
-        - 优先提炼英文精准短语，辅以核心双词组与精简中文词；
-        - 并发检索 `Yahoo Search (site:x.com)` 的 24h (`btf=d`) 与 7d (`btf=w` 前两页 `b=1, 8`)；
-        - 利用推文 Snowflake ID 在发起详情请求前零开销过滤掉超出 `hours_back` 的陈旧归档帖。
+        - 不设人为关键词个数上限（传入多少词即可并发检索多少词）；
+        - 优先检索 `Yahoo Search (site:x.com)` 的 24h (`btf=d`) 与 7d (`btf=w`) 实时页以保障新帖命中率；若冷门词近期页无结果，再回退全时段页；
+        - 默认 `hours_back=0` 不在采集层硬删旧帖（仅在调用方显式指定 `hours_back>0` 时按 Snowflake 时间戳过滤）。
         """
-        min_ts = int(time.time() - max(1, hours_back) * 3600)
+        min_ts = int(time.time() - max(1, hours_back) * 3600) if (hours_back and hours_back > 0) else 0
 
         en_terms: List[str] = []
         cn_terms: List[str] = []
@@ -1602,8 +1609,9 @@ class XHarvester(BasePlatformHarvester):
             has_cjk = bool(re.search(r"[\u4e00-\u9fff]", kw))
             if not has_cjk:
                 _add_term(kw, en_terms)
+                # 仅在单/少量长词查询时补充首尾双词拆解，避免 25 个热搜词批量传入时成倍膨胀冗余子词
                 parts = [p for p in kw.split() if p]
-                if len(parts) >= 3:
+                if len(parts) >= 3 and len(keywords or []) <= 6:
                     _add_term(" ".join(parts[:2]), en_terms)
                     _add_term(" ".join(parts[-2:]), en_terms)
             else:
@@ -1617,7 +1625,7 @@ class XHarvester(BasePlatformHarvester):
                 elif len(kw) <= 10:
                     _add_term(kw, cn_terms)
 
-        search_terms = (en_terms + cn_terms)[:8]
+        search_terms = en_terms + cn_terms
         if not search_terms:
             return []
 
@@ -1625,14 +1633,17 @@ class XHarvester(BasePlatformHarvester):
             local_pairs: List[Tuple[str, str]] = []
             local_seen = set()
             q_encoded = quote(f"site:x.com {term}")
-            # 依次查 24h 最新窗 -> 7d 热门第 1 页 -> 若仍不足再翻 7d 第 2 页
+            # 依次查 24h 最新窗 -> 7d 热门第 1 页 -> 若仍不足翻第 2 页 -> 若冷门词完全无近期帖再兜底不限时间页
             page_specs = [
                 f"https://search.yahoo.com/search?p={q_encoded}&btf=d",
                 f"https://search.yahoo.com/search?p={q_encoded}&btf=w",
                 f"https://search.yahoo.com/search?p={q_encoded}&btf=w&b=8",
+                f"https://search.yahoo.com/search?p={q_encoded}",
             ]
             for idx, target_url in enumerate(page_specs):
-                if idx == 2 and len(local_pairs) >= per_kw_limit:
+                if idx >= 1 and len(local_pairs) >= per_kw_limit:
+                    break
+                if idx == 3 and (len(local_pairs) > 0 or min_ts > 0):
                     break
                 try:
                     rs = self._http_get(target_url, timeout=10)
@@ -1645,7 +1656,7 @@ class XHarvester(BasePlatformHarvester):
                         if tid in local_seen:
                             continue
                         est_ts = _snowflake_to_unix_ts(tid)
-                        if est_ts > 0 and est_ts < min_ts:
+                        if min_ts > 0 and est_ts > 0 and est_ts < min_ts:
                             continue
                         local_seen.add(tid)
                         local_pairs.append((handle, tid))
@@ -1657,7 +1668,7 @@ class XHarvester(BasePlatformHarvester):
 
         discovered: List[Tuple[str, str]] = []
         seen_tids = set()
-        with ThreadPoolExecutor(max_workers=min(3, len(search_terms))) as pool:
+        with ThreadPoolExecutor(max_workers=min(4, len(search_terms))) as pool:
             ordered_results = list(pool.map(_search_single_term, search_terms))
             for pairs in ordered_results:
                 for handle, tid in pairs:
@@ -1668,8 +1679,8 @@ class XHarvester(BasePlatformHarvester):
         return discovered
 
     def _discover_x_tweets_via_yahoo(self, keywords: List[str], per_kw_limit: int = 12) -> List[Tuple[str, str]]:
-        """向后兼容别名：转发至升级后的免登分时多页发现引擎。"""
-        return self._discover_x_tweets_zero_auth(keywords=keywords, per_kw_limit=per_kw_limit, hours_back=72)
+        """向后兼容别名：转发至免登多页发现引擎（默认不做硬性时间丢弃）。"""
+        return self._discover_x_tweets_zero_auth(keywords=keywords, per_kw_limit=per_kw_limit, hours_back=0)
 
     def _attach_comments_safely(
         self,
@@ -1679,8 +1690,10 @@ class XHarvester(BasePlatformHarvester):
     ) -> int:
         """
         登录态最小特权补评：
-        仅在小号健康可用时，对互动最高的前 `top_n_for_comments`（硬上限 10 条）重点帖，
-        采用【单线程串行 + 1.5~2.8s 真人节奏随机间隔】拉取前排高赞神评；一旦遇到 326/掉线立即熔断退出。
+        【保留过滤原因说明】
+        1) X 平台唯独单帖评论接口 `TweetDetail` 必须携带小号 Cookie，因此硬限制单轮最多补评 `MAX_SAFE_COMMENT_POSTS_HARD_CAP=10` 帖，
+           并采用「单线程串行 + 1.5~2.8s 真人随机间隔」，防止高频并发把小号打入 326 验证锁；
+        2) 短路跳过 `comment_count == 0` 的无评论帖，避免白白消耗宝贵的小号请求配额与等待耗时。
         """
         if not self.is_burner_usable or top_n_for_comments <= 0 or not posts:
             return 0
@@ -1734,7 +1747,7 @@ class XHarvester(BasePlatformHarvester):
         query: str,
         count: int = 20,
         handles: Optional[List[str]] = None,
-        hours_back: int = 72,
+        hours_back: int = 0,
         fetch_comments: bool = True,
         fetch_external_links: bool = False,
         download_media: bool = False,
@@ -1742,7 +1755,7 @@ class XHarvester(BasePlatformHarvester):
     ) -> List[Dict[str, Any]]:
         """
         原语 3：按关键词全站定向检索推文（100% 免登搜索主力 + 可选重点帖低频补评）：
-        1) 主力通道（0 账号消耗）：Yahoo 24h/7d 多页分时发现 + 雪花 ID 秒级预筛 + `fxtwitter/syndication` 并发全量富化；
+        1) 主力通道（0 账号消耗）：Yahoo 24h/7d 多页分时发现 + `fxtwitter/syndication` 并发全量富化（无关键词个数上限，默认 `hours_back=0` 不做时间硬删）；
         2) 指定大 V 补充（0 账号消耗）：若传入 `handles` 则通过免登 Guest Token 补充匹配；
         3) 重点帖慢速补评（最小特权）：仅在小号健康可用时，为热度排名前 5 的核心主帖单线程慢速补齐评论。
         """
@@ -1754,7 +1767,9 @@ class XHarvester(BasePlatformHarvester):
         raw_q = str(query or "").replace(",", "|")
         raw_keywords = [w.strip() for w in raw_q.split("|") if w.strip()]
         low_keywords = [w.lower() for w in raw_keywords]
-        min_ts = int(time.time() - max(1, hours_back) * 3600)
+        now_ts = int(time.time())
+        min_ts = int(now_ts - max(1, hours_back) * 3600) if (hours_back and hours_back > 0) else 0
+        recent_priority_ts = int(now_ts - 7 * 86400)
 
         if not raw_keywords:
             return self.fetch_hot_or_recommended(count=count, fallback_handles=handles)
@@ -1762,14 +1777,15 @@ class XHarvester(BasePlatformHarvester):
         by_id: Dict[str, Dict[str, Any]] = {}
         enriched_hit_count = 0
 
-        # 通道 1（100% 免登主力）：多页分时索引发现 + 雪花ID过滤 + fxtwitter/syndication 并发详情富化
+        # 根据传入词数自适应计算每词目标条数：单词深挖、多词（如 25 个热搜词一次性传入）轻量穿透
+        adaptive_per_kw = max(5, ((max(1, count) + len(raw_keywords) - 1) // len(raw_keywords)) * 2)
         discovered_pairs = self._discover_x_tweets_zero_auth(
             keywords=raw_keywords,
-            per_kw_limit=max(12, count),
+            per_kw_limit=adaptive_per_kw,
             hours_back=hours_back,
         )
         if discovered_pairs:
-            candidate_pairs = discovered_pairs[: max(count * 2, 36)]
+            candidate_pairs = discovered_pairs[: max(count * 2, len(raw_keywords) * 4, 40)]
             with ThreadPoolExecutor(max_workers=min(6, len(candidate_pairs))) as pool:
                 fut_map = {
                     pool.submit(self._fetch_tweet_zero_auth, tid, handle): tid
@@ -1781,7 +1797,7 @@ class XHarvester(BasePlatformHarvester):
                     except Exception:
                         tw_item = None
                     if tw_item and self.is_valuable_post(tw_item):
-                        if safe_int(tw_item.get("publish_time"), 0) >= min_ts:
+                        if min_ts <= 0 or safe_int(tw_item.get("publish_time"), 0) >= min_ts:
                             by_id[tw_item["post_id"]] = tw_item
                             enriched_hit_count += 1
 
@@ -1792,7 +1808,7 @@ class XHarvester(BasePlatformHarvester):
                 pool_posts.extend(self.fetch_user_posts(h, count=6, force_burner=False, max_age_hours=hours_back))
             keyword_token_groups = [[t for t in k.split() if t] for k in low_keywords if k.strip()]
             for p in pool_posts:
-                if p["post_id"] in by_id or safe_int(p.get("publish_time"), 0) < min_ts:
+                if p["post_id"] in by_id or (min_ts > 0 and safe_int(p.get("publish_time"), 0) < min_ts):
                     continue
                 txt = ((p.get("content") or {}).get("text_content") or "").lower()
                 if any(all(tok in txt for tok in grp) for grp in keyword_token_groups if grp):
@@ -1801,6 +1817,7 @@ class XHarvester(BasePlatformHarvester):
         results = sorted(
             by_id.values(),
             key=lambda x: (
+                1 if safe_int(x.get("publish_time"), 0) >= recent_priority_ts else 0,
                 safe_int((x.get("engagement") or {}).get("like_count"), 0) * 2
                 + safe_int((x.get("engagement") or {}).get("comment_count"), 0) * 5
                 + safe_int((x.get("engagement") or {}).get("quote_count"), 0) * 4
@@ -1821,7 +1838,7 @@ class XHarvester(BasePlatformHarvester):
 
         cmt_suffix = f", 重点帖补评={cmt_posts_cnt}帖" if self.has_burner_account else ""
         self.last_search_note = (
-            f"免登发现近期帖={len(discovered_pairs)}条, 详情富化={enriched_hit_count}条 -> 保留={len(results)}条{cmt_suffix}"
+            f"免登发现候选帖={len(discovered_pairs)}条, 详情富化={enriched_hit_count}条 -> 保留={len(results)}条{cmt_suffix}"
         )
 
         if fetch_external_links and results:
@@ -1835,7 +1852,7 @@ class XHarvester(BasePlatformHarvester):
                 scene="search",
                 expect_comments=(fetch_comments and self.is_burner_usable and top_n_cmts > 0),
                 expect_media_download=download_media,
-                max_fresh_age_hours=max(168, hours_back * 2),
+                max_fresh_age_hours=max(168, (hours_back or 168) * 2),
             )
             results = [p for p in results if self.is_valuable_post(p)]
         return results
@@ -1901,17 +1918,23 @@ class XHarvester(BasePlatformHarvester):
                     continue
                 seen.add(rid)
                 parsed = self._convert_raw_tweet(node)
+                reply_txt = str(parsed["content"].get("text_content") or "").strip()
+                reply_imgs = (parsed.get("media") or {}).get("images") or []
+                # 【保留过滤原因说明】剔除评论区里「仅 @人名 圈人但无任何实质文字且无配图」的刷屏水评，避免浪费每帖前排神评名额。
+                stripped_mentions = re.sub(r"@[A-Za-z0-9_]+", "", reply_txt).strip()
+                if not stripped_mentions and not reply_imgs:
+                    continue
                 raw_replies.append({
                     "reply_id": rid,
                     "parent_id": str(post_id),
                     "create_time": parsed["publish_time"],
                     "author_uid": parsed["author"]["username"],
                     "author_name": parsed["author"]["author_name"],
-                    "content": parsed["content"]["text_content"],
+                    "content": reply_txt,
                     "likes": parsed["engagement"]["like_count"],
                     "replies": parsed["engagement"]["comment_count"],
                     "views": parsed["engagement"]["view_count"],
-                    "images": (parsed.get("media") or {}).get("images") or [],
+                    "images": reply_imgs,
                 })
             raw_replies.sort(key=lambda x: x["likes"], reverse=True)
             return self.normalize_comments(raw_replies[:max_comments], parent_post_id=str(post_id))
@@ -1932,21 +1955,18 @@ class XHarvester(BasePlatformHarvester):
             "WatcherGuru",
             "Dexerto",
             "wallstreetbets",
-            "MarioNawfal",
             "MorningBrew",
-            "StockMKTNewz",
+            "Barchart",
             "OpenAI",
             "CoinGlass_com",
-            "whale_alert",
-            "NoContextHumans",
             "WuBlockchain",
             "arkham",
         ]
         tweets_per_handle = safe_int(cfg.get("tweets_per_handle"), 5)
         include_home_feed = bool(cfg.get("include_home_feed", True))
         include_trending = bool(cfg.get("include_trending", True))
-        trending_topic_count = safe_int(cfg.get("trending_topic_count"), 5)
-        tweets_per_trend = safe_int(cfg.get("tweets_per_trend"), 5)
+        trending_topic_count = safe_int(cfg.get("trending_topic_count"), 25)
+        tweets_per_trend = safe_int(cfg.get("tweets_per_trend"), 3)
         list_id = cfg.get("list_id")
         top_n_for_comments = min(safe_int(cfg.get("fetch_comments_for_top_n"), 8), MAX_SAFE_COMMENT_POSTS_HARD_CAP)
         fetch_ext_links = bool(cfg.get("fetch_external_links", True))
@@ -1958,7 +1978,7 @@ class XHarvester(BasePlatformHarvester):
         # 1. 小号主页推荐流（每轮仅在健康可用时请求 1 次；若冷却中则静默跳过，绝不硬撞）
         if (include_home_feed or list_id) and self.is_burner_usable:
             feed_posts = self.fetch_hot_or_recommended(
-                count=safe_int(cfg.get("home_feed_count"), 30),
+                count=safe_int(cfg.get("home_feed_count"), 40),
                 list_id=list_id,
             )
             self.last_channel_stats["主页推荐流"] = len(feed_posts)
@@ -1966,33 +1986,35 @@ class XHarvester(BasePlatformHarvester):
                 if self.is_valuable_post(p):
                     collected_by_id[p["post_id"]] = p
 
-        # 2. 100% 免登全球/美国实时热搜榜 (`getdaytrends` / `trends24`) -> 免登穿透抓取热搜爆款推文
-        if include_trending and trending_topic_count > 0:
+        # 2. 100% 免登全球/美国实时热搜榜 (`getdaytrends` / `trends24`) -> 一次性并发穿透全部热搜词（无 8 词截断、无时间过滤）
+        if include_trending and trending_topic_count != 0:
             trends = self.fetch_trending_topics(limit=trending_topic_count)
             trend_names = [t["name"] for t in trends if t.get("name")]
             if trend_names:
-                trend_target_cnt = max(10, trending_topic_count * max(2, tweets_per_trend))
+                total_trend_target = max(15, len(trend_names) * max(2, tweets_per_trend))
                 trend_posts = self.search_or_topic_posts(
                     query="|".join(trend_names),
-                    count=trend_target_cnt,
-                    hours_back=48,
+                    count=total_trend_target,
+                    hours_back=0,
                     fetch_comments=False,
                     fetch_external_links=False,
                     download_media=False,
                     _reset_health=False,
                 )
-                self.last_channel_stats[f"实时热搜榜({len(trend_names)}词)"] = len(trend_posts)
+                trend_added = 0
                 for tp in trend_posts:
                     if self.is_valuable_post(tp):
                         collected_by_id[tp["post_id"]] = tp
+                        trend_added += 1
+                self.last_channel_stats[f"实时热搜榜({len(trend_names)}词)"] = trend_added
             else:
                 self.last_channel_stats["实时热搜榜"] = 0
 
-        # 3. 100% 免登核心垂直大 V 实时时间线（Guest Token + Chrome TLS，不消耗小号配额）
+        # 3. 100% 免登核心垂直大 V 实时时间线（Guest Token + Chrome TLS，不消耗小号配额，不做人为时间丢弃）
         zero_kols: List[str] = []
         for handle in handles:
             clean_h = str(handle).lstrip("@").strip()
-            posts = self.fetch_user_posts(clean_h, count=tweets_per_handle, force_burner=False, max_age_hours=168)
+            posts = self.fetch_user_posts(clean_h, count=tweets_per_handle, force_burner=False)
             self.last_channel_stats[f"@{clean_h}"] = len(posts)
             if not posts:
                 zero_kols.append(f"@{clean_h}")

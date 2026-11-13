@@ -294,6 +294,9 @@ def fetch_external_article(
         article_text = clean_post_text(extractor.og_description)
 
     title = clean_post_text(extractor.og_title or "".join(extractor.page_title_parts))
+    # 【保留过滤原因说明】外链无效页剔除与超长正文截断：
+    # 1) 少于 200 字符的网页通常为登录弹窗、Cookie 同意页、跳转短链或 403/404 拦截壳，非有效新闻正文，直接跳过避免污染原帖；
+    # 2) 单篇外链最多保留 15000 字符（约合数千词深度长文），防止偶发抓取到巨型 API 文档/日志页面撑爆单帖存储与下游上下文。
     if len(article_text) < 200:
         return None
     if _looks_like_blocked_or_error_page(title, article_text):
