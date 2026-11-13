@@ -95,7 +95,7 @@ COLLECTOR_DEFAULTS: Dict[str, Any] = {
     "continuous_loop": False,           # 单独运行 x_browser_collector.py 时：False=拉取一轮即退出；True=常驻定时拉取
     "interval_seconds": 3600,           # 单独开启常驻拉取时的基础间隔秒数
     "jitter_seconds": (120, 600),       # 随机正抖动秒数
-    "browser_visible": False,           # False=真实桌面Chrome移至屏幕外静默运行；True=显示窗口
+    "browser_visible": False,           # False=启用Chrome新版--headless=new真无头(保留显卡指纹+零桌面窗口+零抢焦点)；True=显示窗口
     "home_scroll_rounds": 4,            # 首页 For You 拟人慢速滚屏次数（顺路收集大V热帖）
     "thread_clicks_per_run": 3,         # 顺路点开几条英/日热帖看评论区（顺便收热评 + 发现评论区小蓝V）
     "profile_visits_per_run": 6,        # 顺路点进几个 100~3000 粉蓝 V 主页收集原创主帖

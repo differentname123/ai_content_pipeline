@@ -27,7 +27,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
 from app.ai_api.antigravity_client import (
     DEFAULT_QUEUE_TIMEOUT_SECONDS as ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS,
@@ -93,7 +93,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-aistudio-3.5-flash", "权重": 0, "备注": "来源aistudio_web"},
 
-    {"model_name": "gpt-5.6-terra-max", "权重": 2, "备注": "来源codex 免费"},
+    {"model_name": "gpt-6-codex-luna-max", "权重": 2, "备注": "来源codex 免费"},
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
@@ -684,12 +684,17 @@ def generate_content(
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
                     is_queue_busy = isinstance(exc, AntigravityQueueBusyError)
+                    is_upstream_timeout = isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
                     if is_queue_busy and has_non_ag_after:
                         antigravity_pool_busy = True
                         fast_switch_model = True
                         next_non_ag = next(m for m in models[model_index + 1:] if m not in ANTIGRAVITY_MODEL_ALIASES)
                         terminal = False
                         action = f"本地槽位繁忙(排队>{ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS:g}s)，0延迟立即切换模型 {next_non_ag}"
+                    elif is_upstream_timeout and model_index < len(models) - 1:
+                        fast_switch_model = True
+                        terminal = False
+                        action = f"当前模型连接/响应超时，0延迟立即切换备用模型 {models[model_index + 1]}"
                     else:
                         terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                         if attempt < max_retries_per_model:

@@ -419,6 +419,7 @@ def _execute_comprehension_batch(
     run_id: str,
     fail_counts_map: Optional[Dict[str, int]] = None,
     log_prefix: str = "Step2",
+    db: Optional[PipelineDB] = None,
 ) -> List[Dict[str, Any]]:
     logger = get_pipeline_logger()
     digests: List[Dict[str, Any]] = []
@@ -427,6 +428,7 @@ def _execute_comprehension_batch(
 
     fc_lookup = fail_counts_map or {}
     workers = max(1, min(int(cfg.get("concurrency", 12)), len(pending_posts)))
+    unflushed: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         fut_map = {
             pool.submit(
@@ -442,7 +444,11 @@ def _execute_comprehension_batch(
         for idx, fut in enumerate(as_completed(fut_map), 1):
             rec = fut.result()
             digests.append(rec)
+            unflushed.append(rec)
             if idx % 10 == 0 or idx == len(pending_posts):
+                if db is not None and unflushed:
+                    db.upsert_digests(unflushed)
+                    unflushed.clear()
                 ok_so_far = sum(1 for d in digests if d["status"] == "ok")
                 usable_so_far = sum(1 for d in digests if d.get("is_usable"))
                 logger.info(
@@ -541,6 +547,7 @@ def comprehend_posts_by_keys(
             run_id=run_id,
             fail_counts_map=fail_counts_map,
             log_prefix="Step2/定向",
+            db=db,
         )
         db.upsert_digests(new_digests)
 
@@ -625,6 +632,7 @@ def run_step2_comprehension(
         run_id=run_id,
         fail_counts_map=fail_counts_map,
         log_prefix="Step2",
+        db=db,
     )
     if digests:
         db.upsert_digests(digests)

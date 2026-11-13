@@ -66,18 +66,86 @@ _X_UNDETERMINED_LANGS = {"", "unknown", "und", "qme", "qam", "zxx", "art"}
 
 
 def build_real_chrome_launch_options(browser_visible: bool = False) -> Tuple[List[str], Optional[Dict[str, int]]]:
-    """构造真实桌面 Chrome 启动参数（保留硬件 GPU 指纹；静默模式仅将窗口移出可视区）。"""
+    """
+    构造真实桌面 Chrome 启动参数：
+    - `browser_visible=False`（默认）：启用现代 Chrome `--headless=new` 原生无头引擎（不传 `--disable-gpu`，
+      100% 保留本机真实物理显卡 D3D11 WebGL 指纹，同时不创建任何系统桌面窗口、零任务栏图标、100% 零焦点抢占）；
+    - `browser_visible=True`：显示正常最大化窗口便于人工观察。
+    """
     args = [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-infobars",
         "--disable-dev-shm-usage",
+        "--mute-audio",
     ]
     if browser_visible:
         args.append("--start-maximized")
         return args, None
-    args.extend(["--window-position=-32000,-32000", "--window-size=1440,900"])
+    args.extend(
+        [
+            "--headless=new",
+            "--window-size=1440,900",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+        ]
+    )
     return args, {"width": 1440, "height": 900}
+
+
+def apply_stealth_headless_emulation(context: Any, page: Any, browser_visible: bool = False) -> Optional[Any]:
+    """
+    在 `--headless=new` 模式下，于导航前通过 CDP 将默认 `HeadlessChrome/<ver>` 动态还原为本机真实 `Chrome/<ver>`，
+    同步对齐 HTTP `User-Agent`、`Sec-CH-UA*` 请求头与 `navigator.userAgentData`，返回需保持存活的 CDP 会话对象。
+    """
+    if browser_visible:
+        return None
+    try:
+        raw_ua = str(page.evaluate("() => navigator.userAgent") or "")
+        clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/")
+        m_ver = re.search(r"Chrome/([\d.]+)", clean_ua)
+        ver_full = m_ver.group(1) if m_ver else "135.0.0.0"
+        ver_major = ver_full.split(".", 1)[0]
+
+        if sys.platform == "darwin":
+            nav_platform, ch_platform, ch_platform_ver, arch = "MacIntel", "macOS", "14.5.0", "arm"
+        elif sys.platform.startswith("linux"):
+            nav_platform, ch_platform, ch_platform_ver, arch = "Linux x86_64", "Linux", "6.8.0", "x86"
+        else:
+            nav_platform, ch_platform, ch_platform_ver, arch = "Win32", "Windows", "15.0.0", "x86"
+
+        cdp = context.new_cdp_session(page)
+        cdp.send(
+            "Emulation.setUserAgentOverride",
+            {
+                "userAgent": clean_ua,
+                "platform": nav_platform,
+                "userAgentMetadata": {
+                    "brands": [
+                        {"brand": "Google Chrome", "version": ver_major},
+                        {"brand": "Not-A.Brand", "version": "8"},
+                        {"brand": "Chromium", "version": ver_major},
+                    ],
+                    "fullVersionList": [
+                        {"brand": "Google Chrome", "version": ver_full},
+                        {"brand": "Not-A.Brand", "version": "8.0.0.0"},
+                        {"brand": "Chromium", "version": ver_full},
+                    ],
+                    "fullVersion": ver_full,
+                    "platform": ch_platform,
+                    "platformVersion": ch_platform_ver,
+                    "architecture": arch,
+                    "model": "",
+                    "mobile": False,
+                    "bitness": "64",
+                    "wow64": False,
+                },
+            },
+        )
+        return cdp
+    except Exception:
+        return None
 
 
 def _clean_x_text_with_entities(raw_text: str, legacy: Dict[str, Any]) -> str:
@@ -832,6 +900,7 @@ def collect_posts_via_browser(
                         except Exception:
                             pass
 
+                _stealth_cdp = apply_stealth_headless_emulation(context, page, browser_visible=browser_visible)
                 page.on("response", sniffer.on_response)
                 install_overlay_guard(page)
 

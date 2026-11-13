@@ -60,6 +60,7 @@ from x_growth.growth_config import (
 from x_growth.x_browser_collector import (
     X_HOME_URL,
     XPassiveGraphQLSniffer,
+    apply_stealth_headless_emulation,
     build_real_chrome_launch_options,
     extract_logged_in_identity,
     inspect_x_page_account_status,
@@ -338,6 +339,7 @@ def publish_comments_from_db(
                         except Exception:
                             pass
 
+                _stealth_cdp = apply_stealth_headless_emulation(context, page, browser_visible=browser_visible)
                 page.on("response", sniffer.on_response)
                 install_overlay_guard(page)
 
