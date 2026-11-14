@@ -37,6 +37,7 @@ from common.common_utils import (
     clean_post_text,
     create_standard_post_schema,
     download_web_media,
+    get_config,
     get_media_save_dir,
     get_requests_proxies,
     get_runtime_file_path,
@@ -54,7 +55,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 全局常量配置（统一从 common_utils 获取代理与目录）
+# 全局常量与可插拔多账号配置（优先读取 config/config.json）
 # ============================================================
 PROXIES = get_requests_proxies() or {}
 REQUEST_TIMEOUT = 15
@@ -62,6 +63,13 @@ MAX_RETRIES = 3
 MAX_WORKERS = 10
 
 DEFAULT_SCREEN_NAME = "2434954452qqc"
+DEFAULT_ACCOUNT_CONFIG_MAP = {
+    "dahao": ("x_dahao_screen_name", "2434954452qqc"),
+    "myself": ("x_myself_screen_name", "peterzhu1003"),
+}
+DEFAULT_FETCH_ACCOUNTS = ["dahao", "myself"]
+DEFAULT_PROMPT_ACCOUNTS = ["dahao", "myself"]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_SAVE_DIR = get_media_save_dir()
 
@@ -80,18 +88,21 @@ DEFAULT_UA = (
 _CASHTAG_RE = re.compile(r"\$([A-Za-z]{2,10})\b")
 _HASHTAG_RE = re.compile(r"#([^\s#]+)")
 _TCO_URL_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
+_TWEET_ID_RE = re.compile(r"(?:status/)?(\d{15,22})")
 
 TZ_CN = timezone(timedelta(hours=8))
 _safe_int = safe_int
 
 
 def get_standard_schema():
-    """获取与币安广场 / OKX Orbit 100% 兼容的通用帖子 Schema，额外扩展 X 专属收藏与互动率指标"""
+    """获取与币安广场 / OKX Orbit 100% 兼容的通用帖子 Schema，额外扩展 X 专属收藏、互动率与账号归属标识"""
     schema = create_standard_post_schema(source=PLATFORM_X, card_type="BUZZ_SHORT")
     schema["publish_time_str"] = ""
     schema["metadata"].update({
         "lang": None,
         "replying_to": None,
+        "account_alias": None,
+        "account_screen_name": None,
     })
     schema["author"]["followers_count"] = 0
     schema["content"]["text_length"] = 0
@@ -110,6 +121,28 @@ def _clean_text(raw):
     return clean_post_text(cleaned)
 
 
+def _clean_screen_name(name):
+    return str(name or "").lstrip("@").strip()
+
+
+def _extract_tweet_id(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.isdigit() and 15 <= len(text) <= 22:
+        return text
+    m = _TWEET_ID_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def _is_forbidden_myself_dir(path_str):
+    """物理隔离守卫：采集与缓存探测绝不允许读取或触碰主号目录 `x_myself`。"""
+    if not path_str:
+        return False
+    norm = os.path.normcase(os.path.abspath(str(path_str).strip()))
+    return "x_myself" in norm
+
+
 def _parse_cookie_dict(cookies_str):
     cookie_dict = {}
     if not cookies_str:
@@ -119,6 +152,155 @@ def _parse_cookie_dict(cookies_str):
             k, v = part.strip().split("=", 1)
             cookie_dict[k.strip()] = v.strip()
     return cookie_dict
+
+
+def get_configured_x_account_registry():
+    """
+    读取可配置的监控账号别名映射 `{alias: clean_screen_name}`：
+    1) 自动加载 config/config.json 中的 x_dahao_screen_name / x_myself_screen_name；
+    2) 自动合并可选的 x_monitor_accounts 扩展映射，支持随时增删任意监控号。
+    """
+    registry = {}
+    for alias, (cfg_key, fallback_name) in DEFAULT_ACCOUNT_CONFIG_MAP.items():
+        try:
+            raw_val = get_config(cfg_key, default=fallback_name)
+        except Exception:
+            raw_val = fallback_name
+        clean_sn = _clean_screen_name(raw_val or fallback_name)
+        if clean_sn:
+            registry[alias.lower()] = clean_sn
+
+    try:
+        extra_cfg = get_config("x_monitor_accounts", default=None)
+    except Exception:
+        extra_cfg = None
+
+    if isinstance(extra_cfg, dict):
+        for k, v in extra_cfg.items():
+            alias = str(k or "").strip().lower()
+            clean_sn = _clean_screen_name(v)
+            if alias and clean_sn:
+                registry[alias] = clean_sn
+    elif isinstance(extra_cfg, list):
+        for item in extra_cfg:
+            if isinstance(item, dict):
+                alias = str(item.get("alias") or "").strip().lower()
+                clean_sn = _clean_screen_name(item.get("screen_name"))
+                if clean_sn:
+                    registry[alias or clean_sn.lower()] = clean_sn
+            else:
+                clean_sn = _clean_screen_name(item)
+                if clean_sn:
+                    registry.setdefault(clean_sn.lower(), clean_sn)
+
+    return registry
+
+
+def get_configured_fetch_accounts():
+    """读取配置中要无登录拉取维护的账号列表（支持别名或 @handle）。"""
+    try:
+        cfg_val = get_config("x_fetch_accounts", default=DEFAULT_FETCH_ACCOUNTS)
+    except Exception:
+        cfg_val = DEFAULT_FETCH_ACCOUNTS
+    return list(cfg_val) if isinstance(cfg_val, (list, tuple)) else [cfg_val]
+
+
+def get_configured_prompt_accounts():
+    """读取配置中要组合拼入提示词的账号列表（支持别名或 @handle）。"""
+    try:
+        cfg_val = get_config("x_prompt_accounts", default=DEFAULT_PROMPT_ACCOUNTS)
+    except Exception:
+        cfg_val = DEFAULT_PROMPT_ACCOUNTS
+    return list(cfg_val) if isinstance(cfg_val, (list, tuple)) else [cfg_val]
+
+
+def resolve_x_accounts(accounts=None, default_accounts=None):
+    """
+    将任意形态的账号入参归一化为去重后的标准列表 `[{"alias": ..., "screen_name": ...}]`。
+    支持传入：
+    - None：读取 default_accounts 或 config.json 中的 x_fetch_accounts；
+    - str：单个别名（如 "myself"）或用户名（如 "@peterzhu1003"）；
+    - list/tuple：别名、用户名、或 {"alias": ..., "screen_name": ...} 混合列表；
+    - dict：{"dahao": "2434954452qqc", "myself": "peterzhu1003"}。
+    """
+    registry = get_configured_x_account_registry()
+    reverse_registry = {sn.lower(): alias for alias, sn in registry.items()}
+
+    if accounts is None:
+        raw_items = default_accounts if default_accounts is not None else get_configured_fetch_accounts()
+    elif isinstance(accounts, dict):
+        if "screen_name" in accounts:
+            raw_items = [accounts]
+        else:
+            raw_items = [{"alias": k, "screen_name": v} for k, v in accounts.items()]
+    elif isinstance(accounts, str):
+        raw_items = [accounts]
+    else:
+        raw_items = list(accounts)
+
+    resolved = []
+    seen_handles = set()
+    for item in raw_items:
+        alias = ""
+        raw_handle = ""
+        if isinstance(item, dict):
+            alias = str(item.get("alias") or "").strip()
+            raw_handle = item.get("screen_name") or ""
+        else:
+            token = str(item or "").strip()
+            if not token:
+                continue
+            token_low = token.lstrip("@").lower()
+            if not token.startswith("@") and token_low in registry:
+                alias = token_low
+                raw_handle = registry[token_low]
+            else:
+                raw_handle = token
+
+        clean_sn = _clean_screen_name(raw_handle)
+        if not clean_sn:
+            continue
+        sn_low = clean_sn.lower()
+        if sn_low in seen_handles:
+            continue
+        seen_handles.add(sn_low)
+        final_alias = alias or reverse_registry.get(sn_low) or clean_sn
+        resolved.append({"alias": final_alias, "screen_name": clean_sn})
+
+    return resolved
+
+
+def _get_post_account_identity(post):
+    """提取帖子的规范化账号归属 `(alias, screen_name, display_label)`。"""
+    meta = (post or {}).get("metadata") or {}
+    author = (post or {}).get("author") or {}
+    sn = _clean_screen_name(meta.get("account_screen_name") or author.get("username") or "")
+    alias = str(meta.get("account_alias") or "").strip()
+    if not alias and sn:
+        registry = get_configured_x_account_registry()
+        reverse_registry = {v.lower(): k for k, v in registry.items()}
+        alias = reverse_registry.get(sn.lower(), "")
+
+    if alias and sn and alias.lower() != sn.lower():
+        label = f"{alias}(@{sn})"
+    elif sn:
+        label = f"@{sn}"
+    else:
+        label = alias or "unknown"
+    return alias, sn, label
+
+
+def _get_post_account_summary(post):
+    """提取客观账号信息 `(account_label, author_name, followers, objective_header)`。"""
+    author = (post or {}).get("author") or {}
+    _, _, account_label = _get_post_account_identity(post)
+    author_name = str(author.get("author_name") or "").strip()
+    followers = _safe_int(author.get("followers_count"), 0)
+    parts = [f"账号: {account_label}"]
+    if author_name:
+        parts.append(f"名称: {author_name}")
+    parts.append(f"粉丝={followers}")
+    return account_label, author_name, followers, " | ".join(parts)
 
 
 # ============================================================
@@ -231,7 +413,8 @@ def _discover_tweet_ids_from_local_browsers(screen_name):
     pattern = re.compile(rf"{re.escape(clean_name)}/status/(\d{{15,22}})", re.IGNORECASE)
 
     for root in roots:
-        if not os.path.isdir(root):
+        # 【保留过滤原因说明】严禁采集逻辑读取或触碰主号浏览器目录 `x_myself`（遵守主号物理隔离红线）。
+        if _is_forbidden_myself_dir(root) or not os.path.isdir(root):
             continue
         for sub in ["", "Default", "Profile 1", "Profile 2", "Profile 3"]:
             prof_dir = os.path.join(root, sub) if sub else root
@@ -317,6 +500,10 @@ def extract_domain_cookies_from_user_data_dir(
     3) 需要提取时统一复用 `_launch_persistent(..., debug=False)` 独占锁与无头模式，零弹窗闪烁、零并发锁冲突。
     """
     if not user_data_dir or not os.path.isdir(user_data_dir) or not urls:
+        return ""
+    # 【保留过滤原因说明】严禁采集代码读取主号浏览器目录 `x_myself` 的登录态 Cookie（主号物理隔离红线）。
+    if _is_forbidden_myself_dir(user_data_dir):
+        logger.warning(f"[凭证提取] 检测到尝试读取主号目录 <{user_data_dir}>，已物理拦截并返回空凭证")
         return ""
     cookie_mtime = _get_chromium_cookie_db_mtime(user_data_dir)
     if cookie_mtime <= 0.0:
@@ -507,12 +694,42 @@ def fetch_x_tweets_via_graphql(user_rest_id, cookies, count=100, include_replies
     return discovered_ids[:count]
 
 
+def _tag_posts_account_metadata(posts, account_alias="", screen_name=""):
+    """为帖子列表补齐统一的账号归属元数据（account_alias / account_screen_name），便于跨号拼接分析。"""
+    registry = get_configured_x_account_registry()
+    reverse_registry = {sn.lower(): alias for alias, sn in registry.items()}
+    clean_fallback_sn = _clean_screen_name(screen_name)
+
+    tagged = []
+    for p in posts or []:
+        if not isinstance(p, dict):
+            continue
+        author = p.setdefault("author", {})
+        meta = p.setdefault("metadata", {})
+        sn = _clean_screen_name(meta.get("account_screen_name") or author.get("username") or clean_fallback_sn)
+        alias = str(account_alias or meta.get("account_alias") or "").strip()
+        if not alias and sn:
+            alias = reverse_registry.get(sn.lower(), sn)
+        if sn:
+            meta["account_screen_name"] = sn
+            if not author.get("username"):
+                author["username"] = sn
+        if alias:
+            meta["account_alias"] = alias
+        tagged.append(p)
+    return tagged
+
+
 # ============================================================
 # 4. 数据清洗：转换为通用标准 Schema
 # ============================================================
-def clean_x_posts(raw_tweets):
-    """将 fxtwitter 返回的原始 tweet 字典列表清洗为统一的 get_standard_schema() 格式"""
+def clean_x_posts(raw_tweets, default_screen_name=None, account_alias=None, fallback_followers=0):
+    """将 fxtwitter 返回的原始 tweet 字典列表清洗为统一的 get_standard_schema() 格式，并附带账号归属标识"""
     cleaned_list = []
+    registry = get_configured_x_account_registry()
+    reverse_registry = {sn.lower(): alias for alias, sn in registry.items()}
+    fallback_sn = _clean_screen_name(default_screen_name) or DEFAULT_SCREEN_NAME
+    fallback_fol_int = _safe_int(fallback_followers, 0)
 
     for tw in raw_tweets:
         if not isinstance(tw, dict):
@@ -523,7 +740,9 @@ def clean_x_posts(raw_tweets):
 
         item = get_standard_schema()
         author = tw.get("author") or {}
-        screen_name = author.get("screen_name") or DEFAULT_SCREEN_NAME
+        screen_name = _clean_screen_name(author.get("screen_name")) or fallback_sn
+        resolved_alias = str(account_alias or "").strip() or reverse_registry.get(screen_name.lower()) or screen_name
+
         ts = _safe_int(tw.get("created_timestamp"), 0)
         dt_str = (
             datetime.fromtimestamp(ts, TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
@@ -566,12 +785,14 @@ def clean_x_posts(raw_tweets):
             "is_ai_generated": False,
             "lang": tw.get("lang"),
             "replying_to": tw.get("replying_to"),
+            "account_alias": resolved_alias,
+            "account_screen_name": screen_name,
         })
         item["author"].update({
             "username": screen_name,
             "author_name": author.get("name") or screen_name,
             "is_verified": bool(author.get("verification") or author.get("verified")),
-            "followers_count": _safe_int(author.get("followers"), 0),
+            "followers_count": _safe_int(author.get("followers"), 0) or fallback_fol_int,
         })
 
         raw_text = tw.get("text") or ""
@@ -616,10 +837,10 @@ def clean_x_posts(raw_tweets):
 
 
 # ============================================================
-# 5. 导出 CSV 报表与一键拉取主入口
+# 5. 导出 CSV 报表、单账号拉取与可插拔多账号拼接维护
 # ============================================================
 def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
-    """将清洗后的 X 帖子列表导出为带 UTF-8-SIG BOM 头的 CSV 文件"""
+    """将清洗后的 X 帖子列表导出为带 UTF-8-SIG BOM 头的 CSV 文件（含发布账号标识）"""
     if not posts:
         logger.warning("[X平台/报表导出] 帖子列表为空，跳过 CSV 导出")
         return None
@@ -634,6 +855,7 @@ def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
 
     headers = [
         "排名",
+        "发布账号",
         "帖子ID",
         "发布时间(北京时间)",
         "浏览量(Views)",
@@ -663,8 +885,10 @@ def export_x_posts_to_csv(posts, csv_path, sort_by="views"):
             med = p.get("media") or {}
             meta = p.get("metadata") or {}
             imgs = med.get("images") or []
+            _, _, account_label = _get_post_account_identity(p)
             writer.writerow([
                 idx,
+                account_label,
                 f"'{p.get('post_id')}",
                 p.get("publish_time_str", ""),
                 eng.get("view_count", 0),
@@ -700,10 +924,19 @@ def fetch_x_user_posts(
     save_csv_path=None,
     save_json_path=None,
     sort_by="views",
+    account_alias=None,
 ):
-    """一键拉取指定 X 账号的帖子内容与实时数据表现"""
+    """无登录优先一键拉取指定 X 账号的帖子内容与实时数据表现（单账号原子能力）"""
     started = time.monotonic()
-    clean_name = str(screen_name).lstrip("@").strip()
+    specs = resolve_x_accounts(screen_name)
+    clean_name = specs[0]["screen_name"] if specs else _clean_screen_name(screen_name)
+    resolved_alias = str(account_alias or (specs[0]["alias"] if specs else "") or clean_name).strip()
+
+    if user_data_dir and _is_forbidden_myself_dir(user_data_dir):
+        logger.warning(
+            f"[X平台/安全隔离] 检测到传入主号目录 <{user_data_dir}>，已物理拦截并自动切换纯无登录模式"
+        )
+        user_data_dir = None
 
     profile = fetch_x_user_profile(clean_name)
     user_rest_id = profile.get("id")
@@ -714,13 +947,19 @@ def fetch_x_user_posts(
         try:
             loaded = read_json(cache_path)
             if isinstance(loaded, list):
-                cached_ids.update(str(x) for x in loaded if x)
+                for x in loaded:
+                    tid = _extract_tweet_id(x)
+                    if tid:
+                        cached_ids.add(tid)
         except Exception:
             pass
 
     candidate_ids = set(cached_ids)
     if extra_tweet_ids:
-        candidate_ids.update(str(x) for x in extra_tweet_ids if x)
+        for x in extra_tweet_ids:
+            tid = _extract_tweet_id(x)
+            if tid:
+                candidate_ids.add(tid)
 
     if not cookies and user_data_dir:
         cookies = extract_x_cookies_from_user_data_dir(user_data_dir)
@@ -748,7 +987,7 @@ def fetch_x_user_posts(
     )
 
     logger.info(
-        f"[X平台/候选探测] 候选帖子 ID 汇总完成 | 账号: [@{clean_name}] | 本地缓存: [{len(cached_ids)}] "
+        f"[X平台/候选探测] 候选帖子 ID 汇总完成 | 账号: [{resolved_alias}(@{clean_name})] | 本地缓存: [{len(cached_ids)}] "
         f"| 主页SSR: [{len(ssr_ids)}] | 浏览器历史: [{len(hist_ids)}] | 去重待拉取: [{len(valid_candidate_ids)}]"
     )
 
@@ -780,7 +1019,12 @@ def fetch_x_user_posts(
     updated_cache_ids = sorted(cached_ids | verified_author_ids, key=lambda x: int(x), reverse=True)
     save_json(cache_path, updated_cache_ids)
 
-    cleaned_posts = clean_x_posts(raw_tweets)
+    cleaned_posts = clean_x_posts(
+        raw_tweets,
+        default_screen_name=clean_name,
+        account_alias=resolved_alias,
+        fallback_followers=_safe_int(profile.get("followers"), 0),
+    )
     if sort_by == "views":
         cleaned_posts.sort(key=lambda x: x["engagement"]["view_count"], reverse=True)
     else:
@@ -823,7 +1067,7 @@ def fetch_x_user_posts(
     avg_views = total_views / len(cleaned_posts) if cleaned_posts else 0
 
     logger.info(
-        f"[X平台/采集汇总] 账号帖子与互动数据采集完成 | 账号: [@{clean_name}] | 原创帖: [{len(cleaned_posts)}] "
+        f"[X平台/采集汇总] 账号帖子与互动数据采集完成 | 账号: [{resolved_alias}(@{clean_name})] | 原创帖: [{len(cleaned_posts)}] "
         f"| 总浏览: [{total_views:,}] | 篇均浏览: [{avg_views:,.1f}] "
         f"| 点赞/评论/转发/收藏: [{total_likes}/{total_replies}/{total_shares}/{total_bookmarks}] "
         f"| 耗时: [{time.monotonic() - started:.2f}s]"
@@ -832,8 +1076,156 @@ def fetch_x_user_posts(
     return cleaned_posts
 
 
+def load_cached_x_posts(accounts=None, sort_by="time"):
+    """直接从本地缓存 JSON 读取指定账号列表的历史帖子（不发起网络请求），并自动补全账号标识"""
+    specs = resolve_x_accounts(accounts, default_accounts=get_configured_fetch_accounts())
+    posts_by_account = {}
+
+    for spec in specs:
+        clean_name = spec["screen_name"]
+        alias = spec["alias"]
+        json_path = get_runtime_file_path(
+            f"x_posts_{clean_name}.json",
+            legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.json",
+        )
+        posts = []
+        if os.path.exists(json_path):
+            try:
+                loaded = read_json(json_path)
+                if isinstance(loaded, list):
+                    posts = _tag_posts_account_metadata(loaded, account_alias=alias, screen_name=clean_name)
+            except Exception as e:
+                logger.warning(f"[X平台/缓存读取] 读取缓存失败 | 账号: [@{clean_name}] | 原因: [{e}]")
+
+        if sort_by == "views":
+            posts.sort(key=lambda x: (x.get("engagement") or {}).get("view_count", 0), reverse=True)
+        else:
+            posts.sort(key=lambda x: x.get("publish_time", 0), reverse=True)
+        posts_by_account[clean_name] = posts
+
+    return posts_by_account
+
+
+def merge_x_account_posts(
+    posts_source,
+    accounts=None,
+    total_count=None,
+    sort_by="time",
+):
+    """
+    可拔插账号数据拼接器：
+    - 支持传入 `fetch_multi_x_user_posts` / `load_cached_x_posts` 返回的 `{screen_name: posts}` 字典或扁平帖子列表；
+    - 支持通过 `accounts` 自由挑选要组合哪些账号（传别名如 ["dahao", "myself"] 或 @handle）；
+    - 不做按号配额均衡与题材过滤，直接按时间（或浏览量）全局排序并截取 `total_count` 条客观历史记录。
+    """
+    selected_specs = resolve_x_accounts(accounts, default_accounts=get_configured_prompt_accounts()) if accounts is not None else []
+    selected_sn_set = {s["screen_name"].lower() for s in selected_specs}
+    alias_by_sn = {s["screen_name"].lower(): s["alias"] for s in selected_specs}
+    total_cap = int(total_count) if (total_count and int(total_count) > 0) else 0
+
+    buckets = []
+    if isinstance(posts_source, dict):
+        if selected_specs:
+            lower_map = {_clean_screen_name(k).lower(): v for k, v in posts_source.items()}
+            for spec in selected_specs:
+                sn_low = spec["screen_name"].lower()
+                raw_posts = lower_map.get(sn_low)
+                if raw_posts is None:
+                    raw_posts = lower_map.get(spec["alias"].lower()) or []
+                buckets.append((spec["alias"], spec["screen_name"], raw_posts))
+        else:
+            for key, raw_posts in posts_source.items():
+                sn_clean = _clean_screen_name(key)
+                buckets.append((alias_by_sn.get(sn_clean.lower(), ""), sn_clean, raw_posts or []))
+    elif isinstance(posts_source, list):
+        for p in _tag_posts_account_metadata(posts_source):
+            _, sn, _ = _get_post_account_identity(p)
+            sn_low = sn.lower()
+            if selected_sn_set and sn_low not in selected_sn_set:
+                continue
+            buckets.append((alias_by_sn.get(sn_low, ""), sn, [p]))
+
+    merged = []
+    seen_keys = set()
+    for alias, sn, raw_posts in buckets:
+        for p in _tag_posts_account_metadata(list(raw_posts), account_alias=alias, screen_name=sn):
+            _, p_sn, _ = _get_post_account_identity(p)
+            dedup_key = (p_sn.lower(), str(p.get("post_id") or ""))
+            if dedup_key[1] and dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                merged.append(p)
+
+    if sort_by == "views":
+        merged.sort(key=lambda x: (x.get("engagement") or {}).get("view_count", 0), reverse=True)
+    else:
+        merged.sort(key=lambda x: x.get("publish_time", 0), reverse=True)
+
+    if total_cap > 0:
+        merged = merged[:total_cap]
+    return merged
+
+
+def fetch_multi_x_user_posts(
+    accounts=None,
+    count=200,
+    include_replies=False,
+    download_media=False,
+    sort_by="time",
+    extra_tweet_ids_by_account=None,
+    save_merged_json_path=None,
+    save_merged_csv_path=None,
+):
+    """
+    批量无登录拉取并维护多账号 X 帖子数据（返回 `{screen_name: posts}`）：
+    - `accounts` 支持传别名（["dahao", "myself"]）、@handle 或留空读取 config.json 的 x_fetch_accounts；
+    - 各账号独立增量维护各自的 `x_known_ids_{handle}.json` / `x_posts_{handle}.json` / `.csv`；
+    - 多于 1 个账号时自动额外落盘合并总表 `x_posts_merged.json` / `.csv`（传 `""` 或 `False` 可关闭）。
+    """
+    specs = resolve_x_accounts(accounts, default_accounts=get_configured_fetch_accounts())
+    extra_map = {}
+    if isinstance(extra_tweet_ids_by_account, dict):
+        for k, v in extra_tweet_ids_by_account.items():
+            extra_map[_clean_screen_name(k).lower()] = v
+
+    posts_by_account = {}
+    for spec in specs:
+        clean_name = spec["screen_name"]
+        alias = spec["alias"]
+        extra_ids = extra_map.get(clean_name.lower()) or extra_map.get(alias.lower())
+        try:
+            posts_by_account[clean_name] = fetch_x_user_posts(
+                screen_name=clean_name,
+                count=count,
+                cookies="",
+                user_data_dir=None,
+                extra_tweet_ids=extra_ids,
+                include_replies=include_replies,
+                download_media=download_media,
+                sort_by=sort_by,
+                account_alias=alias,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[X平台/多号采集] 拉取账号失败已跳过 | 账号: [{alias}(@{clean_name})] | 原因: [{e}]"
+            )
+            posts_by_account[clean_name] = []
+
+    if len(specs) > 1 or save_merged_json_path or save_merged_csv_path:
+        merged_posts = merge_x_account_posts(posts_by_account, accounts=specs, sort_by=sort_by)
+        if save_merged_json_path is None and len(specs) > 1:
+            save_merged_json_path = get_runtime_file_path("x_posts_merged.json")
+        if save_merged_csv_path is None and len(specs) > 1:
+            save_merged_csv_path = get_runtime_file_path("x_posts_merged.csv")
+        if save_merged_json_path:
+            save_json(save_merged_json_path, merged_posts)
+        if save_merged_csv_path and merged_posts:
+            export_x_posts_to_csv(merged_posts, save_merged_csv_path, sort_by=sort_by)
+
+    return posts_by_account
+
+
 def print_x_posts_summary_table(posts, top_n=None, show_full_text=True):
-    """在终端直观打印帖子表现与完整文案"""
+    """在终端直观打印帖子表现与完整文案（含客观账号名称与粉丝信息）"""
     if not posts:
         print("暂无帖子数据。")
         return
@@ -846,13 +1238,15 @@ def print_x_posts_summary_table(posts, top_n=None, show_full_text=True):
         eng = p["engagement"]
         cnt = p["content"]
         imgs = p["media"]["images"]
+        _, _, _, account_header = _get_post_account_summary(p)
         coins_str = ", ".join(f"${c}" for c in (cnt.get("mentioned_coins") or [])) or "无"
         text_body = cnt.get("text_content") or ""
         if not show_full_text:
             text_body = text_body.replace("\n", " ")[:60] + "..."
 
         print(
-            f"【#{idx:02d}】发布时间: {p['publish_time_str']} | ID: {p['post_id']} | 链接: {p['metadata']['url']}\n"
+            f"【#{idx:02d}】{account_header} | "
+            f"发布时间: {p['publish_time_str']} | ID: {p['post_id']} | 链接: {p['metadata']['url']}\n"
             f" 📊 数据表现: 浏览={eng['view_count']:,} | 点赞={eng['like_count']} | 评论={eng['comment_count']} | "
             f"转发={eng['share_count']} | 收藏={eng['bookmark_count']} | 互动率={eng['engagement_rate_pct']:.2f}% | "
             f"配图={len(imgs)}张 | 字数={cnt['text_length']} | 币种={coins_str}\n"
@@ -864,44 +1258,63 @@ def print_x_posts_summary_table(posts, top_n=None, show_full_text=True):
 DEFAULT_X_PROMPT_TEMPLATE_PATH = str(PROMPT_DIR / "X平台_基于历史表现选帖与改写提示词.txt")
 
 
-def format_historical_x_posts_for_prompt(posts, recent_count=50):
-    """将已拉取的 X 帖子列表提取最近 recent_count 条，格式化为高信息密度文本块"""
+def format_historical_x_posts_for_prompt(
+    posts,
+    recent_count=50,
+    include_account_summary=True,
+):
+    """将已拉取的 X 帖子列表格式化为纯客观历史数据块（不打绩效或冷启动标签，按时间取最新 N 条并标明账号信息）"""
     if not posts:
         return "暂无历史已发帖子数据。"
 
-    by_time = sorted(posts, key=lambda x: x.get("publish_time", 0), reverse=True)[:recent_count]
-    now_ts = int(time.time())
+    tagged_posts = _tag_posts_account_metadata(list(posts))
+    by_time = sorted(tagged_posts, key=lambda x: x.get("publish_time", 0), reverse=True)
+    if recent_count and int(recent_count) > 0:
+        by_time = by_time[: int(recent_count)]
 
+    account_stats = {}
     blocks = []
+
     for idx, p in enumerate(by_time, 1):
         eng = p.get("engagement") or {}
         cnt = p.get("content") or {}
         imgs = (p.get("media") or {}).get("images") or []
         views = eng.get("view_count", 0)
-        pub_ts = p.get("publish_time", 0)
-        age_hours = max(0.0, (now_ts - pub_ts) / 3600.0) if pub_ts else 999.0
+        account_label, _, followers, account_header = _get_post_account_summary(p)
 
-        if age_hours < 6 and views < 500:
-            perf_tag = "⏳[刚发布冷启动中]"
-        elif views >= 10000:
-            perf_tag = "🔥[万级爆款]"
-        elif views >= 1000:
-            perf_tag = "📈[千级破圈]"
-        elif views < 200:
-            perf_tag = "❄️[低迷池<200]"
-        else:
-            perf_tag = "💧[基础池]"
+        stat = account_stats.setdefault(
+            account_label,
+            {"header": account_header, "followers": followers, "count": 0, "total_views": 0},
+        )
+        stat["count"] += 1
+        stat["total_views"] += views
+        if followers >= stat["followers"]:
+            stat["followers"] = followers
+            stat["header"] = account_header
 
         text_body = (cnt.get("text_content") or "").strip()
         blocks.append(
-            f"【#{idx:02d}】{perf_tag} 发布时间: {p.get('publish_time_str', '')} | "
+            f"【#{idx:02d}】【{account_header}】"
+            f"发布时间: {p.get('publish_time_str', '')} | "
             f"浏览={views:,} | 点赞={eng.get('like_count', 0)} | 评论={eng.get('comment_count', 0)} | "
             f"转发={eng.get('share_count', 0)} | 收藏={eng.get('bookmark_count', 0)} | "
             f"互动率={eng.get('engagement_rate_pct', 0.0):.2f}% | 配图={len(imgs)}张\n"
             f"文案:\n{text_body}"
         )
 
-    return "\n" + ("\n" + "-" * 90 + "\n").join(blocks) + "\n"
+    header_block = ""
+    if include_account_summary and account_stats:
+        summary_lines = [
+            f"账号客观数据概览（共 {len(account_stats)} 个账号，按发布时间从新到旧共 {len(by_time)} 条最新历史帖）："
+        ]
+        for st in account_stats.values():
+            avg_v = st["total_views"] / st["count"] if st["count"] else 0.0
+            summary_lines.append(
+                f"- {st['header']} | 本批纳入={st['count']}条 | 篇均浏览={avg_v:,.1f}"
+            )
+        header_block = "\n".join(summary_lines) + "\n" + ("=" * 90) + "\n"
+
+    return "\n" + header_block + ("\n" + "-" * 90 + "\n").join(blocks) + "\n"
 
 
 def _format_candidate_posts_literal(obj, level=0):
@@ -996,20 +1409,60 @@ def fetch_recent_viral_candidates(hours=6, limit=0, only_usable=True):
 
 
 def build_x_selection_prompt(
-    screen_name=DEFAULT_SCREEN_NAME,
+    accounts=None,
+    screen_name=None,
     recent_count=50,
     candidate_posts=None,
     candidate_hours=6,
     posts_data=None,
+    posts_by_account=None,
+    use_cached_only=False,
     prompt_template_path=DEFAULT_X_PROMPT_TEMPLATE_PATH,
     save_prompt_path=None,
 ):
-    """拼接【账号最近 50 条 X 帖子真实表现数据】+【提示词规则】+【近 6 小时流量候选帖子数据】"""
-    clean_name = str(screen_name).lstrip("@").strip()
-    if posts_data is None:
-        posts_data = fetch_x_user_posts(screen_name=clean_name, count=max(recent_count, 100), sort_by="time")
+    """
+    可拼接生成选帖与改写提示词：
+    1) 可通过 `accounts`（或 config.json 的 x_prompt_accounts）自由决定组合哪些监控账号；
+    2) 支持直接传入 `posts_by_account`（来自 fetch_multi_x_user_posts / load_cached_x_posts）、
+       扁平 `posts_data`，或自动按需拉取/读缓存；
+    3) 不区分账号配额与题材冲突，统一按发布时间从新到旧截取最新 `recent_count` 条（默认 50 条）客观记录并标明发帖账号信息。
+    """
+    explicit_selector = accounts if accounts is not None else screen_name
+    target_specs = resolve_x_accounts(
+        explicit_selector,
+        default_accounts=get_configured_prompt_accounts(),
+    )
 
-    historical_block = format_historical_x_posts_for_prompt(posts_data, recent_count=recent_count)
+    if posts_data is not None:
+        selected_posts = merge_x_account_posts(
+            posts_data,
+            accounts=target_specs if explicit_selector is not None else None,
+            total_count=recent_count,
+            sort_by="time",
+        )
+    else:
+        if posts_by_account is None:
+            if use_cached_only:
+                posts_by_account = load_cached_x_posts(accounts=target_specs, sort_by="time")
+            else:
+                fetch_cap = max(_safe_int(recent_count, 50), 100)
+                posts_by_account = fetch_multi_x_user_posts(
+                    accounts=target_specs,
+                    count=fetch_cap,
+                    sort_by="time",
+                )
+        selected_posts = merge_x_account_posts(
+            posts_by_account,
+            accounts=target_specs,
+            total_count=recent_count,
+            sort_by="time",
+        )
+
+    historical_block = format_historical_x_posts_for_prompt(
+        selected_posts,
+        recent_count=recent_count,
+        include_account_summary=True,
+    )
 
     if candidate_posts is None:
         candidate_posts = fetch_recent_viral_candidates(hours=candidate_hours)
@@ -1034,18 +1487,28 @@ def build_x_selection_prompt(
     )
 
     if save_prompt_path is None:
+        if len(target_specs) == 1:
+            prompt_tag = target_specs[0]["screen_name"]
+            legacy_path = _PROJECT_ROOT / "biance" / f"x_selection_prompt_{prompt_tag}.txt"
+        elif 1 < len(target_specs) <= 3:
+            prompt_tag = "_".join(s["alias"] for s in target_specs)
+            legacy_path = None
+        else:
+            prompt_tag = "merged"
+            legacy_path = None
         save_prompt_path = get_runtime_file_path(
-            f"x_selection_prompt_{clean_name}.txt",
-            legacy_path=_PROJECT_ROOT / "biance" / f"x_selection_prompt_{clean_name}.txt",
+            f"x_selection_prompt_{prompt_tag}.txt",
+            legacy_path=legacy_path,
         )
 
     if save_prompt_path:
         with open(save_prompt_path, "w", encoding="utf-8") as f:
             f.write(full_prompt)
         candidate_cnt = len(candidate_posts) if isinstance(candidate_posts, list) else "自定义"
+        accounts_desc = ", ".join(f"{s['alias']}(@{s['screen_name']})" for s in target_specs) or "自定义"
         logger.info(
-            f"[X平台/提示词组装] 选帖与改写完整提示词已生成 | 账号: [@{clean_name}] "
-            f"| 历史表现帖: [{min(recent_count, len(posts_data))}] "
+            f"[X平台/提示词组装] 选帖与改写完整提示词已生成 | 组合账号: [{accounts_desc}] "
+            f"| 历史表现帖: [{len(selected_posts)}] "
             f"| 流量候选帖: [{candidate_cnt} (近{candidate_hours}h)] | 保存路径: <{save_prompt_path}>"
         )
 
@@ -1053,21 +1516,26 @@ def build_x_selection_prompt(
 
 
 if __name__ == "__main__":
-    target_account = "2434954452qqc"
-    all_x_posts = fetch_x_user_posts(
-        screen_name=target_account,
+    # 阶段一：按配置无登录拉取并维护目标账号列表（默认读取 config/config.json 的 x_fetch_accounts）
+    fetch_accounts = get_configured_fetch_accounts()
+    # 阶段二：按配置选取要汇总拼入提示词的账号列表（默认读取 config/config.json 的 x_prompt_accounts）
+    prompt_accounts = get_configured_prompt_accounts()
+
+    posts_by_acc = fetch_multi_x_user_posts(
+        accounts=fetch_accounts,
         count=200,
         sort_by="time",
     )
+    # 阶段三：按时间从新到旧截取全局最新 50 条客观数据并组装提示词
     full_prompt_text = build_x_selection_prompt(
-        screen_name=target_account,
+        accounts=prompt_accounts,
         recent_count=50,
         candidate_posts=None,
         candidate_hours=6,
-        posts_data=all_x_posts,
+        posts_by_account=posts_by_acc,
     )
     print("\n" + "=" * 115)
-    print("🚀 已为您生成拼接好【最近 50 条 X 帖子数据 + 近 6 小时流量候选帖】的完整提示词：")
+    print(f"🚀 已生成拼接好【账号 {prompt_accounts} 最新 50 条客观历史数据 + 近 6 小时流量候选帖】的完整提示词：")
     print("=" * 115 + "\n")
     print(full_prompt_text)
 

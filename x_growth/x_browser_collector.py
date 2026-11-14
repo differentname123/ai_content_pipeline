@@ -622,7 +622,6 @@ class XPassiveGraphQLSniffer:
         skip_peer_authors: Optional[Set[str]] = None,
         max_posts_per_author: int = 0,
         peer_follower_range: Optional[Tuple[int, int]] = None,
-        recent_cutoff_ts: int = 0,
     ) -> List[Dict[str, Any]]:
         """汇总结算本轮顺路捕获到的非转推、非回复原创主帖（含 24h 已拉取目标作者避让与单作者均匀上限）。"""
         merged_by_id: Dict[str, Dict[str, Any]] = {}
@@ -674,17 +673,7 @@ class XPassiveGraphQLSniffer:
             _put(dp, is_clicked_detail=True)
 
         for handle, u_list in self.user_posts_by_handle.items():
-            # 优先挑选 24h 内发布且非视频的最新原创帖，保证单作者保留的 N 条是最有价值的近期帖
-            sorted_u_posts = sorted(
-                u_list,
-                key=lambda x: (
-                    1 if (recent_cutoff_ts <= 0 or safe_int(x.get("publish_time"), 0) >= recent_cutoff_ts) else 0,
-                    0 if bool((x.get("media") or {}).get("video_url")) else 1,
-                    safe_int(x.get("publish_time"), 0),
-                ),
-                reverse=True,
-            )
-            for up in sorted_u_posts:
+            for up in sorted(u_list, key=lambda x: safe_int(x.get("publish_time"), 0), reverse=True):
                 _put(up, is_user_profile_source=True)
 
         sorted_feed = sorted(
@@ -973,7 +962,6 @@ def collect_posts_via_browser(
     author_avoid_seconds: int = 86400,
     max_posts_per_author: int = 2,
     avoid_connected_authors: bool = True,
-    post_max_age_seconds: int = 86400,
 ) -> Dict[str, Any]:
     """
     极简 3 步真人浏览收集（纯返回捕获列表，不碰大模型）：
@@ -1064,8 +1052,8 @@ def collect_posts_via_browser(
                     page.mouse.wheel(0, random.randint(2000, 3200))
                     page.wait_for_timeout(random.randint(2000, 3500))
 
-                # ── 第 2 步：顺路点开几条英/日活跃热帖（白拿热评 + 发现评论区同体量小蓝 V） ──
-                active_threads = [
+                # ── 第 2 步：顺路随机点开几条有讨论的英/日帖子（不按最高评论数排序，避开千评骂战帖） ──
+                eligible_threads = [
                     fp
                     for fp in sniffer.feed_posts_by_id.values()
                     if str(fp.get("post_id") or "") not in seen_detail_pids
@@ -1075,10 +1063,12 @@ def collect_posts_via_browser(
                     )
                     and safe_int((fp.get("engagement") or {}).get("comment_count"), 0) >= 4
                 ]
-                active_threads.sort(
-                    key=lambda x: safe_int((x.get("engagement") or {}).get("comment_count"), 0),
-                    reverse=True,
-                )
+                # 【保留过滤原因说明】优先从 <=500 评的常规讨论帖中随机点开看评论（若无则退回 >=4 评），避免一头扎进几千评的极端引战帖；不影响主帖全量入库
+                active_threads = [
+                    fp for fp in eligible_threads
+                    if safe_int((fp.get("engagement") or {}).get("comment_count"), 0) <= 500
+                ] or eligible_threads
+                random.shuffle(active_threads)
                 clicked_threads = 0
                 for t_post in active_threads[: max(0, int(thread_clicks))]:
                     t_url = str((t_post.get("metadata") or {}).get("url") or "").strip()
@@ -1118,13 +1108,7 @@ def collect_posts_via_browser(
                     return True
 
                 peer_users = [u for u in sniffer.users_by_handle.values() if _is_objective_peer_user(u)]
-                peer_users.sort(
-                    key=lambda u: (
-                        0 if ((u.get("observed_langs") or set()) & allowed_langs_set) else 1,
-                        0 if u.get("source_role") == "comment_author" else 1,
-                        abs(safe_int(u.get("followers_count"), 0) - 800),
-                    )
-                )
+                random.shuffle(peer_users)
 
                 visited_profiles = 0
                 visited_handles: List[str] = []
@@ -1146,12 +1130,10 @@ def collect_posts_via_browser(
                 if visited_handles and author_avoid_seconds > 0:
                     _record_visited_authors(visited_handles, author_avoid_seconds)
 
-                recent_cutoff_ts = int(time.time()) - max(0, int(post_max_age_seconds)) if post_max_age_seconds > 0 else 0
                 all_captured_posts = sniffer.export_all_captured_root_posts(
                     skip_peer_authors=skip_authors,
                     max_posts_per_author=max_posts_per_author,
                     peer_follower_range=(min_followers, max_followers),
-                    recent_cutoff_ts=recent_cutoff_ts,
                 )
                 logger.info(
                     f"[PostCollector/浏览完成] 采集号=@{self_handle or self_uid or '已登录'} | "
@@ -1235,7 +1217,6 @@ def collect_and_save_posts(
         author_avoid_seconds=author_avoid_seconds,
         max_posts_per_author=max_posts_per_author,
         avoid_connected_authors=avoid_connected_authors,
-        post_max_age_seconds=post_max_age_seconds,
     )
 
     acc_status = str(browser_res.get("account_status") or "ok")
