@@ -12,6 +12,7 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
@@ -228,12 +229,18 @@ def _build_prompt_slots_from_bundle(
     style_guidelines: str,
     revision_context: str = "",
 ) -> Dict[str, str]:
+    now_utc_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     hint = str(materials_bundle.get("direction_hint") or "").strip()
-    topic_info = (
-        f"- 创作焦点参考: {hint}"
-        if hint
-        else "- 创作焦点参考: （未预设固定方向，请直接提炼以下素材最具价值的核心事实与看点进行原创表达）"
-    )
+    if hint:
+        topic_info = (
+            f"- 当前系统基准时间: {now_utc_str}\n"
+            f"- 目标议题范围标识（仅用于锁定所属核心事件范围；具体事实定性、叙事主线与表达语态一律以原始素材实证及风格基调为准，严禁照搬任何审稿提纲式措辞）: {hint}"
+        )
+    else:
+        topic_info = (
+            f"- 当前系统基准时间: {now_utc_str}\n"
+            "- 目标议题范围标识: （未预设固定范围，请直接提炼以下素材最具价值的核心事实与主线进行原创表达）"
+        )
     return {
         "STYLE_GUIDELINES": style_guidelines,
         "TOPIC_INFO": topic_info,
@@ -251,8 +258,7 @@ def build_revision_context_block(
     reader_feedback: Sequence[str],
 ) -> str:
     """
-    构造零背景网友盲测反馈打磨指令。
-    严防泄露“现有材料未提及/原帖未给出”等内部审稿腔：若某张图或旁支细节缺乏素材背景支撑，直接换图/弃图/删去该旁支。
+    构造零背景网友盲测反馈定点打磨指令（纯抽象三大铁律：外科手术消障保语感、零幕后元叙述、图文变更原子级同步）。
     """
     fb_lines = "\n".join(f"- {str(x).strip()}" for x in (reader_feedback or []) if str(x).strip())
     prev_ids = [
@@ -265,28 +271,30 @@ def build_revision_context_block(
     if str(language).lower().startswith("en"):
         return (
             "\n## 4. Cold-Reader Blind Review Feedback (Targeted Polish)\n"
-            "An ordinary timeline reader with zero prior context read your draft and reported:\n"
+            "An ordinary timeline reader with zero prior context read your previous draft and reported:\n"
             f"- Reader's first-read takeaway: {reader_takeaway}\n"
-            f"- Specific friction points:\n{fb_lines}\n"
+            f"- Specific blocking friction points:\n{fb_lines}\n"
             f"- Previous draft `post_text`:\n{prev_post_text}\n"
             f"- Previous draft `selected_image_ids`: {prev_ids_json}\n\n"
-            "Revision Rules:\n"
-            "1) Stay 100% grounded in verified facts from the source bundle—never invent unstated facts.\n"
-            "2) CRITICAL: If the reader questioned an unexplained person/object in a selected image or a tangential detail not explained in the sources, DO NOT write meta-disclaimers like 'source materials do not state who this is' or 'details are unspecified'. Instead, drop or switch that confusing image (`selected_image_ids`) or remove the dangling tangential mention so the post is 100% self-contained and natural.\n"
-            "3) Output the complete polished JSON (`post_text`, `selected_image_ids`, `image_selection_reason`).\n"
+            "Mandatory Abstract Revision Rules:\n"
+            "1) Surgical Clarity Fix & Voice Preservation: Resolve the exact comprehension, scope, or attribution friction points grounded strictly in verified facts from the source bundle, while preserving the sharp opening tension and authentic human creator voice of the draft—never flatten vivid public storytelling into a dry, defensive corporate bulletin.\n"
+            "2) Zero Meta-Audit Leakage: If a reader question involves an unexplained visual element or tangential detail unsupported by the source bundle, never insert meta-editorial explanations about source limitations or verification boundaries; instead, adjust `selected_image_ids` or trim the unsupported tangent cleanly so the post reads effortlessly on its own.\n"
+            "3) Atomic Text-Image Synchronization: Whenever `selected_image_ids` is changed, reordered, or emptied compared to the previous draft, you MUST audit the entire `post_text` line by line and rewrite or remove every reference to any replaced or dropped chart, visual scope, or image detail so `post_text` and the final `selected_image_ids` match 100%.\n"
+            "4) Output the complete polished JSON (`post_text`, `selected_image_ids`, `image_selection_reason`).\n"
         )
 
     return (
         "\n## 4. 零背景普通网友盲测反馈（请执行定点打磨）\n"
-        "一位完全没看过原始素材的普通网友阅读了上一版初稿后，给出了如下真实感受与卡壳点：\n"
+        "一位完全没看过原始素材的普通网友阅读了上一版初稿后，给出了如下真实理解与阅读硬伤反馈：\n"
         f"- 网友第一遍读懂的意思：{reader_takeaway}\n"
-        f"- 网友指出的具体问题：\n{fb_lines}\n"
+        f"- 网友指出的具体硬伤：\n{fb_lines}\n"
         f"- 上一版初稿正文 (`post_text`)：\n{prev_post_text}\n"
         f"- 上一版选用原图 (`selected_image_ids`)：{prev_ids_json}\n\n"
-        "定点打磨铁律：\n"
-        "1) 严格基于上方原始素材中的真实事实补齐必要的身份与前因交代，绝不凭空编造未提及的事实。\n"
-        "2) 【严禁审稿腔免责声明】：如果网友对某张配图里的路人/未知细节、或某句旁支细节产生疑问，而原始素材确实没有该细节，**绝对禁止在正文中写出“现有材料未提及”、“原帖没有给出具体身份”之类的内部解释话术**！正确做法是在 `selected_image_ids` 中直接换掉或不选那张容易让人误解的配图，并删去悬空的旁支提法，让整篇成稿像真人内行发帖一样干净自洽。\n"
-        "3) 输出打磨后的完整 JSON（`post_text`、`selected_image_ids`、`image_selection_reason`）。\n"
+        "定点打磨三大铁律：\n"
+        "1) 【外科手术式消障与原生锐度保持】：严格基于上方原始素材中的真实事实，精准补齐缺失的主体身份背景、校准统计时间或影响范围口径；同时完整保留初稿鲜活利落的公众创作者语感与开篇张力，严禁因修补局部问题而退化为干瘪保守的公文通报腔。\n"
+        "2) 【零幕后审稿元叙述】：若网友疑问涉及原始素材未覆盖的画面细枝末节或次要旁支，严禁在正文中向读者解释素材局限、核查过程或定性边界；正确做法是直接调整 `selected_image_ids` 配图选择或果断删去悬空的旁支线索，让成稿浑然一体、干净自洽。\n"
+        "3) 【图文变更原子级同步】：凡本次打磨更换、增删或清空了 `selected_image_ids`，必须逐段通读并同步改写或彻底删去 `post_text` 中所有指向旧配图画面、旧统计图表或旧视觉细节的表述，确保打磨后的正文与最终选定的 `selected_image_ids` 严丝合缝、零脱节。\n"
+        "4) 输出打磨后的完整 JSON（`post_text`、`selected_image_ids`、`image_selection_reason`）。\n"
     )
 
 

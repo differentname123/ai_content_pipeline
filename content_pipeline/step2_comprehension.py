@@ -239,7 +239,9 @@ def _build_post_comprehension_inputs(
         else "未知时间"
     )
 
+    now_utc_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     meta_text = (
+        f"- 当前系统基准时间: {now_utc_str}\n"
         f"- 来源平台: {source} | 作者: {author_label} | 发布时间: {pub_str}\n"
         f"- 已上传本地图片总数: {len(image_items)} 张"
     )

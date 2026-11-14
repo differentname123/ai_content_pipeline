@@ -61,6 +61,7 @@ CONTENT_PROFILES: Dict[str, Dict[str, Any]] = {
         "language": "zh",
         "step2_prompt_file": "step2_post_comprehension.md",
         "radar_prompt_file": "step3_topic_radar.md",
+        "radar_merge_prompt_file": "step3_radar_merge.md",
         "curation_prompt_file": "step4_material_curation.md",
         "creation_prompt_file": "step4_creation_zh_viral.md",
         "review_prompt_file": "step5_cold_reader_review.md",
@@ -73,7 +74,7 @@ CONTENT_PROFILES: Dict[str, Dict[str, Any]] = {
         ),
         "style_guidelines": (
             "输出语言：自然地道的简体中文。\n"
-            "发布场景与表达基调：面向社交平台信息流（如 X / 社区动态流）读者，以洞察敏锐、表达利落的独立创作者口吻直接面向公众发声；"
+            "发布场景与表达基调：面向公开社交信息流读者，以洞察敏锐、表达利落的独立创作者口吻直接面向公众发声；"
             "对陌生背景自然融入简明交代确保零门槛顺畅阅读，开篇直切核心看点，行文紧凑干练、不铺陈水词，篇幅完全随内容实质自然伸缩，讲透即止。"
         ),
     },
@@ -83,6 +84,7 @@ CONTENT_PROFILES: Dict[str, Dict[str, Any]] = {
         "language": "en",
         "step2_prompt_file": "step2_post_comprehension.md",
         "radar_prompt_file": "step3_topic_radar.md",
+        "radar_merge_prompt_file": "step3_radar_merge.md",
         "curation_prompt_file": "step4_material_curation.md",
         "creation_prompt_file": "step4_creation_en_x.md",
         "review_prompt_file": "step5_cold_reader_review.md",
@@ -92,7 +94,7 @@ CONTENT_PROFILES: Dict[str, Dict[str, Any]] = {
         ),
         "style_guidelines": (
             "Output Language: Crisp, idiomatic English.\n"
-            "Voice & Pacing: Write directly for a fast-moving social timeline (e.g., X) as an authentic public creator; "
+            "Voice & Pacing: Write directly for a fast-moving public social timeline as an authentic independent creator; "
             "weave brief context naturally for unfamiliar entities so any reader grasps the full picture effortlessly, lead with the sharpest point, cut filler, and let real substance dictate length."
         ),
     },
@@ -131,8 +133,8 @@ STEP2_CONFIG: Dict[str, Any] = {
     "exclude_video_posts": True,
     # 单轮广谱理解最多新处理多少条未理解帖子（提升至 250 以当轮完整吃透五大平台全量热榜，已有缓存帖 0 开销跳过）
     "max_new_posts_per_run": 250,
-    # 高并发工作线程数（避免个别慢速通道阻塞整体进度）
-    "concurrency": 12,
+    # 高并发工作线程数（配合多模型池与 0 延迟切流加速单帖多模态理解）
+    "concurrency": 16,
     # 单帖理解时附带前多少条高赞评论（注：已理解过的帖子绝不因后续新增评论重跑理解，最新评论在创作阶段直读原表补齐）
     "max_comments_per_post": 10,
     # 单帖理解跨轮次最大尝试次数：单帖若累计失败达到 3 次则标记为 abandoned，后续轮次不再重复捞取理解

@@ -14,7 +14,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote
@@ -30,6 +30,7 @@ from common.common_utils import (
     clean_post_text,
     create_standard_post_schema,
     get_proxy_url,
+    get_runtime_file_path,
     normalize_and_enrich_post_schema,
     normalize_comment_item,
     safe_int,
@@ -615,11 +616,29 @@ class XPassiveGraphQLSniffer:
             if focal_id in self.feed_posts_by_id:
                 self.feed_posts_by_id[focal_id] = focal_post
 
-    def export_all_captured_root_posts(self) -> List[Dict[str, Any]]:
-        """汇总结算本轮顺路捕获到的全部非转推、非回复原创主帖（优先保留带评论列表的详情版本）。"""
+    def export_all_captured_root_posts(
+        self,
+        *,
+        skip_peer_authors: Optional[Set[str]] = None,
+        max_posts_per_author: int = 0,
+        peer_follower_range: Optional[Tuple[int, int]] = None,
+        recent_cutoff_ts: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """汇总结算本轮顺路捕获到的非转推、非回复原创主帖（含 24h 已拉取目标作者避让与单作者均匀上限）。"""
         merged_by_id: Dict[str, Dict[str, Any]] = {}
+        skip_set: Set[str] = {str(x).strip().lstrip("@").lower() for x in (skip_peer_authors or set()) if x}
+        per_author_cap = max(0, int(max_posts_per_author))
+        peer_author_counts: Dict[str, int] = {}
 
-        def _put(post_obj: Optional[Dict[str, Any]]) -> None:
+        def _is_peer_range_post(post_obj: Dict[str, Any]) -> bool:
+            if not peer_follower_range:
+                return False
+            low_fc, high_fc = int(peer_follower_range[0]), int(peer_follower_range[1])
+            au = post_obj.get("author") or {}
+            fc = safe_int(au.get("followers_count"), 0)
+            return bool(au.get("is_verified")) and (low_fc <= fc <= high_fc)
+
+        def _put(post_obj: Optional[Dict[str, Any]], *, is_user_profile_source: bool = False, is_clicked_detail: bool = False) -> None:
             if not isinstance(post_obj, dict):
                 return
             pid = str(post_obj.get("post_id") or "").strip()
@@ -627,21 +646,54 @@ class XPassiveGraphQLSniffer:
                 return
             meta = post_obj.get("metadata") or {}
             pextra = meta.get("platform_extra") or {}
+            # 【保留过滤原因说明】转推与评论回复并非独立原创主帖，仅保留根主帖入库
             if bool(meta.get("is_retweet") or pextra.get("is_retweet")) or bool(
                 meta.get("is_reply") or pextra.get("is_reply")
             ):
                 return
+
+            h_low = str((post_obj.get("author") or {}).get("username") or "").strip().lstrip("@").lower()
+            enforce_peer_uniformity = (not is_clicked_detail) and (is_user_profile_source or _is_peer_range_post(post_obj))
+            if enforce_peer_uniformity and h_low:
+                # 【保留过滤原因说明】24h 内已拉取过该同体量作者帖子则直接避让不再重复拉取，使落库作者分布均匀
+                if h_low in skip_set and pid not in merged_by_id:
+                    return
+                # 【保留过滤原因说明】单次访问新作者主页 X 接口会返回约 20 条推文，限制单作者单次最多保留最新 N 条，防止高频水贴号单人挤占评论池
+                if per_author_cap > 0 and pid not in merged_by_id and peer_author_counts.get(h_low, 0) >= per_author_cap:
+                    return
+
             existing = merged_by_id.get(pid)
-            if existing is None or (post_obj.get("comments") and not existing.get("comments")):
+            if existing is None:
+                merged_by_id[pid] = post_obj
+                if enforce_peer_uniformity and h_low:
+                    peer_author_counts[h_low] = peer_author_counts.get(h_low, 0) + 1
+            elif post_obj.get("comments") and not existing.get("comments"):
                 merged_by_id[pid] = post_obj
 
-        for fp in self.feed_posts_by_id.values():
-            _put(fp)
-        for u_list in self.user_posts_by_handle.values():
-            for up in u_list:
-                _put(up)
         for dp in self.detailed_posts_by_id.values():
-            _put(dp)
+            _put(dp, is_clicked_detail=True)
+
+        for handle, u_list in self.user_posts_by_handle.items():
+            # 优先挑选 24h 内发布且非视频的最新原创帖，保证单作者保留的 N 条是最有价值的近期帖
+            sorted_u_posts = sorted(
+                u_list,
+                key=lambda x: (
+                    1 if (recent_cutoff_ts <= 0 or safe_int(x.get("publish_time"), 0) >= recent_cutoff_ts) else 0,
+                    0 if bool((x.get("media") or {}).get("video_url")) else 1,
+                    safe_int(x.get("publish_time"), 0),
+                ),
+                reverse=True,
+            )
+            for up in sorted_u_posts:
+                _put(up, is_user_profile_source=True)
+
+        sorted_feed = sorted(
+            self.feed_posts_by_id.values(),
+            key=lambda x: safe_int(x.get("publish_time"), 0),
+            reverse=True,
+        )
+        for fp in sorted_feed:
+            _put(fp, is_user_profile_source=False)
 
         out = list(merged_by_id.values())
         out.sort(key=lambda x: safe_int(x.get("publish_time"), 0), reverse=True)
@@ -732,16 +784,73 @@ def _ensure_for_you_tab(page: Any) -> None:
         pass
 
 
+_VISITED_AUTHORS_RUNTIME_FILE = "x_growth_visited_authors.json"
+
+
+def _load_recent_visited_authors(avoid_seconds: int) -> Set[str]:
+    """读取最近 `avoid_seconds`（默认 24h）内访问过主页的作者名单（含主页无新帖的纯评论号，防重复空跑）。"""
+    if avoid_seconds <= 0:
+        return set()
+    p = get_runtime_file_path(_VISITED_AUTHORS_RUNTIME_FILE)
+    if not p.is_file():
+        return set()
+    now_ts = int(time.time())
+    cutoff = now_ts - int(avoid_seconds)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return set()
+        return {
+            str(k).strip().lstrip("@").lower()
+            for k, ts in raw.items()
+            if str(k).strip() and safe_int(ts, 0) >= cutoff
+        }
+    except Exception:
+        return set()
+
+
+def _record_visited_authors(handles: Sequence[str], avoid_seconds: int) -> None:
+    """持久化记录本轮已访问过主页的作者时间戳，并自动清理超过 `avoid_seconds` 的过期条目。"""
+    clean_handles = [str(h).strip().lstrip("@").lower() for h in (handles or []) if str(h).strip()]
+    if not clean_handles or avoid_seconds <= 0:
+        return
+    p = get_runtime_file_path(_VISITED_AUTHORS_RUNTIME_FILE)
+    now_ts = int(time.time())
+    cutoff = now_ts - int(avoid_seconds)
+    merged: Dict[str, int] = {}
+    if p.is_file():
+        try:
+            old_data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(old_data, dict):
+                for k, ts in old_data.items():
+                    k_low = str(k).strip().lstrip("@").lower()
+                    ts_int = safe_int(ts, 0)
+                    if k_low and ts_int >= cutoff:
+                        merged[k_low] = ts_int
+        except Exception:
+            pass
+    for h_low in clean_handles:
+        merged[h_low] = now_ts
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_p = p.with_suffix(".tmp")
+        tmp_p.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_p.replace(p)
+    except Exception:
+        pass
+
+
 def _get_light_browse_hints(
     col: Any,
     cutoff_ts: int,
     min_followers: int,
     max_followers: int,
+    author_avoid_seconds: int = 86400,
 ) -> Tuple[Set[str], Set[str]]:
     """
-    轻量去重提示（无任何冷却锁或账号状态耦合）：
+    轻量 24h 去重避让提示：
     1. `skip_detailed_pids`：已有评论列表的近期热帖，避免每次点开同一条热帖看评论；
-    2. `skip_recent_authors`：库里已经有 24h 内主帖的同体量作者，让主页访问名额优先留给新作者。
+    2. `skip_recent_authors`：24h 内已经拉取过帖子入库或已访问过主页的目标作者，本轮直接避让不再重复拉取。
     """
     detail_docs = col.find(
         {"source": "x", "publish_time": {"$gte": cutoff_ts - 2 * 86400}, "comments.0": {"$exists": True}},
@@ -749,20 +858,34 @@ def _get_light_browse_hints(
     ).limit(1500)
     skip_detailed_pids = {str(d.get("post_id")) for d in detail_docs if d.get("post_id")}
 
-    recent_author_docs = col.find(
-        {
-            "source": "x",
-            "publish_time": {"$gte": cutoff_ts},
-            "author.is_verified": True,
-            "author.followers_count": {"$gte": min_followers, "$lte": max_followers},
-        },
-        {"author.username": 1, "_id": 0},
-    ).limit(1500)
-    skip_recent_authors = {
-        str((d.get("author") or {}).get("username") or "").strip().lstrip("@").lower()
-        for d in recent_author_docs
-        if (d.get("author") or {}).get("username")
-    }
+    now_ts = int(time.time())
+    eff_avoid_sec = max(0, int(author_avoid_seconds))
+    avoid_cutoff_ts = now_ts - eff_avoid_sec
+    avoid_cutoff_utc = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=eff_avoid_sec)
+
+    skip_recent_authors: Set[str] = _load_recent_visited_authors(eff_avoid_sec)
+    if eff_avoid_sec > 0:
+        recent_usernames = col.distinct(
+            "author.username",
+            {
+                "source": "x",
+                "author.is_verified": True,
+                "author.followers_count": {
+                    "$gte": max(0, int(min_followers) - 50),
+                    "$lte": int(max_followers) + 200,
+                },
+                "$or": [
+                    {"publish_time": {"$gte": avoid_cutoff_ts}},
+                    {"db_update_time": {"$gte": avoid_cutoff_utc}},
+                    {"metadata.platform_extra.author_profile.checked_at_ts": {"$gte": avoid_cutoff_ts}},
+                ],
+            },
+        )
+        for u_name in recent_usernames or []:
+            h_low = str(u_name or "").strip().lstrip("@").lower()
+            if h_low:
+                skip_recent_authors.add(h_low)
+
     return skip_detailed_pids, skip_recent_authors
 
 
@@ -847,17 +970,21 @@ def collect_posts_via_browser(
     home_scroll_rounds: int = 4,
     thread_clicks: int = 3,
     profile_visits: int = 6,
+    author_avoid_seconds: int = 86400,
+    max_posts_per_author: int = 2,
+    avoid_connected_authors: bool = True,
+    post_max_age_seconds: int = 86400,
 ) -> Dict[str, Any]:
     """
     极简 3 步真人浏览收集（纯返回捕获列表，不碰大模型）：
     1) 打开 `x.com/home` 慢速滚屏 `home_scroll_rounds` 次，被动接收推荐流热帖；
     2) 点开 `thread_clicks` 条英/日活跃热帖，顺便收下高赞热评 + 发现评论区里的 `100~3000` 粉活跃蓝 V；
-    3) 点进最多 `profile_visits` 个 `100~3000` 粉蓝 V 主页，收下他们自己发的最近原创主帖。
+    3) 点进最多 `profile_visits` 个 24h 内未拉取过的 `100~3000` 粉蓝 V 主页，均匀收下他们自己发的最近原创主帖。
     """
     logger = get_growth_logger()
     session_path = str(Path(user_data_dir).expanduser().resolve())
     seen_detail_pids: Set[str] = set(skip_detailed_pids or set())
-    skip_authors: Set[str] = set(skip_recent_authors or set())
+    skip_authors: Set[str] = {str(x).strip().lstrip("@").lower() for x in (skip_recent_authors or set()) if x}
 
     if not os.path.isdir(session_path):
         return {
@@ -976,7 +1103,11 @@ def collect_posts_via_browser(
                     h_low = str(u.get("screen_name") or "").strip().lstrip("@").lower()
                     if not h_low or h_low == "unknown":
                         return False
+                    # 【保留过滤原因说明】排除采集号自身与主号，以及 24h 内已拉取过帖子或访问过主页的作者，保证拉取作者均匀不重复
                     if (self_uid and uid == self_uid) or (h_low in self_handles) or (h_low in skip_authors):
+                        return False
+                    # 【保留过滤原因说明】避让已关注/已关注当前号的熟人，将有限主页访问配额全部留给未触达新作者
+                    if avoid_connected_authors and (bool(u.get("is_following")) or bool(u.get("is_followed_by"))):
                         return False
                     fc = safe_int(u.get("followers_count"), 0)
                     if fc < min_followers or fc > max_followers:
@@ -996,12 +1127,14 @@ def collect_posts_via_browser(
                 )
 
                 visited_profiles = 0
+                visited_handles: List[str] = []
                 user_timeline_ops = ("UserOriginalsTimeline", "UserTweets", "UserTweetsAndReplies")
                 for u_prof in peer_users[: max(0, int(profile_visits))]:
                     handle = str(u_prof.get("screen_name") or "").strip().lstrip("@")
                     if not handle:
                         continue
                     visited_profiles += 1
+                    visited_handles.append(handle.lower())
                     prev_ut = sum(sniffer.op_counts.get(op_k, 0) for op_k in user_timeline_ops)
                     try:
                         page.goto(f"https://x.com/{handle}", timeout=35000, wait_until="domcontentloaded")
@@ -1010,12 +1143,21 @@ def collect_posts_via_browser(
                     except Exception as prof_e:
                         logger.debug(f"[PostCollector] 访问用户主页略过 (@{handle}): {prof_e}")
 
-                all_captured_posts = sniffer.export_all_captured_root_posts()
+                if visited_handles and author_avoid_seconds > 0:
+                    _record_visited_authors(visited_handles, author_avoid_seconds)
+
+                recent_cutoff_ts = int(time.time()) - max(0, int(post_max_age_seconds)) if post_max_age_seconds > 0 else 0
+                all_captured_posts = sniffer.export_all_captured_root_posts(
+                    skip_peer_authors=skip_authors,
+                    max_posts_per_author=max_posts_per_author,
+                    peer_follower_range=(min_followers, max_followers),
+                    recent_cutoff_ts=recent_cutoff_ts,
+                )
                 logger.info(
                     f"[PostCollector/浏览完成] 采集号=@{self_handle or self_uid or '已登录'} | "
-                    f"gql_ops={sniffer.op_counts} | 点热帖={clicked_threads}条 | "
-                    f"发现100~3000粉蓝V={len(peer_users)}人(进主页={visited_profiles}人) | "
-                    f"共捕获原创主帖={len(all_captured_posts)}条"
+                    f"gql_ops={sniffer.op_counts} | 24h避让作者={len(skip_authors)}人 | 点热帖={clicked_threads}条 | "
+                    f"发现新100~3000粉蓝V={len(peer_users)}人(进主页={visited_profiles}人) | "
+                    f"共捕获原创主帖={len(all_captured_posts)}条(单作者上限={max_posts_per_author}条)"
                 )
                 return {
                     "account_status": "ok",
@@ -1048,10 +1190,14 @@ def collect_and_save_posts(
     home_scroll_rounds: int = COLLECTOR_DEFAULTS["home_scroll_rounds"],
     thread_clicks: int = COLLECTOR_DEFAULTS["thread_clicks_per_run"],
     profile_visits: int = COLLECTOR_DEFAULTS["profile_visits_per_run"],
+    author_avoid_seconds: int = COLLECTOR_DEFAULTS["author_avoid_seconds"],
+    max_posts_per_author: int = COLLECTOR_DEFAULTS["max_posts_per_author_per_fetch"],
+    avoid_connected_authors: bool = COLLECTOR_DEFAULTS["avoid_connected_authors"],
+    post_max_age_seconds: int = COLLECTOR_DEFAULTS["post_max_age_seconds"],
     allowed_languages: Sequence[str] = COLLECTOR_DEFAULTS["allowed_languages"],
 ) -> Dict[str, Any]:
     """
-    高内聚独立拉取入口：启动真实桌面 Chrome 完成浏览并将全部主帖与热评 100% 落库，不触发任何大模型。
+    高内聚独立拉取入口：启动真实桌面 Chrome 完成浏览并将捕获主帖与热评落库，24h 内已拉取作者自动避让，不触发任何大模型。
     """
     logger = get_growth_logger()
     t0 = time.perf_counter()
@@ -1065,13 +1211,14 @@ def collect_and_save_posts(
     db = gen_db_object()
     post_manager = HarvestedPostManager(db, collection_name=POSTS_COLLECTION_NAME)
     col = db.get_collection(POSTS_COLLECTION_NAME)
-    cutoff_ts = int(time.time()) - int(COLLECTOR_DEFAULTS["post_max_age_seconds"])
+    cutoff_ts = int(time.time()) - max(0, int(post_max_age_seconds))
 
     skip_detailed_pids, skip_recent_authors = _get_light_browse_hints(
         col=col,
         cutoff_ts=cutoff_ts,
         min_followers=min_followers,
         max_followers=max_followers,
+        author_avoid_seconds=author_avoid_seconds,
     )
 
     browser_res = collect_posts_via_browser(
@@ -1085,6 +1232,10 @@ def collect_and_save_posts(
         home_scroll_rounds=home_scroll_rounds,
         thread_clicks=thread_clicks,
         profile_visits=profile_visits,
+        author_avoid_seconds=author_avoid_seconds,
+        max_posts_per_author=max_posts_per_author,
+        avoid_connected_authors=avoid_connected_authors,
+        post_max_age_seconds=post_max_age_seconds,
     )
 
     acc_status = str(browser_res.get("account_status") or "ok")

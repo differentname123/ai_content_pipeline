@@ -685,6 +685,7 @@ def generate_content(
                     request_event["error"] = error
                     is_queue_busy = isinstance(exc, AntigravityQueueBusyError)
                     is_upstream_timeout = isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
+                    is_channel_exhausted = (not failed_account) and (status_code in (401, 403, 404, 429, 503))
                     if is_queue_busy and has_non_ag_after:
                         antigravity_pool_busy = True
                         fast_switch_model = True
@@ -695,6 +696,10 @@ def generate_content(
                         fast_switch_model = True
                         terminal = False
                         action = f"当前模型连接/响应超时，0延迟立即切换备用模型 {models[model_index + 1]}"
+                    elif is_channel_exhausted and model_index < len(models) - 1:
+                        fast_switch_model = True
+                        terminal = False
+                        action = f"当前模型渠道配额或状态不可用(HTTP {status_code})，0延迟立即切换备用模型 {models[model_index + 1]}"
                     else:
                         terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                         if attempt < max_retries_per_model:

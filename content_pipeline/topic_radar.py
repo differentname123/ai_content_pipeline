@@ -13,7 +13,9 @@
 import json
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
@@ -134,6 +136,7 @@ def _run_radar_window(
     profile_preference: str,
     max_directions: int,
     cfg: Dict[str, Any],
+    batch_index: int = 1,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     alias_to_digest: Dict[str, Dict[str, Any]] = {}
     cards: List[str] = []
@@ -142,7 +145,9 @@ def _run_radar_window(
         alias_to_digest[alias] = d
         cards.append(format_digest_card(alias, d, raw_lookup.get(d.get("post_key", ""))))
 
+    now_utc_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     slots = {
+        "CURRENT_TIME_UTC": now_utc_str,
         "MAX_DIRECTIONS": str(max_directions),
         "PROFILE_PREFERENCE": profile_preference,
         "RECENT_CREATED_BLOCK": recent_block,
@@ -186,6 +191,8 @@ def _run_radar_window(
                 clean_kws.append(s)
         resolved_dirs.append(
             {
+                "batch_index": batch_index,
+                "rank_in_batch": len(resolved_dirs) + 1,
                 "direction_summary": str(item.get("direction_summary") or "").strip(),
                 "why_worth_creating": str(item.get("why_worth_creating") or "").strip(),
                 "search_keywords": clean_kws[:5],
@@ -219,46 +226,65 @@ def _merge_batch_directions(
     profile_preference: str,
     recent_block: str,
     cfg: Dict[str, Any],
+    digest_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    merge_prompt_file: str = "step3_radar_merge.md",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """当分批扫描产生多个候选方向时，执行一次轻量全局归并去重并优选前 `max_directions` 个。"""
+    """当分批扫描产生多个候选方向时，基于客观跨平台实证指标执行全局归并去重并优选前 `max_directions` 个。"""
+    eff_digests = digest_lookup or {}
+    valid_dids = {f"D{i}" for i in range(1, len(batch_candidates) + 1)}
     items_desc = []
     for idx, c in enumerate(batch_candidates, 1):
+        s_keys = c.get("seed_post_keys") or []
+        plat_counts: Counter = Counter()
+        ext_art_count = 0
+        for pk in s_keys:
+            dig = eff_digests.get(pk) or {}
+            src = str(dig.get("source") or (pk.split(":", 1)[0] if ":" in pk else "unknown")).lower()
+            plat_counts[src] += 1
+            if dig.get("has_external_article"):
+                ext_art_count += 1
+        plat_str = ", ".join(f"{p}:{cnt}" for p, cnt in plat_counts.most_common())
+        b_idx = c.get("batch_index", 1)
+        b_rank = c.get("rank_in_batch", idx)
         items_desc.append(
             f"[D{idx}] 概述: {c['direction_summary']}\n"
+            f"  - 客观实证指标: 批次#{b_idx}排位第{b_rank} | 关联种子帖={len(s_keys)}条 | "
+            f"覆盖独立平台={len(plat_counts)}个({plat_str}) | 含外链全文报道={ext_art_count}篇\n"
             f"  - 搜索词: {json.dumps(c['search_keywords'], ensure_ascii=False)}\n"
-            f"  - 关联种子帖数: {len(c['seed_post_keys'])} ({', '.join(c['seed_post_keys'])})\n"
             f"  - 价值说明: {c['why_worth_creating']}"
         )
 
-    merge_prompt = (
-        "# 角色与任务\n"
-        "你是全局热点方向总编。以下是从多个分批窗口中初步提炼出的候选方向列表。\n"
-        f"请将讨论同一事件的重复方向合并（合并其编号），参考受众定位与近期已写话题去重后，最终优中选优挑出不超过 {max_directions} 个最值得创作的方向。\n\n"
-        f"## 受众定位\n{profile_preference}\n\n"
-        f"## 近期已产出话题（无重大新进展勿重复）\n{recent_block}\n\n"
-        f"## 分批初筛候选方向（共 {len(batch_candidates)} 项）\n" + "\n\n".join(items_desc) + "\n\n"
-        "# 输出格式\n"
-        "严格只输出一个 JSON 对象：\n"
-        "{\n"
-        '  "merged_directions": [\n'
-        "    {\n"
-        '      "source_ids": ["D1"],\n'
-        '      "direction_summary": "合并优化后的一句话方向概述",\n'
-        '      "search_keywords": ["关键词1", "关键词2"],\n'
-        '      "why_worth_creating": "入选依据"\n'
-        "    }\n"
-        "  ]\n"
-        "}"
-    )
+    now_utc_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    slots = {
+        "CURRENT_TIME_UTC": now_utc_str,
+        "MAX_DIRECTIONS": str(max_directions),
+        "PROFILE_PREFERENCE": profile_preference,
+        "RECENT_CREATED_BLOCK": recent_block,
+        "CANDIDATE_COUNT": str(len(batch_candidates)),
+        "BATCH_CANDIDATES_BLOCK": "\n\n".join(items_desc),
+    }
+    merge_prompt, prompt_meta = render_prompt_template(merge_prompt_file, slots)
 
     def _val_merge(d: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(d.get("merged_directions"), list):
+        m_list = d.get("merged_directions")
+        if not isinstance(m_list, list):
             return "缺少数组 `merged_directions`"
+        for i, elem in enumerate(m_list, 1):
+            if not isinstance(elem, dict):
+                return f"merged_directions[{i}] 必须是对象"
+            sids = elem.get("source_ids")
+            if not isinstance(sids, list) or not [x for x in sids if str(x).strip().upper() in valid_dids]:
+                return f"merged_directions[{i}].source_ids 必须包含有效候选编号（D1..D{len(batch_candidates)}）"
+            if not str(elem.get("direction_summary") or "").strip():
+                return f"merged_directions[{i}].direction_summary 不能为空"
+            kws = elem.get("search_keywords")
+            if not isinstance(kws, list) or not [x for x in kws if isinstance(x, str) and x.strip()]:
+                return f"merged_directions[{i}].search_keywords 必须包含至少 1 个非空搜索词"
         return None
 
     parsed, trace = call_llm_json(
         prompt=merge_prompt,
-        prompt_meta={"prompt_name": "radar_batch_merge"},
+        prompt_meta=prompt_meta,
         model=cfg.get("model"),
         fallback_models=cfg.get("fallback_models"),
         timeout=int(cfg.get("timeout", 600)),
@@ -291,12 +317,18 @@ def _merge_batch_directions(
         if not seed_keys:
             continue
         used_post_keys.update(seed_keys)
-        kws = [str(x).strip() for x in (m.get("search_keywords") or []) if isinstance(x, str) and str(x).strip()]
+        clean_kws: List[str] = []
+        seen_kw = set()
+        for kw in (m.get("search_keywords") or fallback_kws):
+            s = str(kw or "").strip()
+            if s and s.lower() not in seen_kw:
+                seen_kw.add(s.lower())
+                clean_kws.append(s)
         merged_out.append(
             {
                 "direction_summary": str(m.get("direction_summary") or "").strip(),
                 "why_worth_creating": str(m.get("why_worth_creating") or "").strip(),
-                "search_keywords": (kws or fallback_kws)[:5],
+                "search_keywords": (clean_kws or fallback_kws)[:5],
                 "seed_post_keys": seed_keys,
             }
         )
@@ -325,6 +357,7 @@ def discover_hot_directions(
 
     profile = CONTENT_PROFILES.get(profile_name) or CONTENT_PROFILES[ACTIVE_PROFILE]
     prompt_file = str(profile.get("radar_prompt_file") or "step3_topic_radar.md")
+    merge_prompt_file = str(profile.get("radar_merge_prompt_file") or "step3_radar_merge.md")
     profile_pref = str(profile.get("topic_preference") or "")
     max_directions = max(1, int(cfg.get("max_directions", 3)))
     batch_size = max(15, int(cfg.get("batch_size", 80)))
@@ -350,6 +383,11 @@ def discover_hot_directions(
         max_total=len(usable_only),
         raw_lookup=effective_raw if effective_raw else None,
     )
+    digest_lookup = {
+        str(d.get("post_key") or ""): d
+        for d in ordered_digests
+        if isinstance(d, dict) and d.get("post_key")
+    }
 
     recent_list = [str(s).strip() for s in (recent_created_topics or []) if str(s).strip()]
     recent_block = (
@@ -377,6 +415,7 @@ def discover_hot_directions(
             profile_preference=profile_pref,
             max_directions=max_directions,
             cfg=cfg,
+            batch_index=1,
         )
         all_batch_dirs.extend(b_dirs)
         all_runner_ups.extend(b_rus)
@@ -385,8 +424,9 @@ def discover_hot_directions(
     else:
         workers = max(1, min(int(cfg.get("batch_concurrency", 4)), len(batches)))
         per_batch_cap = max(2, max_directions)
+        batch_results: List[Tuple[int, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [
+            fut_to_bidx = {
                 pool.submit(
                     _run_radar_window,
                     batch,
@@ -396,14 +436,20 @@ def discover_hot_directions(
                     profile_pref,
                     per_batch_cap,
                     cfg,
-                )
-                for batch in batches
-            ]
-            for fut in as_completed(futs):
+                    b_idx,
+                ): b_idx
+                for b_idx, batch in enumerate(batches, 1)
+            }
+            for fut in as_completed(fut_to_bidx):
+                b_idx = fut_to_bidx[fut]
                 b_dirs, b_rus, b_trace = fut.result()
-                all_batch_dirs.extend(b_dirs)
-                all_runner_ups.extend(b_rus)
-                traces.append(b_trace)
+                batch_results.append((b_idx, b_dirs, b_rus, b_trace))
+
+        batch_results.sort(key=lambda x: x[0])
+        for _, b_dirs, b_rus, b_trace in batch_results:
+            all_batch_dirs.extend(b_dirs)
+            all_runner_ups.extend(b_rus)
+            traces.append(b_trace)
 
         if len(all_batch_dirs) > max_directions:
             final_raw_dirs, merge_trace = _merge_batch_directions(
@@ -412,6 +458,8 @@ def discover_hot_directions(
                 profile_preference=profile_pref,
                 recent_block=recent_block,
                 cfg=cfg,
+                digest_lookup=digest_lookup,
+                merge_prompt_file=merge_prompt_file,
             )
             traces.append(merge_trace)
         else:

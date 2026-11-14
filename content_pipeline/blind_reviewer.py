@@ -11,6 +11,7 @@
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -37,6 +38,9 @@ def _validate_reviewer_json(data: Dict[str, Any]) -> Optional[str]:
     takeaway = data.get("reader_takeaway")
     if not isinstance(takeaway, str) or not takeaway.strip():
         return "缺少非空字符串字段 `reader_takeaway`"
+    vis_check = data.get("visual_alignment_check")
+    if not isinstance(vis_check, str) or not vis_check.strip():
+        return "缺少非空字符串字段 `visual_alignment_check`"
     verdict = str(data.get("verdict") or "").strip().lower()
     if verdict not in ("pass", "revise", "drop"):
         return f"`verdict` 必须是 pass/revise/drop 之一，当前为 {verdict!r}"
@@ -83,7 +87,9 @@ def review_single_creation_blind(
         else "目标读者为中文社交平台普通网友，正文应为自然地道的简体中文。"
     )
 
+    now_date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d (UTC)")
     slots = {
+        "CURRENT_DATE_CONTEXT": now_date_str,
         "LANGUAGE_EXPECTATION": lang_desc,
         "POST_TEXT": str(post_text or "").strip(),
         "FINAL_IMAGES_MANIFEST": images_manifest,
@@ -103,6 +109,7 @@ def review_single_creation_blind(
     if parsed is not None:
         parsed = {
             "reader_takeaway": str(parsed.get("reader_takeaway") or "").strip(),
+            "visual_alignment_check": str(parsed.get("visual_alignment_check") or "").strip(),
             "verdict": str(parsed.get("verdict") or "").strip().lower(),
             "reader_feedback": [
                 str(x).strip()

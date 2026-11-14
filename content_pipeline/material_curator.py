@@ -10,6 +10,7 @@
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -141,7 +142,9 @@ def curate_materials_for_direction(
         card_str = format_digest_card(f"候选编号:{alias} | {origin_tag}", dig, effective_raw.get(pk))
         card_blocks.append(card_str)
 
+    now_utc_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     slots = {
+        "CURRENT_TIME_UTC": now_utc_str,
         "DIRECTION_SUMMARY": str(out_dir.get("direction_summary") or ""),
         "WHY_WORTH_CREATING": str(out_dir.get("why_worth_creating") or ""),
         "CANDIDATE_COUNT": str(len(usable_cands)),

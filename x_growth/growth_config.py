@@ -102,6 +102,9 @@ COLLECTOR_DEFAULTS: Dict[str, Any] = {
     "min_followers": 100,               # 主页访问目标最小粉丝数
     "max_followers": 3000,              # 主页访问目标最大粉丝数（严守同体量高回关率蓝V）
     "post_max_age_seconds": 86400,      # 近期主帖参考时间窗（24h）
+    "author_avoid_seconds": 86400,      # 24h 内已拉取过帖子或访问过主页的目标作者直接避让，不再重复拉取
+    "max_posts_per_author_per_fetch": 2,# 单次拉取同一目标作者最多保留最新几条原创主帖，防高频搬运号单人霸榜，使作者均匀分布
+    "avoid_connected_authors": True,    # 选人进主页时直接避让已关注/互关作者，把主页访问名额留给未触达新作者
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,
 }
 
@@ -157,7 +160,7 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 英文专号填 ("en",)，日文专号填 ("ja",)，综合号保留 ("en", "ja")
     "min_followers": 100,               # 当前账号只消费粉丝数 >= 该值的作者帖子
     "max_followers": 3000,              # 当前账号只消费粉丝数 <= 该值的作者帖子
-    "min_score": 70,                    # 仅消费独立盲测评分 >= 该分值的评论
+    "min_score": 75,                    # 仅消费独立盲测评分 >= 该分值（75+ 自然活人感优质档）的评论
     "max_publish_per_run": 3,           # 单次最多消费发送几条评论
     "post_max_age_seconds": 86400,      # 仅消费 24 小时以内的新鲜帖子
     "author_dedup_days": 7,             # 当前账号多少天内不对同一作者重复发评
