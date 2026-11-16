@@ -27,7 +27,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from common.common_utils import get_proxy_url, safe_int
 from common.mongo_db.mongo_base import gen_db_object
-from common.mongo_db.mongo_manager import HarvestedPostManager
 from content_pipeline.pipeline_db import is_video_post
 from platforms.playwright_base import (
     USER_DATA_LOCK_TIMEOUT_SEC,
@@ -64,7 +63,6 @@ from x_growth.x_browser_collector import (
     build_real_chrome_launch_options,
     extract_logged_in_identity,
     inspect_x_page_account_status,
-    persist_browsed_posts_to_db,
 )
 
 
@@ -146,9 +144,13 @@ def publish_comments_from_db(
     max_followers: int = PUBLISHER_DEFAULTS["max_followers"],
     min_score: float = PUBLISHER_DEFAULTS["min_score"],
     max_publish: int = PUBLISHER_DEFAULTS["max_publish_per_run"],
+    max_publish_per_day: int = int(PUBLISHER_DEFAULTS.get("max_publish_per_day", 0)),
+    post_max_age_seconds: int = int(PUBLISHER_DEFAULTS["post_max_age_seconds"]),
+    author_dedup_days: int = int(PUBLISHER_DEFAULTS["author_dedup_days"]),
     avoid_connected_authors: bool = PUBLISHER_DEFAULTS["avoid_connected_authors"],
     also_follow: bool = PUBLISHER_DEFAULTS["also_follow"],
     like_when_commenting: bool = PUBLISHER_DEFAULTS["like_when_commenting"],
+    action_delay_range: Sequence[float] = PUBLISHER_DEFAULTS["action_delay_range"],
     browser_visible: bool = PUBLISHER_DEFAULTS["browser_visible"],
     dry_run: bool = PUBLISHER_DEFAULTS["dry_run"],
 ) -> Dict[str, Any]:
@@ -156,7 +158,7 @@ def publish_comments_from_db(
     按当前运营账号自身筛选条件消费公共评论池：
     一旦发送成功即写入 `consumed=True`、`consumed_by` 与 `consumed_at`，锁定该帖不再被其他账号重复消费。
     """
-    logger = get_growth_logger()
+    logger = get_growth_logger("x_growth_publisher")
     session_path = str(Path(user_data_dir).expanduser().resolve())
     self_handles: Set[str] = set(get_configured_self_handles())
 
@@ -164,11 +166,54 @@ def publish_comments_from_db(
     col = db.get_collection(POSTS_COLLECTION_NAME)
 
     now_ts = int(time.time())
-    max_age_sec = int(PUBLISHER_DEFAULTS["post_max_age_seconds"])
+    max_age_sec = int(post_max_age_seconds)
     cutoff_ts = now_ts - max_age_sec
 
+    clean_cats = [str(c).strip() for c in (categories or []) if str(c).strip() and str(c).strip().lower() != "all"]
+    if clean_cats:
+        invalid_cats = [c for c in clean_cats if c not in POST_CATEGORIES]
+        if invalid_cats:
+            raise ValueError(f"包含未知帖子分类 {invalid_cats}，合法分类为: {list(POST_CATEGORIES.keys())}")
+
+    eff_languages = PUBLISHER_DEFAULTS["allowed_languages"] if languages is None else languages
+    clean_langs = [
+        normalize_language_code(l)
+        for l in (eff_languages or [])
+        if str(l).strip() and str(l).strip().lower() != "all"
+    ]
+    clean_langs = [l for l in clean_langs if l and l != "unknown"]
+
+    daily_cap = max(0, int(max_publish_per_day))
+    today_sent_count = col.count_documents(
+        {
+            "source": "x",
+            f"{AUTO_COMMENT_FIELD}.consumed": True,
+            f"{AUTO_COMMENT_FIELD}.consumed_dir": session_path,
+            f"{AUTO_COMMENT_FIELD}.consumed_at_ts": {"$gte": now_ts - 86400},
+        }
+    )
+    if (not dry_run) and daily_cap > 0 and today_sent_count >= daily_cap:
+        logger.info(
+            f"⏸️ [Module2/每日上限] 账号目录={session_path} 最近24h已发评 {today_sent_count}/{daily_cap} 条，本轮跳过。"
+        )
+        return {
+            "status": "daily_limit_reached",
+            "dry_run": False,
+            "user_data_dir": session_path,
+            "account_warning": None,
+            "categories_filter": clean_cats or "ALL",
+            "languages_filter": clean_langs or "ALL",
+            "min_score": min_score,
+            "daily_sent_count": today_sent_count,
+            "max_publish_per_day": daily_cap,
+            "db_candidates_found": 0,
+            "published_count": 0,
+            "published_items": [],
+            "skipped_items": [],
+        }
+
     # 仅统计【当前发评账号自己】近 N 天内评论过的作者，互不干扰其他账号
-    dedup_days = max(1, int(PUBLISHER_DEFAULTS["author_dedup_days"]))
+    dedup_days = max(1, int(author_dedup_days))
     recent_own_docs = list(
         col.find(
             {
@@ -196,40 +241,30 @@ def publish_comments_from_db(
         f"{AUTO_COMMENT_FIELD}.best_comment": {"$exists": True, "$ne": ""},
         f"{AUTO_COMMENT_FIELD}.best_score": {"$gte": float(min_score)},
     }
-
-    clean_cats = [str(c).strip() for c in (categories or []) if str(c).strip() and str(c).strip().lower() != "all"]
     if clean_cats:
-        invalid_cats = [c for c in clean_cats if c not in POST_CATEGORIES]
-        if invalid_cats:
-            raise ValueError(f"包含未知帖子分类 {invalid_cats}，合法分类为: {list(POST_CATEGORIES.keys())}")
         query[f"{AUTO_COMMENT_FIELD}.category"] = {"$in": clean_cats}
-
-    eff_languages = PUBLISHER_DEFAULTS["allowed_languages"] if languages is None else languages
-    clean_langs = [
-        normalize_language_code(l)
-        for l in (eff_languages or [])
-        if str(l).strip() and str(l).strip().lower() != "all"
-    ]
-    clean_langs = [l for l in clean_langs if l and l != "unknown"]
     if clean_langs:
         query[f"{AUTO_COMMENT_FIELD}.language"] = {"$in": clean_langs}
 
     raw_candidates = list(
         col.find(query)
-        .sort([(f"{AUTO_COMMENT_FIELD}.best_score", -1), ("publish_time", -1)])
-        .limit(max(20, int(max_publish) * 8))
+        .sort([("publish_time", -1), (f"{AUTO_COMMENT_FIELD}.best_score", -1)])
+        .limit(max(40, int(max_publish) * 15))
     )
     candidates = [d for d in raw_candidates if not is_video_post(d)]
+
+    target_limit = max(1, int(max_publish))
+    if (not dry_run) and daily_cap > 0:
+        target_limit = min(target_limit, max(1, daily_cap - today_sent_count))
 
     logger.info(
         f"[Module2/启动] 模式={'DRY_RUN(纯库预览)' if dry_run else 'LIVE(真实Chrome消费发评)'} | 账号目录={session_path} | "
         f"语种={clean_langs or 'ALL'} | 赛道={clean_cats or 'ALL'} | 粉丝={min_followers}~{max_followers} | "
-        f"最低分={min_score} | 未消费候选={len(candidates)}条"
+        f"最低分={min_score} | 今日已发={today_sent_count}/{daily_cap or '∞'} | 未消费候选={len(candidates)}条"
     )
 
     published_items: List[Dict[str, Any]] = []
     skipped_items: List[Dict[str, Any]] = []
-    target_limit = max(1, int(max_publish))
 
     # ── 模式 A：纯数据库预览（零浏览器启动） ──
     if dry_run or not candidates:
@@ -286,6 +321,8 @@ def publish_comments_from_db(
             "categories_filter": clean_cats or "ALL",
             "languages_filter": clean_langs or "ALL",
             "min_score": min_score,
+            "daily_sent_count": today_sent_count,
+            "max_publish_per_day": daily_cap,
             "db_candidates_found": len(candidates),
             "published_count": len(published_items),
             "published_items": published_items,
@@ -372,6 +409,8 @@ def publish_comments_from_db(
                 consumer_label = f"@{self_handle}" if self_handle else (f"uid:{self_uid}" if self_uid else Path(session_path).name)
 
                 live_sent_count = 0
+                halt_status: Optional[str] = None
+                halt_warning: Optional[str] = None
                 for doc in candidates:
                     if len(published_items) >= target_limit:
                         break
@@ -414,7 +453,7 @@ def publish_comments_from_db(
                     post_url = str((doc.get("metadata") or {}).get("url") or f"https://x.com/{handle}/status/{pid}")
 
                     if live_sent_count > 0:
-                        _sleep_jitter(PUBLISHER_DEFAULTS["action_delay_range"])
+                        _sleep_jitter(action_delay_range)
 
                     prev_det = sniffer.op_counts.get("TweetDetail", 0)
                     resp = page.goto(post_url, timeout=45000, wait_until="domcontentloaded")
@@ -425,6 +464,8 @@ def publish_comments_from_db(
 
                     step_status, step_msg = inspect_x_page_account_status(page)
                     if step_status != "ok":
+                        halt_status = step_status
+                        halt_warning = step_msg
                         logger.error(f"🚨 [Module2/发评途中触发安全验证] {step_msg}")
                         break
 
@@ -473,6 +514,19 @@ def publish_comments_from_db(
                             )
                             continue
 
+                    # 先检查是否允许当前账号回复，再执行点赞，避免给限评帖先点赞后失败重试
+                    inline_box = page.locator('div[data-testid="tweetTextarea_0"], div[data-testid="tweetTextarea_0_label"]').first
+                    if inline_box.count() == 0 or not inline_box.is_visible():
+                        focal_tweet = _locate_focal_tweet(page, post_id=pid)
+                        reply_btn = focal_tweet.locator('button[data-testid="reply"]').first
+                        if reply_btn.count() > 0 and (
+                            reply_btn.is_disabled()
+                            or str(reply_btn.get_attribute("aria-disabled") or "").lower() == "true"
+                        ):
+                            _mark_objective_post_invalid(col, pid, "reply_restricted")
+                            skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "reply_restricted"})
+                            continue
+
                     try:
                         if like_when_commenting:
                             _like_focal_tweet_on_page(page, pid, logger)
@@ -489,6 +543,8 @@ def publish_comments_from_db(
                         live_sent_count += 1
                     except BusinessErrorException as biz_e:
                         err_str = f"business_blocked:{biz_e}"
+                        halt_status = "cooldown_required"
+                        halt_warning = err_str
                         logger.error(f"[Module2/业务阻断] @{handle} <{post_url}> | {err_str}")
                         col.update_one(
                             {"source": "x", "post_id": pid},
@@ -550,14 +606,6 @@ def publish_comments_from_db(
                     logger.info(
                         f"[Module2/消费成功] 账号={consumer_label} | [{category} | {language} | {score}分] @{handle} <{post_url}> | comment_id={comment_id}"
                     )
-
-                pub_captured = sniffer.export_all_captured_root_posts()
-                if pub_captured:
-                    try:
-                        post_manager = HarvestedPostManager(db, collection_name=POSTS_COLLECTION_NAME)
-                        persist_browsed_posts_to_db(post_manager, col, pub_captured)
-                    except Exception as persist_e:
-                        logger.debug(f"[Module2/顺路入库略过] {persist_e}")
             finally:
                 if page is not None:
                     try:
@@ -571,13 +619,15 @@ def publish_comments_from_db(
                         pass
 
     return {
-        "status": "ok",
+        "status": halt_status or "ok",
         "dry_run": False,
         "user_data_dir": session_path,
-        "account_warning": None,
+        "account_warning": halt_warning,
         "categories_filter": clean_cats or "ALL",
         "languages_filter": clean_langs or "ALL",
         "min_score": min_score,
+        "daily_sent_count": today_sent_count + len(published_items),
+        "max_publish_per_day": daily_cap,
         "db_candidates_found": len(candidates),
         "published_count": len(published_items),
         "published_items": published_items,
@@ -591,8 +641,9 @@ def run_comment_publisher_daemon(
     jitter_seconds: Optional[Tuple[int, int]] = None,
 ) -> None:
     """可选常驻定时消费发评循环。"""
-    logger = get_growth_logger()
+    logger = get_growth_logger("x_growth_publisher")
     base_interval = max(120, int(interval_seconds or PUBLISHER_DEFAULTS.get("publish_interval_seconds", 3600)))
+    cooldown_sec = max(base_interval, int(PUBLISHER_DEFAULTS.get("risk_cooldown_seconds", 21600)))
     raw_jitter = (
         jitter_seconds
         if jitter_seconds is not None
@@ -607,25 +658,34 @@ def run_comment_publisher_daemon(
 
     session_path = str(Path(user_data_dir).expanduser().resolve())
     logger.info(
-        f"⏰ [Module2/常驻发评任务启动] 账号目录={session_path} | 周期={base_interval}s + 抖动({j_low}~{j_high}s)"
+        f"⏰ [Module2/常驻发评任务启动] 账号目录={session_path} | 周期={base_interval}s + 抖动({j_low}~{j_high}s) | "
+        f"每轮上限={PUBLISHER_DEFAULTS['max_publish_per_run']}条 | 每日上限={PUBLISHER_DEFAULTS.get('max_publish_per_day', 0)}条"
     )
     round_no = 0
     while True:
         round_no += 1
         logger.info(f"========== [Module2/发评轮次 #{round_no}] 开始执行 ==========")
+        sleep_base = base_interval
         try:
-            res = publish_comments_from_db(
-                user_data_dir=session_path,
-                categories=PUBLISHER_DEFAULTS.get("allowed_categories"),
-                languages=PUBLISHER_DEFAULTS.get("allowed_languages"),
-                dry_run=bool(PUBLISHER_DEFAULTS.get("dry_run", False)),
-            )
-            if res.get("status") != "ok":
-                logger.error(f"⚠️ [Module2/发评轮次 #{round_no} 待处理] {res.get('account_warning')}")
+            res = publish_comments_from_db(user_data_dir=session_path)
+            st = str(res.get("status") or "ok")
+            if st == "daily_limit_reached":
+                logger.info(
+                    f"⏸️ [Module2/发评轮次 #{round_no}] 今日已达上限 "
+                    f"({res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0)})，跳过等待下轮释放配额。"
+                )
+            elif st != "ok":
+                sleep_base = cooldown_sec
+                logger.error(f"⚠️ [Module2/发评轮次 #{round_no} 触发冷却({sleep_base}s)] status={st} | {res.get('account_warning')}")
             else:
+                preview = [
+                    f"{it['author']}({it['language']}|{it['score']}分): {it['comment_text']}"
+                    for it in (res.get("published_items") or [])
+                ]
                 logger.info(
                     f"✅ [Module2/发评轮次 #{round_no} 完成] 未消费候选={res.get('db_candidates_found', 0)}条 | "
-                    f"本次成功消费={res.get('published_count', 0)}条"
+                    f"本次成功消费={res.get('published_count', 0)}条 | 今日累计={res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0) or '∞'}"
+                    + (f" | 预览={preview}" if preview else "")
                 )
         except KeyboardInterrupt:
             logger.info("[Module2/常驻发评退出] 收到手动中断信号，安全停止。")
@@ -633,7 +693,7 @@ def run_comment_publisher_daemon(
         except Exception as exc:
             logger.exception(f"❌ [Module2/发评轮次 #{round_no} 异常] {exc}")
 
-        sleep_sec = base_interval + (random.randint(j_low, j_high) if j_high > 0 else 0)
+        sleep_sec = sleep_base + (random.randint(j_low, j_high) if j_high > 0 else 0)
         next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"💤 [Module2/常驻休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
         try:
@@ -658,10 +718,5 @@ if __name__ == "__main__":
             jitter_seconds=PUBLISHER_DEFAULTS.get("publish_jitter_seconds", (180, 600)),
         )
     else:
-        res = publish_comments_from_db(
-            user_data_dir=target_dir,
-            categories=PUBLISHER_DEFAULTS.get("allowed_categories"),
-            languages=PUBLISHER_DEFAULTS.get("allowed_languages"),
-            dry_run=bool(PUBLISHER_DEFAULTS.get("dry_run", False)),
-        )
+        res = publish_comments_from_db(user_data_dir=target_dir)
         print(json.dumps(res, ensure_ascii=False, indent=2))

@@ -61,7 +61,7 @@ logger = setup_logger(app_name="x_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("x_myself_browser_session_dir", "x_myself")
+USER_DATA_DIR = resolve_session_dir("x_xiaohao_browser_session_dir", "x_myself")
 X_HOME_URL = "https://x.com/home"
 X_COMPOSE_URL = "https://x.com/compose/post"
 X_LOGIN_URL = "https://x.com/i/flow/login"
@@ -746,9 +746,9 @@ def _read_x_api_verdict(page, watcher):
             _forensics(page, "x_biz_reject", {"url": resp.url, "status": resp.status, "body": body})
             raise BusinessErrorException(f"X 业务发送被服务端拦截 (code={err_code})，原因: {err_msg}")
 
-        if resp.status >= 400:
-            logger.warning(f"[发送/校验] X 主接口返回 HTTP {resp.status}，转入 DOM 兜底校验")
-            return False, None
+        logger.warning(
+            f"[发送/校验] X 主接口返回 HTTP {resp.status} 但未包含 rest_id 与 errors，转入辅助/DOM校验 | url={resp.url}"
+        )
 
     sec = watcher.latest_secondary()
     if sec is not None:
@@ -758,7 +758,8 @@ def _read_x_api_verdict(page, watcher):
             logger.info(f"[发送/校验] 辅助接口确认 X 发帖成功 | 帖子ID: 【{tweet_id}】 | 结果: [Success]")
             return True, tweet_id
 
-    logger.warning(f"[发送/校验] 【{API_WAIT_TIMEOUT_MS}ms】 内未从接口提取到 rest_id，转入 DOM 兜底校验")
+    if resp is None:
+        logger.warning(f"[发送/校验] 【{API_WAIT_TIMEOUT_MS}ms】 内未捕获到主接口响应，转入 DOM 兜底校验")
     return False, None
 
 
@@ -901,8 +902,24 @@ def _submit_x_post(
         page.wait_for_timeout(1500)
         return post_id
 
-    # DOM 兜底校验：检查 Toast 提示中的新推文链接或编辑器是否已清空
+    # DOM 兜底校验：先拦截跳转安全验证/登录页与 HTTP>=400 失败响应，严防编辑器被重定向清空导致误判成功
     page.wait_for_timeout(3000)
+    cur_url_low = (page.url or "").lower()
+    if "/account/access" in cur_url_low or "/i/flow/login" in cur_url_low or cur_url_low.rstrip("/").endswith("/login"):
+        _forensics(page, "x_send_challenge_redirect", {"url": page.url})
+        raise BusinessErrorException(f"X 发送后页面触发安全验证/登录跳转: {page.url}")
+
+    for ch_sel in ('iframe[src*="arkoselabs"]', 'iframe[id*="arkose"]', 'form[action*="/account/access"]'):
+        try:
+            ch_loc = page.locator(ch_sel).first
+            if ch_loc.count() > 0 and ch_loc.is_visible():
+                _forensics(page, "x_send_challenge_dom", {"url": page.url, "selector": ch_sel})
+                raise BusinessErrorException(f"X 发送后页面弹出安全验证挑战 ({ch_sel})")
+        except BusinessErrorException:
+            raise
+        except Exception:
+            continue
+
     try:
         toast_link = page.locator('[data-testid="toast"] a[href*="/status/"]').first
         if toast_link.count() > 0:
@@ -914,6 +931,13 @@ def _submit_x_post(
                 return post_id
     except Exception:
         pass
+
+    bad_http = next((getattr(r, "status", 0) for r in reversed(watcher.primary) if getattr(r, "status", 0) >= 400), None)
+    if bad_http:
+        _forensics(page, "x_send_http_error", {"status": bad_http, "url": page.url})
+        if bad_http in (401, 403, 429):
+            raise BusinessErrorException(f"X 发送主接口返回风控/鉴权状态 HTTP {bad_http}")
+        raise Exception(f"X 发送主接口返回错误状态 HTTP {bad_http} 且未捕获到新帖 ID")
 
     text_after, media_after = _snapshot_x_editor(editor_container, real_editor)
     if (text_before > 0 and text_after == 0) or (media_before > 0 and media_after == 0):

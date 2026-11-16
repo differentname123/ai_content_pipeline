@@ -76,14 +76,15 @@ def now_iso_cn() -> str:
     return datetime.now(TZ_CN).isoformat(timespec="seconds")
 
 
-_LOGGER: Optional[logging.Logger] = None
+_LOGGERS: Dict[str, logging.Logger] = {}
 
 
-def get_growth_logger() -> logging.Logger:
-    global _LOGGER
-    if _LOGGER is None:
-        _LOGGER = setup_logger(app_name="x_growth")
-    return _LOGGER
+def get_growth_logger(app_name: str = "x_growth") -> logging.Logger:
+    logger_obj = _LOGGERS.get(app_name)
+    if logger_obj is None:
+        logger_obj = setup_logger(app_name=app_name)
+        _LOGGERS[app_name] = logger_obj
+    return logger_obj
 
 
 # ==============================================================================
@@ -140,6 +141,7 @@ PIPELINE_SCHEDULE_CONFIG: Dict[str, Any] = {
     "interval_seconds": 3600,           # 基础轮询间隔秒数（3600 秒 = 1 小时）
     "jitter_seconds": (120, 600),       # 每轮附加随机正抖动（2~10 分钟）
     "force_rescore": False,
+    "risk_cooldown_seconds": 21600,     # 遇安全验证或登录失效时自动静默冷却 6 小时，严禁死磕硬撞
 }
 
 # 兼容聚合视图
@@ -150,22 +152,24 @@ PIPELINE_DEFAULTS: Dict[str, Any] = {**COLLECTOR_DEFAULTS, **GENERATOR_DEFAULTS}
 # 不同运营账号只需按自身定位调整 user_data_dir / allowed_languages / allowed_categories
 # ==============================================================================
 PUBLISHER_DEFAULTS: Dict[str, Any] = {
-    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 当前执行发评的 X 账号登录目录
-    "continuous_loop": False,           # False=单次发布一轮即退出；True=按间隔常驻自动发评
-    "publish_interval_seconds": 3600,   # 开启常驻发评时的基础间隔秒数
+    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 当前执行发评的 X 账号登录目录（小号 @hsiaohuchu）
+    "continuous_loop": True,            # True=直接运行 comment_publisher.py 即按周期常驻自动发评
+    "publish_interval_seconds": 3600,   # 开启常驻发评时的基础间隔秒数（1 小时）
     "publish_jitter_seconds": (180, 600),
     "dry_run": False,                   # True=仅查库预览待发评论；False=启动真实 Chrome 发评并回写消费记录
-    "browser_visible": False,           # False=屏幕外静默运行；True=显示窗口观察发评过程
+    "browser_visible": False,           # False=--headless=new 静默运行不抢焦点；True=显示窗口观察发评过程
     "allowed_categories": None,         # None=不限分类；如填 ["tech_ai", "crypto_web3"] 则只消费对应赛道帖子
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 英文专号填 ("en",)，日文专号填 ("ja",)，综合号保留 ("en", "ja")
     "min_followers": 100,               # 当前账号只消费粉丝数 >= 该值的作者帖子
     "max_followers": 3000,              # 当前账号只消费粉丝数 <= 该值的作者帖子
     "min_score": 75,                    # 仅消费独立盲测评分 >= 该分值（75+ 自然活人感优质档）的评论
-    "max_publish_per_run": 3,           # 单次最多消费发送几条评论
+    "max_publish_per_run": 2,           # 单轮最多消费发送几条评论（平稳分散发送，避免单小时集中操作）
+    "max_publish_per_day": 15,          # 当前账号 24 小时滚动发评上限（防高频互动风控，0 表示不限）
     "post_max_age_seconds": 86400,      # 仅消费 24 小时以内的新鲜帖子
     "author_dedup_days": 7,             # 当前账号多少天内不对同一作者重复发评
     "avoid_connected_authors": True,    # 当前账号打开推文时若已与该作者关注/互关则本号跳过（不锁帖，其他号仍可用）
     "like_when_commenting": True,       # 发评论时顺手给原帖点赞
     "also_follow": False,               # 发评论时是否顺手关注该作者
     "action_delay_range": (14, 28),     # 多条真实发送之间的随机拟人间隔秒数
+    "risk_cooldown_seconds": 21600,     # 遇安全验证或服务端限流拒收时自动静默冷却秒数（6 小时）
 }

@@ -127,14 +127,22 @@ def run_comment_pipeline_daemon(
         f"语种={list(SUPPORTED_COMMENT_LANGUAGES)}"
     )
 
+    cooldown_sec = max(base_interval, int(PIPELINE_SCHEDULE_CONFIG.get("risk_cooldown_seconds", 21600)))
+
     round_no = 0
     while True:
         round_no += 1
         logger.info(f"========== [CommentPipeline/轮次 #{round_no}] 开始执行 ==========")
+        sleep_base = base_interval
         try:
             res = run_comment_pipeline(session_path, force_rescore=False)
-            if res.get("status") != "ok":
-                logger.error(f"⚠️ [CommentPipeline/轮次 #{round_no} 待处理] {res.get('account_warning')}")
+            st = str(res.get("status") or "ok")
+            if st != "ok":
+                if st in ("locked_challenge", "suspended", "not_logged_in"):
+                    sleep_base = cooldown_sec
+                logger.error(
+                    f"⚠️ [CommentPipeline/轮次 #{round_no} 待处理(冷却{sleep_base}s)] status={st} | {res.get('account_warning')}"
+                )
             else:
                 top_preview = [
                     f"{it['author']}({it['language']}|{it['best_score']}分): {it['best_comment']}"
@@ -153,7 +161,7 @@ def run_comment_pipeline_daemon(
         except Exception as exc:
             logger.exception(f"❌ [CommentPipeline/轮次 #{round_no} 异常] 将在下轮重试: {exc}")
 
-        sleep_sec = base_interval + (random.randint(j_low, j_high) if j_high > 0 else 0)
+        sleep_sec = sleep_base + (random.randint(j_low, j_high) if j_high > 0 else 0)
         next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"💤 [CommentPipeline/常驻休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
         try:
