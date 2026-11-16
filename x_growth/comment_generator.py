@@ -583,10 +583,10 @@ def _process_and_persist_single_wave(
             "consumed_at_ts": prev_meta.get("consumed_at_ts"),
             "published_comment_id": prev_meta.get("published_comment_id"),
             "published_comment_text": prev_meta.get("published_comment_text"),
-            "parent_engagement_at_publish": prev_meta.get("parent_engagement_at_publish"),
-            "comment_engagement": prev_meta.get("comment_engagement"),
-            "comment_engagement_history": prev_meta.get("comment_engagement_history"),
         }
+        for _track_key in ("parent_engagement_at_publish", "comment_engagement", "comment_engagement_history"):
+            if prev_meta.get(_track_key) is not None:
+                nested_payload[_track_key] = prev_meta[_track_key]
 
         bulk_ops.append(
             UpdateOne(

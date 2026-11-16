@@ -152,7 +152,17 @@ PIPELINE_DEFAULTS: Dict[str, Any] = {**COLLECTOR_DEFAULTS, **GENERATOR_DEFAULTS}
 # 不同运营账号只需按自身定位调整 user_data_dir / allowed_languages / allowed_categories
 # ==============================================================================
 PUBLISHER_DEFAULTS: Dict[str, Any] = {
-    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 当前执行发评的 X 账号登录目录（小号 @hsiaohuchu）
+    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 默认单账号兼容项（@hsiaohuchu）
+    "account_pool": [                   # 公共评论池消费账号池：每轮自动轮换先后顺序，独立计数、独立作者去重与独立风控冷却
+        {
+            "name": "x_xiaohao",
+            "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
+        },
+        {
+            "name": "x_myself",
+            "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
+        },
+    ],
     "continuous_loop": True,            # True=直接运行 comment_publisher.py 即按周期常驻自动发评
     "publish_interval_seconds": 3600,   # 开启常驻发评时的基础间隔秒数（1 小时）
     "publish_jitter_seconds": (180, 600),

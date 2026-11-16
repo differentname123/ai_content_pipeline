@@ -898,9 +898,8 @@ def sync_recent_comment_metrics(
                 unavailable_count += 1
 
             engagement_payload = {**snap, "poll_count": poll_count}
-            col.update_one(
-                {"source": "x", "post_id": post_id},
-                {
+            if isinstance(meta.get("comment_engagement_history"), list):
+                update_doc: Dict[str, Any] = {
                     "$set": {f"{AUTO_COMMENT_FIELD}.comment_engagement": engagement_payload},
                     "$push": {
                         f"{AUTO_COMMENT_FIELD}.comment_engagement_history": {
@@ -908,8 +907,15 @@ def sync_recent_comment_metrics(
                             "$slice": -_MAX_COMMENT_HISTORY_SNAPSHOTS,
                         }
                     },
-                },
-            )
+                }
+            else:
+                update_doc = {
+                    "$set": {
+                        f"{AUTO_COMMENT_FIELD}.comment_engagement": engagement_payload,
+                        f"{AUTO_COMMENT_FIELD}.comment_engagement_history": [snap],
+                    }
+                }
+            col.update_one({"source": "x", "post_id": post_id}, update_doc)
             synced_items.append(
                 {
                     "post_id": post_id,
@@ -938,12 +944,124 @@ def sync_recent_comment_metrics(
     }
 
 
+_PUBLISHER_OVERRIDE_KEYS: Tuple[str, ...] = (
+    "categories",
+    "languages",
+    "min_followers",
+    "max_followers",
+    "min_score",
+    "max_publish",
+    "max_publish_per_day",
+    "post_max_age_seconds",
+    "max_post_comments",
+    "stale_zero_engagement_seconds",
+    "stale_min_likes",
+    "author_dedup_days",
+    "avoid_connected_authors",
+    "also_follow",
+    "like_when_commenting",
+    "action_delay_range",
+    "browser_visible",
+    "dry_run",
+)
+
+
+def _resolve_publisher_pool(
+    account_pool: Optional[Sequence[Any]] = None,
+    user_data_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """解析待轮询发评的账号池；显式传入 `user_data_dir` 且未指定 `account_pool` 时保持单账号兼容。"""
+    if user_data_dir is not None and account_pool is None:
+        raw_items: Sequence[Any] = [user_data_dir]
+    else:
+        configured = account_pool if account_pool is not None else PUBLISHER_DEFAULTS.get("account_pool")
+        raw_items = configured or [PUBLISHER_DEFAULTS["user_data_dir"]]
+
+    resolved: List[Dict[str, Any]] = []
+    seen_dirs: Set[str] = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            raw_dir = str(item.get("user_data_dir") or "").strip()
+            name = str(item.get("name") or "").strip()
+            overrides = {k: item[k] for k in _PUBLISHER_OVERRIDE_KEYS if k in item}
+            if "allowed_categories" in item and "categories" not in overrides:
+                overrides["categories"] = item["allowed_categories"]
+            if "allowed_languages" in item and "languages" not in overrides:
+                overrides["languages"] = item["allowed_languages"]
+        else:
+            raw_dir = str(item or "").strip()
+            name = ""
+            overrides = {}
+
+        if not raw_dir:
+            continue
+        session_path = str(Path(raw_dir).expanduser().resolve())
+        if session_path in seen_dirs:
+            continue
+        seen_dirs.add(session_path)
+        resolved.append(
+            {
+                "name": name or Path(session_path).name,
+                "user_data_dir": session_path,
+                "overrides": overrides,
+            }
+        )
+    return resolved
+
+
+def _run_single_account_publish(
+    acc_cfg: Dict[str, Any],
+    *,
+    round_no: int,
+    cooldown_sec: int,
+    cooldown_until: Dict[str, float],
+    logger: Any,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """执行单个账号的本轮发评，维护各自独立的冷却窗口。"""
+    session_path = acc_cfg["user_data_dir"]
+    acc_name = acc_cfg["name"]
+    now_ts = time.time()
+    cool_end = cooldown_until.get(session_path, 0.0)
+    if cool_end > now_ts:
+        rem = int(cool_end - now_ts)
+        logger.info(f"⏸️ [Module2/发评轮次 #{round_no} | {acc_name}] 仍在独立风控冷却中（剩余 {rem}s），本轮跳过。")
+        return None, False
+
+    res = publish_comments_from_db(user_data_dir=session_path, **(acc_cfg.get("overrides") or {}))
+    st = str(res.get("status") or "ok")
+    if st == "daily_limit_reached":
+        logger.info(
+            f"⏸️ [Module2/发评轮次 #{round_no} | {acc_name}] 今日已达上限 "
+            f"({res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0)})，本账号跳过等待次日释放。"
+        )
+    elif st != "ok":
+        cooldown_until[session_path] = time.time() + cooldown_sec
+        logger.error(
+            f"⚠️ [Module2/发评轮次 #{round_no} | {acc_name} 触发独立冷却({cooldown_sec}s)] "
+            f"status={st} | {res.get('account_warning')}"
+        )
+    else:
+        cooldown_until.pop(session_path, None)
+        preview = [
+            f"{it['author']}({it['language']}|{it['score']}分): {it['comment_text']}"
+            for it in (res.get("published_items") or [])
+        ]
+        logger.info(
+            f"✅ [Module2/发评轮次 #{round_no} | {acc_name} 完成] 未消费候选={res.get('db_candidates_found', 0)}条 | "
+            f"本次成功消费={res.get('published_count', 0)}条 | 今日累计={res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0) or '∞'}"
+            + (f" | 预览={preview}" if preview else "")
+        )
+    did_work = (not res.get("dry_run", False)) and (st == "ok") and int(res.get("db_candidates_found") or 0) > 0
+    return res, did_work
+
+
 def run_comment_publisher_daemon(
-    user_data_dir: str = PUBLISHER_DEFAULTS["user_data_dir"],
+    user_data_dir: Optional[str] = None,
     interval_seconds: Optional[int] = None,
     jitter_seconds: Optional[Tuple[int, int]] = None,
+    account_pool: Optional[Sequence[Any]] = None,
 ) -> None:
-    """可选常驻定时消费发评循环。"""
+    """常驻定时多账号轮换消费发评循环（各账号独立去重、独立日限、独立风控冷却）。"""
     logger = get_growth_logger("x_growth_publisher")
     base_interval = max(120, int(interval_seconds or PUBLISHER_DEFAULTS.get("publish_interval_seconds", 3600)))
     cooldown_sec = max(base_interval, int(PUBLISHER_DEFAULTS.get("risk_cooldown_seconds", 21600)))
@@ -959,40 +1077,43 @@ def run_comment_publisher_daemon(
     else:
         j_low, j_high = 0, 0
 
-    session_path = str(Path(user_data_dir).expanduser().resolve())
+    accounts = _resolve_publisher_pool(account_pool=account_pool, user_data_dir=user_data_dir)
+    pool_desc = ", ".join(f"{a['name']}({a['user_data_dir']})" for a in accounts)
     logger.info(
-        f"⏰ [Module2/常驻发评任务启动] 账号目录={session_path} | 周期={base_interval}s + 抖动({j_low}~{j_high}s) | "
-        f"每轮上限={PUBLISHER_DEFAULTS['max_publish_per_run']}条 | 每日上限={PUBLISHER_DEFAULTS.get('max_publish_per_day', 0)}条"
+        f"⏰ [Module2/常驻发评任务启动] 账号池({len(accounts)}个)=[{pool_desc}] | 周期={base_interval}s + 抖动({j_low}~{j_high}s) | "
+        f"每轮每号上限={PUBLISHER_DEFAULTS['max_publish_per_run']}条 | 每日每号上限={PUBLISHER_DEFAULTS.get('max_publish_per_day', 0)}条"
     )
+
+    cooldown_until: Dict[str, float] = {}
     round_no = 0
     while True:
         round_no += 1
         logger.info(f"========== [Module2/发评轮次 #{round_no}] 开始执行 ==========")
-        sleep_base = base_interval
+        any_non_dry = False
         try:
-            res = publish_comments_from_db(user_data_dir=session_path)
-            st = str(res.get("status") or "ok")
-            if st == "daily_limit_reached":
-                logger.info(
-                    f"⏸️ [Module2/发评轮次 #{round_no}] 今日已达上限 "
-                    f"({res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0)})，跳过等待下轮释放配额。"
+            # 轮换账号先后顺序，保证 A/B 对比都能公平抢到前排候选帖
+            start_idx = (round_no - 1) % max(1, len(accounts))
+            ordered_accounts = accounts[start_idx:] + accounts[:start_idx]
+
+            prev_did_live = False
+            for acc_cfg in ordered_accounts:
+                if prev_did_live and cooldown_until.get(acc_cfg["user_data_dir"], 0.0) <= time.time():
+                    _sleep_jitter((10, 20))
+                res, did_work = _run_single_account_publish(
+                    acc_cfg,
+                    round_no=round_no,
+                    cooldown_sec=cooldown_sec,
+                    cooldown_until=cooldown_until,
+                    logger=logger,
                 )
-            elif st != "ok":
-                sleep_base = cooldown_sec
-                logger.error(f"⚠️ [Module2/发评轮次 #{round_no} 触发冷却({sleep_base}s)] status={st} | {res.get('account_warning')}")
-            else:
-                preview = [
-                    f"{it['author']}({it['language']}|{it['score']}分): {it['comment_text']}"
-                    for it in (res.get("published_items") or [])
-                ]
-                logger.info(
-                    f"✅ [Module2/发评轮次 #{round_no} 完成] 未消费候选={res.get('db_candidates_found', 0)}条 | "
-                    f"本次成功消费={res.get('published_count', 0)}条 | 今日累计={res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0) or '∞'}"
-                    + (f" | 预览={preview}" if preview else "")
-                )
-            if (not res.get("dry_run", False)) and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
+                prev_did_live = did_work
+                if res is not None and not res.get("dry_run", False):
+                    any_non_dry = True
+
+            if any_non_dry and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
                 try:
-                    sync_res = sync_recent_comment_metrics(user_data_dir=session_path)
+                    sync_dir = accounts[0]["user_data_dir"] if len(accounts) == 1 else None
+                    sync_res = sync_recent_comment_metrics(user_data_dir=sync_dir)
                     if sync_res.get("synced_count", 0) or sync_res.get("unavailable_count", 0):
                         logger.info(
                             f"📊 [Module2/指标同步] 成功={sync_res.get('synced_count', 0)}条 | "
@@ -1005,6 +1126,13 @@ def run_comment_publisher_daemon(
             break
         except Exception as exc:
             logger.exception(f"❌ [Module2/发评轮次 #{round_no} 异常] {exc}")
+
+        now_ts = time.time()
+        active_rem = [max(0.0, cooldown_until.get(a["user_data_dir"], 0.0) - now_ts) for a in accounts]
+        if accounts and all(rem > 0 for rem in active_rem):
+            sleep_base = max(base_interval, int(min(active_rem)))
+        else:
+            sleep_base = base_interval
 
         sleep_sec = sleep_base + (random.randint(j_low, j_high) if j_high > 0 else 0)
         next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1027,13 +1155,12 @@ if __name__ == "__main__":
         print(json.dumps(sync_recent_comment_metrics(min_refresh_interval_sec=0), ensure_ascii=False, indent=2))
         raise SystemExit(0)
 
-    target_dir = str(PUBLISHER_DEFAULTS["user_data_dir"])
     if PUBLISHER_DEFAULTS.get("continuous_loop", False):
         run_comment_publisher_daemon(
-            user_data_dir=target_dir,
             interval_seconds=PUBLISHER_DEFAULTS.get("publish_interval_seconds", 3600),
             jitter_seconds=PUBLISHER_DEFAULTS.get("publish_jitter_seconds", (180, 600)),
         )
     else:
-        res = publish_comments_from_db(user_data_dir=target_dir)
-        print(json.dumps(res, ensure_ascii=False, indent=2))
+        pool = _resolve_publisher_pool()
+        results = [publish_comments_from_db(user_data_dir=a["user_data_dir"], **(a.get("overrides") or {})) for a in pool]
+        print(json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2))
