@@ -135,6 +135,32 @@ def _follow_author_in_same_session(page: Any, handle: str, logger: Any) -> str:
         return f"FAILED:{str(f_exc)[:80]}"
 
 
+_MAX_COMMENT_HISTORY_SNAPSHOTS = 72
+
+
+def _build_engagement_snapshot(
+    post_or_eng: Optional[Dict[str, Any]],
+    *,
+    ts: int,
+    time_str: str,
+) -> Dict[str, Any]:
+    """构造与顶层 `engagement` / `engagement_history` 同构的轻量互动快照。"""
+    raw = post_or_eng or {}
+    eng = raw.get("engagement") if isinstance(raw.get("engagement"), dict) else raw
+    if not isinstance(eng, dict):
+        eng = {}
+    return {
+        "ts": int(ts),
+        "time_str": str(time_str),
+        "view_count": safe_int(eng.get("view_count"), 0),
+        "like_count": safe_int(eng.get("like_count"), 0),
+        "comment_count": safe_int(eng.get("comment_count"), 0),
+        "share_count": safe_int(eng.get("share_count"), 0),
+        "quote_count": safe_int(eng.get("quote_count"), 0),
+        "bookmark_count": safe_int(eng.get("bookmark_count"), 0),
+    }
+
+
 def _check_post_activity_eligible(
     doc: Dict[str, Any],
     *,
@@ -690,6 +716,12 @@ def publish_comments_from_db(
 
                     done_ts = int(time.time())
                     done_iso = now_iso_cn()
+                    parent_source = (
+                        live_post
+                        if (isinstance(live_post, dict) and isinstance(live_post.get("engagement"), dict) and live_post.get("engagement"))
+                        else doc
+                    )
+                    parent_snap = _build_engagement_snapshot(parent_source, ts=done_ts, time_str=done_iso)
                     col.update_one(
                         {"source": "x", "post_id": pid},
                         {
@@ -701,6 +733,7 @@ def publish_comments_from_db(
                                 f"{AUTO_COMMENT_FIELD}.consumed_at_ts": done_ts,
                                 f"{AUTO_COMMENT_FIELD}.published_comment_id": comment_id,
                                 f"{AUTO_COMMENT_FIELD}.published_comment_text": comment_text,
+                                f"{AUTO_COMMENT_FIELD}.parent_engagement_at_publish": parent_snap,
                                 f"{AUTO_COMMENT_FIELD}.follow_state": follow_state,
                                 f"{AUTO_COMMENT_FIELD}.last_publish_error": None,
                                 f"{AUTO_COMMENT_FIELD}.updated_at": done_iso,
@@ -759,12 +792,14 @@ def publish_comments_from_db(
 def sync_recent_comment_metrics(
     lookback_hours: Optional[int] = None,
     min_refresh_interval_sec: int = 1800,
-    limit: int = 30,
+    limit: int = 50,
     user_data_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    通过免登接口（Zero-Auth）同步近期已发布评论的曝光与互动指标到 MongoDB (`auto_comment.comment_metrics`)。
-    全程不读取小号/主号 Cookie 或启动浏览器，零账号风控风险。
+    通过免登接口（Zero-Auth）同步近期已发布评论的互动快照：
+    - 最新状态写入 `auto_comment.comment_engagement`
+    - 历次采样追加到 `auto_comment.comment_engagement_history`（最多保留最近 72 个点）
+    字段口径与顶层 `engagement` / `engagement_history` 完全一致，零 Cookie / 浏览器风控风险。
     """
     from platforms.harvesters.x_harvester import XHarvester
 
@@ -805,15 +840,15 @@ def sync_recent_comment_metrics(
     skipped_recent = 0
     for doc in docs:
         meta = doc.get(AUTO_COMMENT_FIELD) or {}
-        prev_metrics = dict(meta.get("comment_metrics") or {})
-        prev_ts = int(prev_metrics.get("fetched_at_ts") or 0)
+        prev_engagement = dict(meta.get("comment_engagement") or {})
+        prev_ts = int(prev_engagement.get("ts") or 0)
         if min_refresh_interval_sec > 0 and prev_ts > 0 and (now_ts - prev_ts) < int(min_refresh_interval_sec):
             skipped_recent += 1
             continue
         comment_id = str(meta.get("published_comment_id") or "").strip()
         if not comment_id:
             continue
-        to_fetch.append((doc, meta, prev_metrics, comment_id))
+        to_fetch.append((doc, meta, prev_engagement, comment_id))
 
     if not to_fetch:
         return {
@@ -839,44 +874,41 @@ def sync_recent_comment_metrics(
     error_count = 0
     synced_items = []
 
-    for idx, (doc, meta, prev_metrics, comment_id) in enumerate(to_fetch):
+    for idx, (doc, meta, prev_engagement, comment_id) in enumerate(to_fetch):
         post_id = str(doc.get("post_id") or "").strip()
         commenter = str(meta.get("consumed_by") or "").strip().lstrip("@")
         target_author = str((doc.get("author") or {}).get("username") or "").strip().lstrip("@")
         try:
             parsed = harvester._fetch_tweet_zero_auth(comment_id, screen_name=commenter)
-            poll_count = int(prev_metrics.get("poll_count") or 0) + 1
+            poll_count = int(prev_engagement.get("poll_count") or 0) + 1
             fetched_at = now_iso_cn()
             fetched_at_ts = int(time.time())
 
             if parsed:
-                eng = parsed.get("engagement") or {}
-                metrics_payload = {
+                snap = {
+                    **_build_engagement_snapshot(parsed, ts=fetched_at_ts, time_str=fetched_at),
                     "status": "ok",
-                    "views": safe_int(eng.get("view_count"), 0),
-                    "likes": safe_int(eng.get("like_count"), 0),
-                    "replies": safe_int(eng.get("comment_count"), 0),
-                    "retweets": safe_int(eng.get("share_count"), 0),
-                    "quotes": safe_int(eng.get("quote_count"), 0),
-                    "bookmarks": safe_int(eng.get("bookmark_count"), 0),
-                    "poll_count": poll_count,
-                    "fetched_at": fetched_at,
-                    "fetched_at_ts": fetched_at_ts,
                 }
                 synced_ok += 1
             else:
-                metrics_payload = {
-                    **prev_metrics,
+                snap = {
+                    **_build_engagement_snapshot(prev_engagement, ts=fetched_at_ts, time_str=fetched_at),
                     "status": "unavailable",
-                    "poll_count": poll_count,
-                    "fetched_at": fetched_at,
-                    "fetched_at_ts": fetched_at_ts,
                 }
                 unavailable_count += 1
 
+            engagement_payload = {**snap, "poll_count": poll_count}
             col.update_one(
                 {"source": "x", "post_id": post_id},
-                {"$set": {f"{AUTO_COMMENT_FIELD}.comment_metrics": metrics_payload}},
+                {
+                    "$set": {f"{AUTO_COMMENT_FIELD}.comment_engagement": engagement_payload},
+                    "$push": {
+                        f"{AUTO_COMMENT_FIELD}.comment_engagement_history": {
+                            "$each": [snap],
+                            "$slice": -_MAX_COMMENT_HISTORY_SNAPSHOTS,
+                        }
+                    },
+                },
             )
             synced_items.append(
                 {
@@ -884,7 +916,7 @@ def sync_recent_comment_metrics(
                     "target_author": target_author,
                     "comment_id": comment_id,
                     "commenter": commenter,
-                    **metrics_payload,
+                    **engagement_payload,
                 }
             )
         except Exception as exc:
