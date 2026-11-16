@@ -792,7 +792,7 @@ def publish_comments_from_db(
 def sync_recent_comment_metrics(
     lookback_hours: Optional[int] = None,
     min_refresh_interval_sec: int = 1800,
-    limit: int = 50,
+    limit: int = 80,
     user_data_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """

@@ -160,8 +160,8 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
         },
     ],
     "continuous_loop": True,            # True=直接运行 comment_publisher.py 即按周期常驻自动发评
-    "publish_interval_seconds": 3600,   # 开启常驻发评时的基础间隔秒数（1 小时）
-    "publish_jitter_seconds": (180, 600),
+    "publish_interval_seconds": 2400,   # 开启常驻发评时的基础间隔秒数（40 分钟，配合每轮 1 条更均匀覆盖全天）
+    "publish_jitter_seconds": (120, 420),
     "dry_run": False,                   # True=仅查库预览待发评论；False=启动真实 Chrome 发评并回写消费记录
     "browser_visible": False,           # False=--headless=new 静默运行不抢焦点；True=显示窗口观察发评过程
     "allowed_categories": None,         # None=不限分类；如填 ["tech_ai", "crypto_web3"] 则只消费对应赛道帖子
@@ -169,8 +169,8 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "min_followers": 100,               # 当前账号只消费粉丝数 >= 该值的作者帖子
     "max_followers": 3000,              # 当前账号只消费粉丝数 <= 该值的作者帖子
     "min_score": 75,                    # 仅消费独立盲测评分 >= 该分值（75+ 自然活人感优质档）的评论
-    "max_publish_per_run": 2,           # 单轮最多消费发送几条评论（平稳分散发送，避免单小时集中操作）
-    "max_publish_per_day": 15,          # 当前账号 24 小时滚动发评上限（防高频互动风控，0 表示不限）
+    "max_publish_per_run": 1,           # 单轮仅精挑并发送 1 条最优评论（动作最分散、不扎堆）
+    "max_publish_per_day": 24,          # 当前账号 24 小时滚动发评上限（配合每~45分钟发1条，均匀覆盖全天）
     "post_max_age_seconds": 86400,      # 仅消费 24 小时以内的新鲜帖子
     "max_post_comments": 15,            # 原帖已有回复数上限（避开已爆拥挤大楼、防小号回复沉底，0 表示不限）
     "stale_zero_engagement_seconds": 21600,  # 发布超过该时长（6 小时）且赞数仍不足阈值的冷死帖跳过（0 表示不限）
