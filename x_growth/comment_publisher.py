@@ -1112,8 +1112,7 @@ def run_comment_publisher_daemon(
 
             if any_non_dry and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
                 try:
-                    sync_dir = accounts[0]["user_data_dir"] if len(accounts) == 1 else None
-                    sync_res = sync_recent_comment_metrics(user_data_dir=sync_dir)
+                    sync_res = sync_recent_comment_metrics()
                     if sync_res.get("synced_count", 0) or sync_res.get("unavailable_count", 0):
                         logger.info(
                             f"📊 [Module2/指标同步] 成功={sync_res.get('synced_count', 0)}条 | "

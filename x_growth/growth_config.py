@@ -94,17 +94,17 @@ def get_growth_logger(app_name: str = "x_growth") -> logging.Logger:
 COLLECTOR_DEFAULTS: Dict[str, Any] = {
     "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 用于浏览采集的已登录目录
     "continuous_loop": False,           # 单独运行 x_browser_collector.py 时：False=拉取一轮即退出；True=常驻定时拉取
-    "interval_seconds": 3600,           # 单独开启常驻拉取时的基础间隔秒数
-    "jitter_seconds": (120, 600),       # 随机正抖动秒数
+    "interval_seconds": 2400,           # 单独开启常驻拉取时的基础间隔秒数（40 分钟）
+    "jitter_seconds": (120, 360),       # 随机正抖动秒数（2~6 分钟）
     "browser_visible": False,           # False=启用Chrome新版--headless=new真无头(保留显卡指纹+零桌面窗口+零抢焦点)；True=显示窗口
-    "home_scroll_rounds": 4,            # 首页 For You 拟人慢速滚屏次数（顺路收集大V热帖）
-    "thread_clicks_per_run": 3,         # 顺路点开几条英/日热帖看评论区（顺便收热评 + 发现评论区小蓝V）
-    "profile_visits_per_run": 6,        # 顺路点进几个 100~3000 粉蓝 V 主页收集原创主帖
+    "home_scroll_rounds": 6,            # 首页 For You 拟人慢速滚屏次数（顺路收集更多大V与热帖）
+    "thread_clicks_per_run": 4,         # 顺路点开几条英/日热帖看评论区（顺便收热评 + 发现更多评论区小蓝V）
+    "profile_visits_per_run": 9,        # 顺路点进几个 100~3000 粉蓝 V 主页收集原创主帖
     "min_followers": 100,               # 主页访问目标最小粉丝数
     "max_followers": 3000,              # 主页访问目标最大粉丝数（严守同体量高回关率蓝V）
     "post_max_age_seconds": 86400,      # 近期主帖参考时间窗（24h）
-    "author_avoid_seconds": 86400,      # 24h 内已拉取过帖子或访问过主页的目标作者直接避让，不再重复拉取
-    "max_posts_per_author_per_fetch": 2,# 单次拉取同一目标作者最多保留最新几条原创主帖，防高频搬运号单人霸榜，使作者均匀分布
+    "author_avoid_seconds": 43200,      # 12h 内已拉取过帖子或访问过主页的目标作者避让（兼顾作者分布均匀与日更博主新帖捕捉）
+    "max_posts_per_author_per_fetch": 3,# 单次拉取同一目标作者最多保留最新几条原创主帖（不增加额外请求提高单主页产出）
     "avoid_connected_authors": True,    # 选人进主页时直接避让已关注/互关作者，把主页访问名额留给未触达新作者
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,
 }
@@ -121,8 +121,8 @@ GENERATOR_DEFAULTS: Dict[str, Any] = {
     "max_followers": 3000,              # 目标发帖作者最大粉丝数
     "post_max_age_seconds": 86400,      # 仅对最近 24h 内发布的新鲜主帖生产评论
     "allowed_languages": SUPPORTED_COMMENT_LANGUAGES,  # 仅针对英语(en)与日语(ja)帖子生成同语种评论
-    "wave_size": 15,                    # 每波取 15 条合格未评帖处理并落库，若库内还有剩余则当场自动继续下一波直至清零
-    "max_waves_per_run": 20,            # 单次运行安全波次熔断上限（20 波 × 15 条 = 300 条，正常 1~2 波即清零）
+    "wave_size": 20,                    # 每波取 20 条合格未评帖处理并落库，若库内还有剩余则当场自动继续下一波直至清零
+    "max_waves_per_run": 20,            # 单次运行安全波次熔断上限（20 波 × 20 条 = 400 条，正常 1~2 波即清零）
     "comment_batch_size": 5,            # 每波内部按 5 条/批调用 low 模型生成评论与分类
     "score_batch_size": 6,              # 每波内部按 6 条/批调用独立 medium 模型横向盲测打分
     "generator_model_group": "low",     # 评论生成模型组
@@ -138,8 +138,8 @@ GENERATOR_DEFAULTS: Dict[str, Any] = {
 PIPELINE_SCHEDULE_CONFIG: Dict[str, Any] = {
     "user_data_dir": COLLECTOR_DEFAULTS["user_data_dir"],
     "continuous_loop": True,            # True=常驻定时循环（每轮先拉帖入库，再把库内合格待评帖100%生成完）；False=跑一轮退出
-    "interval_seconds": 3600,           # 基础轮询间隔秒数（3600 秒 = 1 小时）
-    "jitter_seconds": (120, 600),       # 每轮附加随机正抖动（2~10 分钟）
+    "interval_seconds": 2400,           # 基础轮询间隔秒数（2400 秒 = 40 分钟）
+    "jitter_seconds": (120, 360),       # 每轮附加随机正抖动（2~6 分钟）
     "force_rescore": False,
     "risk_cooldown_seconds": 21600,     # 遇安全验证或登录失效时自动静默冷却 6 小时，严禁死磕硬撞
 }
@@ -152,12 +152,8 @@ PIPELINE_DEFAULTS: Dict[str, Any] = {**COLLECTOR_DEFAULTS, **GENERATOR_DEFAULTS}
 # 不同运营账号只需按自身定位调整 user_data_dir / allowed_languages / allowed_categories
 # ==============================================================================
 PUBLISHER_DEFAULTS: Dict[str, Any] = {
-    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),  # 默认单账号兼容项（@hsiaohuchu）
-    "account_pool": [                   # 公共评论池消费账号池：每轮自动轮换先后顺序，独立计数、独立作者去重与独立风控冷却
-        {
-            "name": "x_xiaohao",
-            "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
-        },
+    "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),  # 默认单账号兼容项（@peterzhu1003）
+    "account_pool": [                   # 公共评论池消费账号池：小号 x_xiaohao 专职采集，当前仅使用主号 x_myself (@peterzhu1003) 发评
         {
             "name": "x_myself",
             "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
