@@ -210,9 +210,12 @@ class BinancePlatform:
     def session_dir(self, account):
         return resolve_session_dir(f"{account}_browser_session_dir", f"biance_{account}")
 
-    # 返回原热榜的币种字符串列表；保留统一调用参数，不额外改变Binance查询。
+    # 采集时合并主流共识币兜底避免漏掉主流讨论流；发布筛选保持原热榜不变。
     def hot_coins(self, for_publish=False):
-        return get_hot_coin()
+        coins = list(get_hot_coin() or [])
+        if for_publish:
+            return coins
+        return list(dict.fromkeys([*coins, "BTC", "ETH", "SOL"]))
 
     # 正文/图片路径/主题/立场 → 原发布接口的 (error,success,post_id)。
     def publish(self, session_dir, text, image_paths, topic=None, stance=None):
