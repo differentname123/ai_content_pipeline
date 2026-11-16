@@ -25,7 +25,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from common.common_utils import get_proxy_url, safe_int
+from common.common_utils import get_proxy_url, get_requests_proxies, safe_int
 from common.mongo_db.mongo_base import gen_db_object
 from content_pipeline.pipeline_db import is_video_post
 from platforms.playwright_base import (
@@ -135,6 +135,96 @@ def _follow_author_in_same_session(page: Any, handle: str, logger: Any) -> str:
         return f"FAILED:{str(f_exc)[:80]}"
 
 
+def _check_post_activity_eligible(
+    doc: Dict[str, Any],
+    *,
+    now_ts: int,
+    max_post_comments: int,
+    stale_zero_engagement_seconds: int,
+    stale_min_likes: int,
+    pub_ts_override: Optional[int] = None,
+) -> Optional[str]:
+    """
+    校验原帖是否处于“尚未爆楼且未彻底停流”的窗口内：
+    - 返回 None 表示合格；
+    - 返回原因字符串表示应由当前发评策略跳过（不污染公共池全局 skip 标记）。
+    """
+    eng = doc.get("engagement")
+    if not isinstance(eng, dict) or not eng:
+        return None
+    replies = safe_int(eng.get("comment_count"), 0)
+    likes = safe_int(eng.get("like_count"), 0)
+
+    if max_post_comments > 0 and replies > max_post_comments:
+        return f"crowded_replies({replies}>{max_post_comments})"
+
+    pub_ts = safe_int(pub_ts_override if pub_ts_override is not None else doc.get("publish_time"), 0)
+    if stale_zero_engagement_seconds > 0 and stale_min_likes > 0 and pub_ts > 0:
+        age_sec = max(0, now_ts - pub_ts)
+        if age_sec > stale_zero_engagement_seconds and likes < stale_min_likes:
+            return f"stale_low_engagement(age={age_sec}s,likes={likes}<{stale_min_likes})"
+    return None
+
+
+def _candidate_priority_key(doc: Dict[str, Any], now_ts: int) -> Tuple[int, int, int, float, int]:
+    """
+    优先把“刚发不久 + 已有初步真实互动 + 评论区仍空旷”的上升期帖子排在前面：
+    1. 时段分档：0=6h内新鲜帖，1=6~12h活跃帖，2=12~24h兜底活跃帖
+    2. 已有起势信号优先：likes>=1 或 replies>=1 排在零互动前面
+    3. 当前评论数升序（越空越容易占前排）
+    4. 独立评论质量分降序 + 发布时间降序
+    """
+    pub_ts = safe_int(doc.get("publish_time"), 0)
+    age_sec = max(0, now_ts - pub_ts)
+    if age_sec <= 21600:
+        age_bucket = 0
+    elif age_sec <= 43200:
+        age_bucket = 1
+    else:
+        age_bucket = 2
+
+    eng = doc.get("engagement") or {}
+    likes = max(0, safe_int(eng.get("like_count"), 0))
+    replies = max(0, safe_int(eng.get("comment_count"), 0))
+    has_traction = 0 if (likes >= 1 or replies >= 1) else 1
+    best_score = float((doc.get(AUTO_COMMENT_FIELD) or {}).get("best_score") or 0.0)
+    return (age_bucket, has_traction, replies, -best_score, -pub_ts)
+
+
+def _filter_and_rank_candidates(
+    raw_candidates: Sequence[Dict[str, Any]],
+    *,
+    now_ts: int,
+    max_post_comments: int,
+    stale_zero_engagement_seconds: int,
+    stale_min_likes: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """过滤视频帖、已爆拥挤帖与久发零互动冷死帖，并按上升期潜力优先排序。"""
+    picked: List[Dict[str, Any]] = []
+    stats = {"filtered_video": 0, "filtered_crowded": 0, "filtered_stale": 0}
+    for doc in raw_candidates:
+        if is_video_post(doc):
+            stats["filtered_video"] += 1
+            continue
+        reason = _check_post_activity_eligible(
+            doc,
+            now_ts=now_ts,
+            max_post_comments=max_post_comments,
+            stale_zero_engagement_seconds=stale_zero_engagement_seconds,
+            stale_min_likes=stale_min_likes,
+        )
+        if reason:
+            if reason.startswith("crowded_replies"):
+                stats["filtered_crowded"] += 1
+            else:
+                stats["filtered_stale"] += 1
+            continue
+        picked.append(doc)
+
+    picked.sort(key=lambda d: _candidate_priority_key(d, now_ts))
+    return picked, stats
+
+
 def publish_comments_from_db(
     user_data_dir: str = PUBLISHER_DEFAULTS["user_data_dir"],
     *,
@@ -146,6 +236,9 @@ def publish_comments_from_db(
     max_publish: int = PUBLISHER_DEFAULTS["max_publish_per_run"],
     max_publish_per_day: int = int(PUBLISHER_DEFAULTS.get("max_publish_per_day", 0)),
     post_max_age_seconds: int = int(PUBLISHER_DEFAULTS["post_max_age_seconds"]),
+    max_post_comments: Optional[int] = PUBLISHER_DEFAULTS.get("max_post_comments", 15),
+    stale_zero_engagement_seconds: int = int(PUBLISHER_DEFAULTS.get("stale_zero_engagement_seconds", 21600)),
+    stale_min_likes: int = int(PUBLISHER_DEFAULTS.get("stale_min_likes", 1)),
     author_dedup_days: int = int(PUBLISHER_DEFAULTS["author_dedup_days"]),
     avoid_connected_authors: bool = PUBLISHER_DEFAULTS["avoid_connected_authors"],
     also_follow: bool = PUBLISHER_DEFAULTS["also_follow"],
@@ -246,12 +339,22 @@ def publish_comments_from_db(
     if clean_langs:
         query[f"{AUTO_COMMENT_FIELD}.language"] = {"$in": clean_langs}
 
+    max_comments_cap = max(0, int(max_post_comments or 0))
+    stale_age_sec = max(0, int(stale_zero_engagement_seconds or 0))
+    min_stale_likes = max(0, int(stale_min_likes or 0))
+
     raw_candidates = list(
         col.find(query)
         .sort([("publish_time", -1), (f"{AUTO_COMMENT_FIELD}.best_score", -1)])
-        .limit(max(40, int(max_publish) * 15))
+        .limit(max(200, int(max_publish) * 50))
     )
-    candidates = [d for d in raw_candidates if not is_video_post(d)]
+    candidates, filter_stats = _filter_and_rank_candidates(
+        raw_candidates,
+        now_ts=now_ts,
+        max_post_comments=max_comments_cap,
+        stale_zero_engagement_seconds=stale_age_sec,
+        stale_min_likes=min_stale_likes,
+    )
 
     target_limit = max(1, int(max_publish))
     if (not dry_run) and daily_cap > 0:
@@ -260,7 +363,9 @@ def publish_comments_from_db(
     logger.info(
         f"[Module2/启动] 模式={'DRY_RUN(纯库预览)' if dry_run else 'LIVE(真实Chrome消费发评)'} | 账号目录={session_path} | "
         f"语种={clean_langs or 'ALL'} | 赛道={clean_cats or 'ALL'} | 粉丝={min_followers}~{max_followers} | "
-        f"最低分={min_score} | 今日已发={today_sent_count}/{daily_cap or '∞'} | 未消费候选={len(candidates)}条"
+        f"最低分={min_score} | 原帖回复<={max_comments_cap or '∞'} | "
+        f"滤除(拥挤={filter_stats['filtered_crowded']},冷死={filter_stats['filtered_stale']}) | "
+        f"今日已发={today_sent_count}/{daily_cap or '∞'} | 未消费候选={len(candidates)}条"
     )
 
     published_items: List[Dict[str, Any]] = []
@@ -514,6 +619,22 @@ def publish_comments_from_db(
                             )
                             continue
 
+                    if isinstance(live_post, dict):
+                        live_activity_reason = _check_post_activity_eligible(
+                            live_post,
+                            now_ts=int(time.time()),
+                            max_post_comments=max_comments_cap,
+                            stale_zero_engagement_seconds=stale_age_sec,
+                            stale_min_likes=min_stale_likes,
+                            pub_ts_override=live_pub_ts,
+                        )
+                        if live_activity_reason:
+                            logger.info(f"⏭️ [Module2/实时复核跳过] @{handle} post_id={pid} | reason={live_activity_reason}")
+                            skipped_items.append(
+                                {"post_id": pid, "author": f"@{handle}", "reason": f"live_{live_activity_reason}"}
+                            )
+                            continue
+
                     # 先检查是否允许当前账号回复，再执行点赞，避免给限评帖先点赞后失败重试
                     inline_box = page.locator('div[data-testid="tweetTextarea_0"], div[data-testid="tweetTextarea_0_label"]').first
                     if inline_box.count() == 0 or not inline_box.is_visible():
@@ -635,6 +756,156 @@ def publish_comments_from_db(
     }
 
 
+def sync_recent_comment_metrics(
+    lookback_hours: Optional[int] = None,
+    min_refresh_interval_sec: int = 1800,
+    limit: int = 30,
+    user_data_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    通过免登接口（Zero-Auth）同步近期已发布评论的曝光与互动指标到 MongoDB (`auto_comment.comment_metrics`)。
+    全程不读取小号/主号 Cookie 或启动浏览器，零账号风控风险。
+    """
+    from platforms.harvesters.x_harvester import XHarvester
+
+    logger = get_growth_logger("x_growth_publisher")
+    db = gen_db_object()
+    col = db.get_collection(POSTS_COLLECTION_NAME)
+
+    now_ts = int(time.time())
+    eff_lookback = int(
+        PUBLISHER_DEFAULTS.get("metrics_lookback_hours", 72) if lookback_hours is None else lookback_hours
+    )
+
+    query: Dict[str, Any] = {
+        "source": "x",
+        f"{AUTO_COMMENT_FIELD}.consumed": True,
+        f"{AUTO_COMMENT_FIELD}.published_comment_id": {"$nin": [None, ""]},
+    }
+    if eff_lookback > 0:
+        query[f"{AUTO_COMMENT_FIELD}.consumed_at_ts"] = {"$gte": now_ts - eff_lookback * 3600}
+    if user_data_dir:
+        query[f"{AUTO_COMMENT_FIELD}.consumed_dir"] = str(Path(user_data_dir).expanduser().resolve())
+
+    docs = list(
+        col.find(
+            query,
+            {
+                "post_id": 1,
+                "author.username": 1,
+                AUTO_COMMENT_FIELD: 1,
+                "_id": 0,
+            },
+        )
+        .sort(f"{AUTO_COMMENT_FIELD}.consumed_at_ts", -1)
+        .limit(max(1, int(limit)))
+    )
+
+    to_fetch = []
+    skipped_recent = 0
+    for doc in docs:
+        meta = doc.get(AUTO_COMMENT_FIELD) or {}
+        prev_metrics = dict(meta.get("comment_metrics") or {})
+        prev_ts = int(prev_metrics.get("fetched_at_ts") or 0)
+        if min_refresh_interval_sec > 0 and prev_ts > 0 and (now_ts - prev_ts) < int(min_refresh_interval_sec):
+            skipped_recent += 1
+            continue
+        comment_id = str(meta.get("published_comment_id") or "").strip()
+        if not comment_id:
+            continue
+        to_fetch.append((doc, meta, prev_metrics, comment_id))
+
+    if not to_fetch:
+        return {
+            "status": "ok",
+            "lookback_hours": eff_lookback,
+            "candidates_found": len(docs),
+            "skipped_recent": skipped_recent,
+            "synced_count": 0,
+            "unavailable_count": 0,
+            "error_count": 0,
+            "items": [],
+        }
+
+    # 显式传入空字符串禁用账号 Cookie 抽取，确保 100% 走免登公开接口
+    harvester = XHarvester(
+        burner_cookies="",
+        burner_user_data_dir="",
+        proxies=get_requests_proxies(),
+    )
+
+    synced_ok = 0
+    unavailable_count = 0
+    error_count = 0
+    synced_items = []
+
+    for idx, (doc, meta, prev_metrics, comment_id) in enumerate(to_fetch):
+        post_id = str(doc.get("post_id") or "").strip()
+        commenter = str(meta.get("consumed_by") or "").strip().lstrip("@")
+        target_author = str((doc.get("author") or {}).get("username") or "").strip().lstrip("@")
+        try:
+            parsed = harvester._fetch_tweet_zero_auth(comment_id, screen_name=commenter)
+            poll_count = int(prev_metrics.get("poll_count") or 0) + 1
+            fetched_at = now_iso_cn()
+            fetched_at_ts = int(time.time())
+
+            if parsed:
+                eng = parsed.get("engagement") or {}
+                metrics_payload = {
+                    "status": "ok",
+                    "views": safe_int(eng.get("view_count"), 0),
+                    "likes": safe_int(eng.get("like_count"), 0),
+                    "replies": safe_int(eng.get("comment_count"), 0),
+                    "retweets": safe_int(eng.get("share_count"), 0),
+                    "quotes": safe_int(eng.get("quote_count"), 0),
+                    "bookmarks": safe_int(eng.get("bookmark_count"), 0),
+                    "poll_count": poll_count,
+                    "fetched_at": fetched_at,
+                    "fetched_at_ts": fetched_at_ts,
+                }
+                synced_ok += 1
+            else:
+                metrics_payload = {
+                    **prev_metrics,
+                    "status": "unavailable",
+                    "poll_count": poll_count,
+                    "fetched_at": fetched_at,
+                    "fetched_at_ts": fetched_at_ts,
+                }
+                unavailable_count += 1
+
+            col.update_one(
+                {"source": "x", "post_id": post_id},
+                {"$set": {f"{AUTO_COMMENT_FIELD}.comment_metrics": metrics_payload}},
+            )
+            synced_items.append(
+                {
+                    "post_id": post_id,
+                    "target_author": target_author,
+                    "comment_id": comment_id,
+                    "commenter": commenter,
+                    **metrics_payload,
+                }
+            )
+        except Exception as exc:
+            error_count += 1
+            logger.warning(f"[Module2/指标同步异常] post_id={post_id} comment_id={comment_id}: {exc}")
+
+        if idx < len(to_fetch) - 1:
+            time.sleep(0.4)
+
+    return {
+        "status": "ok",
+        "lookback_hours": eff_lookback,
+        "candidates_found": len(docs),
+        "skipped_recent": skipped_recent,
+        "synced_count": synced_ok,
+        "unavailable_count": unavailable_count,
+        "error_count": error_count,
+        "items": synced_items,
+    }
+
+
 def run_comment_publisher_daemon(
     user_data_dir: str = PUBLISHER_DEFAULTS["user_data_dir"],
     interval_seconds: Optional[int] = None,
@@ -687,6 +958,16 @@ def run_comment_publisher_daemon(
                     f"本次成功消费={res.get('published_count', 0)}条 | 今日累计={res.get('daily_sent_count', 0)}/{res.get('max_publish_per_day', 0) or '∞'}"
                     + (f" | 预览={preview}" if preview else "")
                 )
+            if (not res.get("dry_run", False)) and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
+                try:
+                    sync_res = sync_recent_comment_metrics(user_data_dir=session_path)
+                    if sync_res.get("synced_count", 0) or sync_res.get("unavailable_count", 0):
+                        logger.info(
+                            f"📊 [Module2/指标同步] 成功={sync_res.get('synced_count', 0)}条 | "
+                            f"不可用={sync_res.get('unavailable_count', 0)}条 | 跳过未到期={sync_res.get('skipped_recent', 0)}条"
+                        )
+                except Exception as metric_exc:
+                    logger.warning(f"[Module2/指标同步跳过] {metric_exc}")
         except KeyboardInterrupt:
             logger.info("[Module2/常驻发评退出] 收到手动中断信号，安全停止。")
             break
@@ -709,6 +990,10 @@ if __name__ == "__main__":
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    if "--sync-metrics" in sys.argv[1:]:
+        print(json.dumps(sync_recent_comment_metrics(min_refresh_interval_sec=0), ensure_ascii=False, indent=2))
+        raise SystemExit(0)
 
     target_dir = str(PUBLISHER_DEFAULTS["user_data_dir"])
     if PUBLISHER_DEFAULTS.get("continuous_loop", False):

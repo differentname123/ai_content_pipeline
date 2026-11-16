@@ -166,10 +166,15 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "max_publish_per_run": 2,           # 单轮最多消费发送几条评论（平稳分散发送，避免单小时集中操作）
     "max_publish_per_day": 15,          # 当前账号 24 小时滚动发评上限（防高频互动风控，0 表示不限）
     "post_max_age_seconds": 86400,      # 仅消费 24 小时以内的新鲜帖子
+    "max_post_comments": 15,            # 原帖已有回复数上限（避开已爆拥挤大楼、防小号回复沉底，0 表示不限）
+    "stale_zero_engagement_seconds": 21600,  # 发布超过该时长（6 小时）且赞数仍不足阈值的冷死帖跳过（0 表示不限）
+    "stale_min_likes": 1,               # 超过上述时长后要求原帖至少获得的点赞数，过滤长期无人问津的停流帖
     "author_dedup_days": 7,             # 当前账号多少天内不对同一作者重复发评
     "avoid_connected_authors": True,    # 当前账号打开推文时若已与该作者关注/互关则本号跳过（不锁帖，其他号仍可用）
     "like_when_commenting": True,       # 发评论时顺手给原帖点赞
     "also_follow": False,               # 发评论时是否顺手关注该作者
     "action_delay_range": (14, 28),     # 多条真实发送之间的随机拟人间隔秒数
     "risk_cooldown_seconds": 21600,     # 遇安全验证或服务端限流拒收时自动静默冷却秒数（6 小时）
+    "sync_metrics_after_publish": True, # 每轮发评完成后通过免登接口同步近期已发评论的阅读/点赞等公开指标
+    "metrics_lookback_hours": 72,       # 每次自动同步回溯最近多少小时内已消费发布的评论（默认 72 小时）
 }

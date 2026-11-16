@@ -41,6 +41,7 @@ __all__ = [
     "run_comment_pipeline_daemon",
     "publish_comments_from_db",
     "run_comment_publisher_daemon",
+    "sync_recent_comment_metrics",
 ]
 
 
@@ -57,7 +58,7 @@ def __getattr__(name: str) -> Any:
         from x_growth import comment_pipeline
 
         return getattr(comment_pipeline, name)
-    if name in ("publish_comments_from_db", "run_comment_publisher_daemon"):
+    if name in ("publish_comments_from_db", "run_comment_publisher_daemon", "sync_recent_comment_metrics"):
         from x_growth import comment_publisher
 
         return getattr(comment_publisher, name)
