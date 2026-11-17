@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import threading
+import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -125,9 +126,29 @@ class _ThirdPartyNoiseFilter(logging.Filter):
 _NOISE_FILTER = _ThirdPartyNoiseFilter()
 
 
+class SafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """
+    Windows 多进程环境下的文件轮转安全处理器：
+    当跨午夜切分日志时，若目标日志被其他并发进程占用（触发 Windows 的 WinError 32 PermissionError），
+    安全捕获异常，推进轮转时间戳至下一周期并继续以追加模式写入，防止死循环反复报错刷屏终端。
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            current_time = int(time.time())
+            new_rollover_at = self.computeRollover(current_time)
+            while new_rollover_at <= current_time:
+                new_rollover_at += self.interval
+            self.rolloverAt = new_rollover_at
+            if not self.stream:
+                self.stream = self._open()
+
+
 def _attach_handlers(target_logger: logging.Logger, log_dir: str, app_name: str):
     log_file_path = os.path.join(log_dir, f"{app_name}.log")
-    file_handler = TimedRotatingFileHandler(
+    file_handler = SafeTimedRotatingFileHandler(
         filename=log_file_path,
         when="midnight",
         interval=1,
