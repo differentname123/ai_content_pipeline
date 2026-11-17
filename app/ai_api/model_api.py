@@ -52,7 +52,7 @@ API_KEY = get_config("local_api_key")
 HIGH_MODEL_LIST = [
     # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
     {"model_name": "gpt-6.1-sol-max", "权重": 90, "备注": "来源codex 订阅账号 (占组内总权重 90%)"},
-    {"model_name": "antigravity-argon-high", "权重": 10, "备注": "来源antigravity 本地客户端 (占组内总权重 10%)"},
+    # {"model_name": "antigravity-argon-high", "权重": 10, "备注": "来源antigravity 本地客户端 (占组内总权重 10%)"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
@@ -64,7 +64,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
-    {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端 (占组内总权重 4%)"},
+    # {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端 (占组内总权重 4%)"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
@@ -97,7 +97,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-    {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
+    # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。

@@ -60,7 +60,7 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 # ==============================================================================
 SUB_ACCOUNT_POOL: List[str] = [
     "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
-    "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
+    # "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
 ]
 
 # 若设为 None（默认），则启用上面的 SUB_ACCOUNT_POOL 多小号随机池；
