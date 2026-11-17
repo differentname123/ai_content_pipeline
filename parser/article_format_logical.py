@@ -65,6 +65,7 @@ from platforms.binance_api import (
     fetch_binance_feed,
     fetch_binance_future_hot_coins,
     fetch_binance_hot_hashtags,
+    fetch_binance_post_detail,
     fetch_binance_spot_hot_coins,
     fetch_binance_square_replies,
     get_latest_crypto_price,
@@ -99,6 +100,7 @@ ANALYSIS_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析�
 VIRAL_STAGE1_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖可用性筛选.txt")
 VIRAL_STAGE2_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖洗稿和神评生成.txt")
 VIRAL_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_发布前总编精选.txt")
+SELECTION_PROMPT_VERSION = "20261118-v2_data_driven"
 
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -1996,7 +1998,7 @@ def _get_recent_published_image_usage(article_manager, platform, hours=IMAGE_DED
 
 
 # 账号状态、候选三元组列表 → 所有满足主题冷却与图片去重的候选索引列表（最多取前 limit 个）。
-def _get_valid_publish_candidate_indices(account_state, candidates, now, used_addresses, article_type, limit=8):
+def _get_valid_publish_candidate_indices(account_state, candidates, now, used_addresses, article_type, limit=50):
     history = account_state.get("topic_publish_history") or {}
     valid_indices = []
     for index, (article, addresses, _) in enumerate(candidates):
@@ -2018,10 +2020,79 @@ def _select_publish_candidate(account_state, candidates, now, used_addresses, ar
     return valid[0] if valid else None
 
 
-# 总编横向擂台（Top-8 选 1 + 终审去 AI 味精修）：异常时无缝回退至排第一的候选。
+def _get_recent_published_history_with_metrics(article_manager, platform, target_accounts=None, limit=50):
+    """
+    拉取目标发送账号近期已发布的帖子历史（按时间倒序最多 limit 条），
+    并对币安平台安全补齐最新真实阅读数与互动指标。不加过多标签，保持数据与内容完整客观，
+    供后续大模型总编横向比稿时自主深度分析受众偏好。
+    """
+    query = {
+        "status": "ok",
+        f"publish_records.{platform}.status": "success",
+    }
+    if target_accounts:
+        query[f"publish_records.{platform}.published_by"] = {"$in": list(target_accounts)}
+
+    docs = article_manager.find_articles(
+        query=query,
+        sort=[(f"publish_records.{platform}.publish_time", -1)],
+        limit=limit,
+    ) or []
+
+    history_items = []
+    need_upsert = []
+    now_ts = time.time()
+
+    for d in docs:
+        rec = (d.get("publish_records") or {}).get(platform) or {}
+        info = d.get("article_info") or {}
+        text = (info.get("post_text") or info.get("text") or "").strip().replace("\n", " ")
+        if not text:
+            continue
+
+        pid = rec.get("post_id")
+        views = rec.get("view_count")
+        likes = rec.get("like_count")
+        comments = rec.get("comment_count")
+        pub_time = rec.get("publish_time", 0)
+
+        # 针对币安平台，对尚未抓取过浏览量（且发布超 10 分钟）的帖子进行快速免登只读同步并沉淀
+        if platform == PLATFORM_BINANCE and pid and views is None and (now_ts - pub_time > 600):
+            try:
+                detail = fetch_binance_post_detail(str(pid))
+                if detail and detail.get("contentStatus") == 2:
+                    views = rec["view_count"] = detail.get("viewCount", 0)
+                    likes = rec["like_count"] = detail.get("likeCount", 0)
+                    comments = rec["comment_count"] = detail.get("commentCount", 0)
+                    need_upsert.append(d)
+            except Exception:
+                pass
+
+        time_str = datetime.fromtimestamp(pub_time, tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M") if pub_time else "未知"
+        history_items.append({
+            "account": rec.get("published_by"),
+            "topic": d.get("topic"),
+            "stance": d.get("stance"),
+            "published_at": time_str,
+            "views": views if views is not None else "统计中",
+            "likes": likes if likes is not None else 0,
+            "comments": comments if comments is not None else 0,
+            "content": text[:150],
+        })
+
+    if need_upsert:
+        try:
+            article_manager.upsert_articles(need_upsert)
+        except Exception:
+            pass
+
+    return history_items
+
+
+# 总编横向擂台（Top-50 选 1 + 终审去 AI 味精修）：异常时无缝回退至排第一的候选。
 def _select_and_polish_best_candidate(article_manager, platform, account, account_state, candidates, now, used_addresses, article_type):
     valid_indices = _get_valid_publish_candidate_indices(
-        account_state, candidates, now, used_addresses, article_type, limit=8,
+        account_state, candidates, now, used_addresses, article_type, limit=50,
     )
     if not valid_indices:
         return None
@@ -2029,40 +2100,26 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
     viral = article_type == ARTICLE_TYPE_VIRAL
     comments_key = "bait_comments" if viral else "god_comments"
 
-    # 获取近期已发帖摘要，供总编防撞车
-    recent_arts = article_manager.find_articles(
-        query={
-            "status": "ok",
-            f"publish_records.{platform}.status": "success",
-            f"publish_records.{platform}.publish_time": {"$gte": now - 72 * 3600},
-        },
-        sort=[(f"publish_records.{platform}.publish_time", -1)],
-        limit=12,
-    ) or []
-    recent_summaries = []
-    for r_art in recent_arts:
-        r_info = r_art.get("article_info") or {}
-        r_txt = (r_info.get("post_text") or r_info.get("text") or "").strip().replace("\n", " ")
-        if r_txt:
-            recent_summaries.append(f"[{r_art.get('topic', '')}] {r_txt[:70]}")
+    # 获取当前发送账号最近已发布的历史战报（最多 50 条，带真实阅读量与互动数）
+    target_accs = ACCOUNTS if platform == PLATFORM_BINANCE else None
+    historical_performance = _get_recent_published_history_with_metrics(
+        article_manager, platform, target_accounts=target_accs, limit=50,
+    )
 
     arena_items = []
     for rank_no, idx in enumerate(valid_indices, 1):
         art, _, m_coin = candidates[idx]
         info = art["article_info"]
-        eng = art.get("_source_engagement") or {}
         if viral:
             img_roles = [
                 img.get("semantic_role", "")
                 for img in (info.get("image_semantics") or [])
                 if isinstance(img, dict) and img.get("keep")
             ]
+            # 彻底去除内部评分与第三方平台数据干扰，保持纯净
             arena_items.append({
                 "candidate_no": rank_no,
-                "matched_coin": m_coin,
-                "viral_score": info.get("viral_score"),
-                "source_engagement": f"浏览={eng.get('view_count', 0):,}, 点赞={eng.get('like_count', 0)}, 评论={eng.get('comment_count', 0)}",
-                "viral_analysis": info.get("viral_analysis", ""),
+                "topic": art.get("topic") or m_coin,
                 "kept_images_desc": img_roles,
                 "draft_text": info.get("post_text", ""),
                 "draft_comments": info.get("bait_comments", []),
@@ -2082,12 +2139,11 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
                 for v in vis_list:
                     if isinstance(v, dict) and v.get("placeholder") in selected_phs and v.get("what_it_shows"):
                         img_descs.append(v["what_it_shows"])
+            # 彻底去除内部评分，仅保留核心盘面论据与初稿文本
             arena_items.append({
                 "candidate_no": rank_no,
-                "coin": art.get("topic"),
+                "topic": art.get("topic"),
                 "stance": art.get("stance"),
-                "score": info.get("score"),
-                "image_count": len(info.get("image_placeholders") or []),
                 "kept_images_desc": img_descs,
                 "core_facts": used_facts,
                 "draft_text": info.get("text", ""),
@@ -2099,7 +2155,7 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
     payload = {
         "platform": platform.upper(),
         "platform_constraints": f"{rival_ban}；正文非空白字符数 <= {ARTICLE_MAX_CHARS}",
-        "recent_published": recent_summaries,
+        "historical_published_performance": historical_performance,
         "candidates": arena_items,
     }
 
@@ -2150,6 +2206,13 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
                         f"article_info.{comments_key}": chosen_art["article_info"][comments_key],
                     }},
                 )
+        chosen_art["_selection_meta"] = {
+            "prompt_version": SELECTION_PROMPT_VERSION,
+            "reason": str(parsed.get("reason") or ""),
+            "selected_candidate_no": cand_no,
+            "candidate_pool_size": len(valid_indices),
+            "selected_at": time.time(),
+        }
         _log(
             f"{rule['action']}/总编擂台",
             "横向比稿与终审精修完成",
@@ -2294,6 +2357,11 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
         plat_record.setdefault("interacted", False)
         plat_record.setdefault("interaction_time", None)
         plat_record.setdefault("comment_interact_info", {})
+        sel_meta = article.get("_selection_meta") or {}
+        if sel_meta.get("prompt_version"):
+            plat_record["selection_prompt_version"] = sel_meta["prompt_version"]
+        if sel_meta.get("reason"):
+            plat_record["selection_reason"] = sel_meta["reason"]
     else:
         error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"
         state_updates = {f"{prefix}last_error_msg": error_detail, f"{prefix}last_error_time": now}
