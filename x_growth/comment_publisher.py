@@ -263,7 +263,7 @@ def publish_comments_from_db(
     max_publish_per_day: int = int(PUBLISHER_DEFAULTS.get("max_publish_per_day", 0)),
     post_max_age_seconds: int = int(PUBLISHER_DEFAULTS["post_max_age_seconds"]),
     max_post_comments: Optional[int] = PUBLISHER_DEFAULTS.get("max_post_comments", 15),
-    stale_zero_engagement_seconds: int = int(PUBLISHER_DEFAULTS.get("stale_zero_engagement_seconds", 21600)),
+    stale_zero_engagement_seconds: int = int(PUBLISHER_DEFAULTS.get("stale_zero_engagement_seconds", 7200)),
     stale_min_likes: int = int(PUBLISHER_DEFAULTS.get("stale_min_likes", 1)),
     author_dedup_days: int = int(PUBLISHER_DEFAULTS["author_dedup_days"]),
     avoid_connected_authors: bool = PUBLISHER_DEFAULTS["avoid_connected_authors"],

@@ -173,7 +173,8 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "max_publish_per_day": 24,          # 当前账号 24 小时滚动发评上限（配合每~45分钟发1条，均匀覆盖全天）
     "post_max_age_seconds": 86400,      # 仅消费 24 小时以内的新鲜帖子
     "max_post_comments": 15,            # 原帖已有回复数上限（避开已爆拥挤大楼、防小号回复沉底，0 表示不限）
-    "stale_zero_engagement_seconds": 21600,  # 发布超过该时长（6 小时）且赞数仍不足阈值的冷死帖跳过（0 表示不限）
+    # 【保留过滤原因说明】推文发出 2 小时后若仍为 0 赞，经 N=28 实测统计其后续爆发率为 0%，为避免浪费主号发评配额给停流冷死帖，收紧为 7200s (2小时)
+    "stale_zero_engagement_seconds": 7200,
     "stale_min_likes": 1,               # 超过上述时长后要求原帖至少获得的点赞数，过滤长期无人问津的停流帖
     "author_dedup_days": 7,             # 当前账号多少天内不对同一作者重复发评
     "avoid_connected_authors": True,    # 当前账号打开推文时若已与该作者关注/互关则本号跳过（不锁帖，其他号仍可用）
