@@ -524,7 +524,7 @@ ALL_POST_SOURCES = (
     PLATFORM_HACKERNEWS,
 )
 
-BINANCE_ACCOUNTS = ["qiqi", "ruru"]
+BINANCE_ACCOUNTS = ["myself", "qiqi", "ruru"]
 # OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
 OKX_ACCOUNTS = ["myself", "nana"]
 
