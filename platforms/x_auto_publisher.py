@@ -613,10 +613,10 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
 
         # 1. 冷却门禁校验
         in_cooldown, remaining_sec = is_account_in_cooldown(account, state)
-        if in_cooldown and not dry_run:
-            rem_min = max(1, int(remaining_sec // 60))
-            logger.info(f"⏳ [冷却跳过] 账号 [@{screen_name}] 处于发帖冷却中（还需等待约 {rem_min} 分钟）")
-            continue
+        # if in_cooldown and not dry_run:
+        #     rem_min = max(1, int(remaining_sec // 60))
+        #     logger.info(f"⏳ [冷却跳过] 账号 [@{screen_name}] 处于发帖冷却中（还需等待约 {rem_min} 分钟）")
+        #     continue
 
         logger.info(f"🎯 [账号就绪] 账号 [@{screen_name}] 冷却完毕，开始执行选帖与发布检查")
 
