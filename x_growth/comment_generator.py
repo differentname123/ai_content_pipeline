@@ -188,7 +188,7 @@ def _select_unscored_wave_from_db(
 ) -> List[Dict[str, Any]]:
     """
     无截断扫描库内 `<24h + 蓝V + 100~3000粉 + 英/日 + 非视频 + 有独立纯文本 + 未打分` 的原创主帖：
-    按 `publish_time` 升序（FIFO，优先处理更早发布、离 24h 过期更近的合格帖）取出最多 `wave_size` 条（默认 15 条）。
+    按 `publish_time` 降序（最新优先，保证刚发布的 <2h 新鲜帖最先生成可发评论）取出最多 `wave_size` 条（默认 20 条）。
     """
     query: Dict[str, Any] = {
         "source": "x",
@@ -204,7 +204,7 @@ def _select_unscored_wave_from_db(
     target_cap = max(1, int(wave_size))
     picked: List[Dict[str, Any]] = []
 
-    cursor = col.find(query, {"_id": 0}).sort("publish_time", 1)
+    cursor = col.find(query, {"_id": 0}).sort("publish_time", -1)
     for doc in cursor:
         meta = doc.get("metadata") or {}
         pextra = meta.get("platform_extra") or {}

@@ -192,33 +192,26 @@ def _check_post_activity_eligible(
     return None
 
 
-def _candidate_priority_key(doc: Dict[str, Any], now_ts: int) -> Tuple[int, int, int, float, int]:
+def _candidate_priority_key(doc: Dict[str, Any], now_ts: int) -> Tuple[int, int, float, int]:
     """
-    优先把“刚发不久 + 已有初步真实互动 + 评论区仍空旷”的上升期帖子排在前面：
-    【保留排序优化说明】经 N=42 真实发评统计，发帖 < 2h 的博主互动率达 80.0% (12/15)，而 2~6h 降至 52.9%；
-    因此将 < 2h (7200s) 单独立为第 0 优先档，避免高分但已发数小时的半老帖挤占超新鲜黄金互动窗口。
-    1. 时段分档：0=2h内黄金抢鲜帖(实测互动率80%)，1=2~6h成长期帖，2=6~12h活跃帖，3=12~24h兜底活跃帖
-    2. 已有起势信号优先：likes>=1 或 replies>=1 排在零互动前面
-    3. 当前评论数升序（越空越容易占前排）
-    4. 独立评论质量分降序 + 发布时间降序
+    发评优先级（越小越优先），仅依据 N=52 实测中经显著性检验的事前信号，不使用无区分力的评分/回复升序：
+    1. 已起势优先（likes>=1 或 replies>=1）：评论曝光完全寄生于原帖后续增长，零互动空帖排后（不硬删，避免 DB 快照滞后误杀）；
+    2. 发帖 <=2h 优先：作者在前 2 小时回复我方评论的概率显著更高；
+    3. 浏览增速（views/小时）降序：与原帖后续增量相关性最强（ρ≈0.71, p<0.001）；
+    4. 同分时发布时间新者优先。
     """
     pub_ts = safe_int(doc.get("publish_time"), 0)
     age_sec = max(0, now_ts - pub_ts)
-    if age_sec <= 7200:
-        age_bucket = 0
-    elif age_sec <= 21600:
-        age_bucket = 1
-    elif age_sec <= 43200:
-        age_bucket = 2
-    else:
-        age_bucket = 3
 
     eng = doc.get("engagement") or {}
+    views = max(0, safe_int(eng.get("view_count"), 0))
     likes = max(0, safe_int(eng.get("like_count"), 0))
     replies = max(0, safe_int(eng.get("comment_count"), 0))
-    has_traction = 0 if (likes >= 1 or replies >= 1) else 1
-    best_score = float((doc.get(AUTO_COMMENT_FIELD) or {}).get("best_score") or 0.0)
-    return (age_bucket, has_traction, replies, -best_score, -pub_ts)
+
+    no_traction = 0 if (likes >= 1 or replies >= 1) else 1
+    over_2h = 0 if age_sec <= 7200 else 1
+    views_per_hour = views / max(age_sec / 3600.0, 0.25)
+    return (no_traction, over_2h, -views_per_hour, -pub_ts)
 
 
 def _filter_and_rank_candidates(
@@ -382,7 +375,9 @@ def publish_comments_from_db(
         raw_candidates,
         now_ts=now_ts,
         max_post_comments=max_comments_cap,
-        stale_zero_engagement_seconds=stale_age_sec,
+        # 【保留过滤原因说明】库内 engagement 为入库时的旧快照，实测约 13% 被判“冷死”的帖线上已起飞；
+        # 因此库端不再按冷死硬删（交由排序沉底），仅在打开详情页后用线上实时数据做冷死复核（见下方 live_activity_reason）。
+        stale_zero_engagement_seconds=0,
         stale_min_likes=min_stale_likes,
     )
 
@@ -393,8 +388,7 @@ def publish_comments_from_db(
     logger.info(
         f"[Module2/启动] 模式={'DRY_RUN(纯库预览)' if dry_run else 'LIVE(真实Chrome消费发评)'} | 账号目录={session_path} | "
         f"语种={clean_langs or 'ALL'} | 赛道={clean_cats or 'ALL'} | 粉丝={min_followers}~{max_followers} | "
-        f"最低分={min_score} | 原帖回复<={max_comments_cap or '∞'} | "
-        f"滤除(拥挤={filter_stats['filtered_crowded']},冷死={filter_stats['filtered_stale']}) | "
+        f"最低分={min_score} | 原帖回复<={max_comments_cap or '∞'} | 滤除(拥挤={filter_stats['filtered_crowded']}) | "
         f"今日已发={today_sent_count}/{daily_cap or '∞'} | 未消费候选={len(candidates)}条"
     )
 
