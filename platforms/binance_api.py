@@ -18,7 +18,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import ccxt
+try:
+    import ccxt
+except ImportError:
+    ccxt = None
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -1478,6 +1481,8 @@ _CCXT_LOCK = threading.Lock()
 
 def _get_ccxt_binance_client(market_type: str = "future", proxy: str = None):
     """获取或复用缓存的 CCXT Binance 客户端实例，避免高频重复初始化"""
+    if ccxt is None:
+        return None
     key = (market_type, proxy or "")
     with _CCXT_LOCK:
         client = _CCXT_CLIENTS.get(key)
@@ -1496,6 +1501,8 @@ def _get_ccxt_binance_client(market_type: str = "future", proxy: str = None):
 
 def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890") -> float | None:
     """使用 ccxt 获取指定币种最新价格（优先查询U本位合约，查不到则降级查询现货）"""
+    if ccxt is None:
+        return None
     if not coin_name or not isinstance(coin_name, str):
         logger.warning(f"[行情查询/价格] 传入币种名称无效 | 输入: [{coin_name}]")
         return None
@@ -1565,6 +1572,8 @@ def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890"
 
 def get_top_k_movers(top_k: int = 5) -> dict:
     """获取币安 U本位合约 24h 涨幅榜与跌幅榜前 top_k 名"""
+    if ccxt is None:
+        return {"top_gainers": [], "top_losers": []}
     proxy = get_proxy_url()
     try:
         exchange = _get_ccxt_binance_client("future", proxy)
