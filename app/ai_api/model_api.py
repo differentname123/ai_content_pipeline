@@ -63,14 +63,15 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 1, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-4-hydrogen", "权重": 4, "备注": "来源aistudio_web"},
 
     # {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端 (占组内总权重 4%)"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
 
-    {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0, "备注": "来源api key aistudio"},
 
     {"model_name": "gpt-5.6-max", "权重": 0, "备注": "来源chatgpt_web "},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 0,
@@ -81,7 +82,7 @@ MEDIUM_MODEL_LIST = [
 
     {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
     # {"model_name": "gpt-6-codex-sol-max", "权重": 5, "备注": "来源codex 付费"},
-    {"model_name": "gpt-6-codex-luna-max", "权重": 10, "备注": "来源codex 付费 (占组内总权重 80%，其余启用项合计=20)"},
+    {"model_name": "gpt-6-codex-luna-max", "权重": 5, "备注": "来源codex 付费 (占组内总权重 80%，其余启用项合计=20)"},
 
 ]
 LOW_MODEL_LIST = [
@@ -89,13 +90,18 @@ LOW_MODEL_LIST = [
 
     # {"model_name": "gemma-aistudio-api-key-4-31b-it", "权重": 0, "备注": "来源api key aistudio "},
     {"model_name": "gemini-aistudio-api-key-3.5-flash", "权重": 0, "备注": "来源api key aistudio "},
+    {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "权重": 0.1, "备注": "来源api key aistudio "},
+    {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "权重": 0.1, "备注": "来源api key aistudio "},
 
+    {"model_name": "gemini-aistudio-3.5-flash-lite", "权重": 0.5, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0.1, "备注": "来源aistudio_web"},
 
-    {"model_name": "gemini-aistudio-3.5-flash", "权重": 0, "备注": "来源aistudio_web"},
-
-    {"model_name": "gpt-6-codex-luna-max", "权重": 1, "备注": "来源codex 免费"},
+    {"model_name": "gpt-6-codex-luna", "权重": 1, "备注": "来源codex 免费"},
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
+
+
+
 
     # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
