@@ -1082,6 +1082,39 @@ def fetch_okx_user_timeline(
     return results
 
 
+def fetch_okx_post_detail(content_id, session=None):
+    """根据帖子/文章 ID 获取欧易 Orbit 帖子的详细内容及真实互动指标 (viewCount, likeCount, commentNum)"""
+    clean_id = str(content_id or "").strip()
+    if not clean_id:
+        return None
+    url = "https://www.okx.com/priapi/v5/content/public/detail/1"
+    headers = _build_okx_headers(referer=f"https://www.okx.com/zh-hans/orbit/post/{clean_id}")
+    req_client = session if session else requests
+    retry_count = 0
+
+    while retry_count < MAX_RETRIES:
+        try:
+            response = req_client.get(
+                url,
+                headers=headers,
+                params={"contentId": clean_id},
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            json_resp = response.json()
+            if str(json_resp.get("code")) != "0":
+                return None
+            return json_resp.get("data")
+        except Exception as e:
+            retry_count += 1
+            if retry_count >= MAX_RETRIES:
+                logger.debug(f"[欧易采集/帖子详情] 获取帖子详情失败 | ID: [{clean_id}] | 原因: [{e}]")
+                return None
+            time.sleep(random.uniform(0.3, 0.8))
+    return None
+
+
 if __name__ == "__main__":
     hot_coins = fetch_okx_hot_coins(num=25)
     okx_recommend_posts = fetch_okx_feed(count=10)

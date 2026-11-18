@@ -82,6 +82,7 @@ from platforms.okx_api import (
     SELF_OKX_AUTHOR_NAMES,
     fetch_okx_feed,
     fetch_okx_hot_coins,
+    fetch_okx_post_detail,
     fetch_okx_user_timeline,
 )
 from platforms.okx_playwright import comment_on_okx_post, create_okx_post, delete_okx_posts
@@ -2056,15 +2057,23 @@ def _get_recent_published_history_with_metrics(article_manager, platform, target
         comments = rec.get("comment_count")
         pub_time = rec.get("publish_time", 0)
 
-        # 针对币安平台，对尚未抓取过浏览量（且发布超 10 分钟）的帖子进行快速免登只读同步并沉淀
-        if platform == PLATFORM_BINANCE and pid and views is None and (now_ts - pub_time > 600):
+        # 针对已发布超 10 分钟且尚未抓取过浏览量的帖子，进行快速免登只读同步并沉淀
+        if pid and views is None and (now_ts - pub_time > 600):
             try:
-                detail = fetch_binance_post_detail(str(pid))
-                if detail and detail.get("contentStatus") == 2:
-                    views = rec["view_count"] = detail.get("viewCount", 0)
-                    likes = rec["like_count"] = detail.get("likeCount", 0)
-                    comments = rec["comment_count"] = detail.get("commentCount", 0)
-                    need_upsert.append(d)
+                if platform == PLATFORM_BINANCE:
+                    detail = fetch_binance_post_detail(str(pid))
+                    if detail and detail.get("contentStatus") == 2:
+                        views = rec["view_count"] = detail.get("viewCount", 0)
+                        likes = rec["like_count"] = detail.get("likeCount", 0)
+                        comments = rec["comment_count"] = detail.get("commentCount", 0)
+                        need_upsert.append(d)
+                elif platform == PLATFORM_OKX:
+                    detail = fetch_okx_post_detail(str(pid))
+                    if detail and detail.get("reviewState") == 2:
+                        views = rec["view_count"] = detail.get("viewCount", 0)
+                        likes = rec["like_count"] = detail.get("likeCount", 0)
+                        comments = rec["comment_count"] = detail.get("commentNum", 0)
+                        need_upsert.append(d)
             except Exception:
                 pass
 
@@ -2100,8 +2109,8 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
     viral = article_type == ARTICLE_TYPE_VIRAL
     comments_key = "bait_comments" if viral else "god_comments"
 
-    # 获取当前发送账号最近已发布的历史战报（最多 50 条，带真实阅读量与互动数）
-    target_accs = ACCOUNTS if platform == PLATFORM_BINANCE else None
+    # 获取当前平台发送账号最近已发布的历史战报（最多 50 条，带真实阅读量与互动数）
+    target_accs = PLATFORM_ACCOUNTS.get(platform)
     historical_performance = _get_recent_published_history_with_metrics(
         article_manager, platform, target_accounts=target_accs, limit=50,
     )
