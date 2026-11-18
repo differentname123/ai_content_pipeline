@@ -95,6 +95,7 @@ HISTORICAL_REF_COUNT: int = 50              # 参考历史已发推文数量（�
 # 5. 运行模式与模型调用
 BROWSER_VISIBLE: bool = True                # Playwright 发帖是否显示浏览器可见窗口（方便实时观测发帖状态）
 MODEL_PRESET_GROUP: str = "high"            # 调用的最强模型组（100% 走 high，使用 gpt-6.1-sol-max 等最强模型）
+AI_TIMEOUT_SECONDS: int = 1200              # 模型调用超时阈值（秒），设为 20 分钟 = 1200 秒，确保最强模型（如 gpt-6.1-sol-max 深度推理）充足运算不中断
 AI_MAX_RETRIES: int = 3                     # 模型调用失败时的最大重试次数（默认 3 次）
 AI_RETRY_DELAY_SECONDS: int = 15            # 重试退避等待基础间隔（秒）
 PROMPT_TEMPLATE_PATH: str = str(PROMPT_DIR / "X平台_结构化自动选帖与改写提示词.txt")
@@ -232,6 +233,9 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
         if src_pid:
             candidates_map[src_pid] = art
 
+        # 【保留过滤原因说明】：纯字段级保留与剔除（保持极简、稳定，绝不搞任何脆弱的字符串切分或二次逻辑）：
+        # 1. 彻底剔除上游 Stage 2 专属思考脚手架（decision_reason 和 image_role，合计 4.5 万字符死重，当前 X 选帖提示词零引用、零依赖）；
+        # 2. 其余业务字段（包含 image_semantics 配图语义列表）100% 完整原样保留。
         cleaned_item = {
             "id": primary_id,
             "topic_tag": info.get("topic_tag", ""),
@@ -239,8 +243,6 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
             "image_semantics": info.get("image_semantics", []),
             "selected_images": info.get("selected_images", []),
             "viral_analysis": info.get("viral_analysis", ""),
-            "decision_reason": info.get("decision_reason", ""),
-            "image_role": info.get("image_role", ""),
             "post_text": info.get("post_text", ""),
             "bait_comments": info.get("bait_comments", []),
         }
@@ -363,7 +365,7 @@ def query_ai_for_structured_selection(
         res = generate_content(
             prompt=full_prompt,
             preset_model_group=MODEL_PRESET_GROUP,
-            timeout=180,
+            timeout=AI_TIMEOUT_SECONDS,
         )
         elapsed = time.time() - t0
 
