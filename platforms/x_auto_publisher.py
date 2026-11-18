@@ -369,17 +369,16 @@ def query_ai_for_structured_selection(
         )
         elapsed = time.time() - t0
 
-        if isinstance(res, dict) and res.get("status") == "ok":
-            raw_content = res.get("content", "")
-            parsed_obj = safe_parse_llm_json(raw_content)
-            if isinstance(parsed_obj, dict) and parsed_obj:
-                logger.info(f"✅ [AI决策/完成] 结构化决策返回成功 | 尝试: [第{attempt}次] | 耗时: {elapsed:.2f}s")
-                return parsed_obj
-            else:
-                logger.warning(f"⚠️ [AI决策/解析异常] 模型返回非有效 JSON 字典 (第 {attempt}/{max_retries} 次)")
-        else:
-            err_detail = res.get("error_history") if isinstance(res, dict) else "未知异常"
-            logger.warning(f"⚠️ [AI决策/重试] 强模型组 [{MODEL_PRESET_GROUP}] 第 {attempt}/{max_retries} 次调用未成功: {err_detail}")
+        # 极简结果导向：完全不依赖外部状态字段，直接拿结果说话——只要能解析出需要的选帖 JSON，即判定成功
+        raw_content = res.get("content", "") if isinstance(res, dict) else str(res or "")
+        parsed_obj = safe_parse_llm_json(raw_content)
+
+        if isinstance(parsed_obj, dict) and ("selected_posts" in parsed_obj or "rejected_posts" in parsed_obj):
+            logger.info(f"✅ [AI决策/完成] 结构化决策返回成功 | 尝试: [第{attempt}次] | 耗时: {elapsed:.2f}s")
+            return parsed_obj
+
+        err_detail = res.get("error_history") if isinstance(res, dict) and res.get("error_history") else "未能解析出符合规范的选帖JSON"
+        logger.warning(f"⚠️ [AI决策/重试] 强模型组 [{MODEL_PRESET_GROUP}] 第 {attempt}/{max_retries} 次未获得有效决策: {err_detail}")
 
         if attempt < max_retries:
             wait_sec = AI_RETRY_DELAY_SECONDS * attempt
