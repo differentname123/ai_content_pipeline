@@ -59,7 +59,7 @@ logger = setup_logger(app_name="okx_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("okx_myself_browser_session_dir", "okx_ruru")
+USER_DATA_DIR = resolve_session_dir("okx_nana_browser_session_dir", "okx_ruru")
 OKX_ORBIT_URL = "https://www.okx.com/zh-hans/orbit"
 API_WAIT_TIMEOUT_MS = 12000
 
@@ -323,6 +323,10 @@ def _read_api_verdict(page, watcher):
     """解读 OKX 星球发帖结果。主判据：POST /priapi/v5/content/ugc/publish 且 code == '0'。"""
     resp = watcher.wait_primary(API_WAIT_TIMEOUT_MS)
     if resp is not None:
+        if resp.status in (401, 403):
+            logger.error(f"[发送/校验] OKX 发帖主接口认证失败 | HTTP: 【{resp.status}】 | 原因: [账号登录会话已失效]")
+            _forensics(page, "auth_fail", {"url": resp.url, "status": resp.status})
+            raise BusinessErrorException(f"OKX 发帖接口认证失败 (HTTP {resp.status})，账号登录会话已失效，请重新登录")
         body = _parse_api_json(resp)
         code_str = str(body.get("code", ""))
         if code_str in ("0", "000000") or body.get("success") is True:
@@ -337,6 +341,10 @@ def _read_api_verdict(page, watcher):
             logger.error(f"[发送/校验] 服务端业务规则拒收本条帖子 | HTTP: 【{resp.status}】 | code: 【{code_str}】 | 原因: 【{err}】")
             _forensics(page, "biz_reject", {"url": resp.url, "status": resp.status, "body": body})
             raise BusinessErrorException(f"业务发送被服务器拦截 (code={code_str})，原因: {err}")
+        if resp.status >= 400:
+            logger.error(f"[发送/校验] OKX 发帖接口返回 HTTP 错误 | HTTP: 【{resp.status}】")
+            _forensics(page, "http_err", {"url": resp.url, "status": resp.status})
+            raise BusinessErrorException(f"OKX 发帖接口请求异常 (HTTP {resp.status})")
         logger.warning(f"[发送/校验] 主接口响应非 JSON(HTTP 【{resp.status}】)，转入 DOM 兜底校验")
         return False, None
 
@@ -362,6 +370,10 @@ def _read_comment_api_verdict(page, watcher):
     """解读 OKX 星球评论结果。主判据：POST /priapi/v5/content/user/comment 且 code == '0'。"""
     resp = watcher.wait_primary(API_WAIT_TIMEOUT_MS)
     if resp is not None:
+        if resp.status in (401, 403):
+            logger.error(f"[评论/校验] OKX 评论主接口认证失败 | HTTP: 【{resp.status}】 | 原因: [账号登录会话已失效]")
+            _forensics(page, "comment_auth_fail", {"url": resp.url, "status": resp.status})
+            raise BusinessErrorException(f"OKX 评论接口认证失败 (HTTP {resp.status})，账号登录会话已失效，请重新登录")
         body = _parse_api_json(resp)
         code_str = str(body.get("code", ""))
         if code_str in ("0", "000000") or body.get("success") is True:
@@ -380,6 +392,10 @@ def _read_comment_api_verdict(page, watcher):
             logger.error(f"[评论/校验] 服务端业务规则拒收本条评论 | HTTP: 【{resp.status}】 | code: 【{code_str}】 | 原因: 【{err}】")
             _forensics(page, "comment_biz_reject", {"url": resp.url, "status": resp.status, "body": body})
             raise BusinessErrorException(f"业务评论被服务器拦截 (code={code_str})，原因: {err}")
+        if resp.status >= 400:
+            logger.error(f"[评论/校验] OKX 评论接口返回 HTTP 错误 | HTTP: 【{resp.status}】")
+            _forensics(page, "comment_http_err", {"url": resp.url, "status": resp.status})
+            raise BusinessErrorException(f"OKX 评论接口请求异常 (HTTP {resp.status})")
         logger.warning(f"[评论/校验] 主接口响应非 JSON(HTTP 【{resp.status}】)，转入 DOM 兜底校验")
         return False, None
 

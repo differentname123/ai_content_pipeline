@@ -35,9 +35,20 @@
 
 ---
 
-# 输出格式规范（必须且仅输出合法的 JSON 格式）
+<historical_x_posts>
+{HISTORICAL_X_POSTS}
+</historical_x_posts>
 
-请直接输出且仅输出一个合法的 JSON 字典，严禁包含任何前缀解释、外层多余文字或 markdown 解释性废话，确保程序可直接 `json.loads` 解析：
+---
+
+# 待筛选与改写的候选帖子数据（Candidate Posts）
+{CANDIDATE_POSTS}
+
+---
+
+# 强制输出规范（必须且仅输出合法的 JSON 字典）
+
+请仔细阅读上述候选帖与历史表现，**直接且仅输出一个合法的 JSON 对象**。必须以 `{` 开始，以 `}` 结束，严禁包含任何变量赋值前缀（如 `texts = `）、解释性文字或 Markdown 废话：
 
 ```json
 {
@@ -61,14 +72,3 @@
 ```
 
 *注意：`selected_posts` 按推荐度从高到低排列。若本批候选无达到 S 级或 A 级潜质的内容，`selected_posts` 应输出为 `[]`。*
-
----
-
-<historical_x_posts>
-{HISTORICAL_X_POSTS}
-</historical_x_posts>
-
----
-
-# 待筛选与改写的候选帖子数据（Candidate Posts）
-{CANDIDATE_POSTS}

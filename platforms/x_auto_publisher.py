@@ -86,14 +86,17 @@ MAX_X_RAW_CHARS: int = 140                  # 纯汉字数上限（X 平台单�
 MAX_X_UNITS: int = 280                      # X 平台标准计数单位上限（半角字符记 1，汉字/Emoji/全角记 2，URL 记 23）
 STRICT_X_LENGTH_GATE: bool = True           # 是否启用字符数量代码级二次强制校验
 
-# 4. 候选素材抓取配置
-CANDIDATE_LOOKBACK_HOURS: int = 24          # 抓取近多少小时内的精品候选帖
-CANDIDATE_QUERY_LIMIT: int = 20             # 每轮候选池上限
-HISTORICAL_REF_COUNT: int = 50              # 参考该账号最近已发布的历史推文数量（对比提炼爆款规律）
+# 4. 候选素材抓取配置（与 x_api 默认保持 100% 一致：近 6h，limit=0 全量拉取，零人为截断）
+HISTORICAL_PROMPT_ACCOUNTS: List[str] = get_config("x_prompt_accounts", ["dahao", "myself"])  # 对比账号矩阵（包含大号与发帖号）
+CANDIDATE_LOOKBACK_HOURS: int = 6           # 抓取近 6 小时内的全部候选帖（与 x_api 一致）
+CANDIDATE_QUERY_LIMIT: int = 0              # 0 表示全量拉取，绝不截断（获取全量 100+ 篇候选）
+HISTORICAL_REF_COUNT: int = 50              # 参考历史已发推文数量（跨账号矩阵共 50 条）
 
 # 5. 运行模式与模型调用
 BROWSER_VISIBLE: bool = True                # Playwright 发帖是否显示浏览器可见窗口（方便实时观测发帖状态）
-MODEL_PRESET_GROUP: str = "medium"          # 调用的模型组级别（推荐 medium，自带多源自动降级；亦可根据需要切回 high）
+MODEL_PRESET_GROUP: str = "high"            # 调用的最强模型组（100% 走 high，使用 gpt-6.1-sol-max 等最强模型）
+AI_MAX_RETRIES: int = 3                     # 模型调用失败时的最大重试次数（默认 3 次）
+AI_RETRY_DELAY_SECONDS: int = 15            # 重试退避等待基础间隔（秒）
 PROMPT_TEMPLATE_PATH: str = str(PROMPT_DIR / "X平台_结构化自动选帖与改写提示词.txt")
 STATE_FILE_PATH: str = str(get_runtime_file_path("x_publisher_state.json"))
 
@@ -249,19 +252,17 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
 
 def build_account_historical_posts_block(account: Dict[str, Any], count: int = HISTORICAL_REF_COUNT) -> str:
     """
-    获取账号最近 count 条客观已发推文并格式化为 Prompt 区块。
-    优先读取本地缓存，若网络正常则无登录拉取最新数据。
+    获取对比账号矩阵（默认含 dahao 与 myself）最近 count 条客观已发推文并格式化为 Prompt 区块。
+    与 x_api 保持 100% 一致，跨账号合并提取爆款规律。
     """
-    alias = account["alias"]
-    screen_name = account["screen_name"]
-    target_specs = resolve_x_accounts([alias], default_accounts=[alias])
+    target_specs = resolve_x_accounts(HISTORICAL_PROMPT_ACCOUNTS, default_accounts=["dahao", "myself"])
 
     # 尝试无登录联网刷新最新推文表现；若受限或异常自动回退至本地缓存
     posts_by_acc = None
     try:
         posts_by_acc = fetch_multi_x_user_posts(accounts=target_specs, count=max(count, 50), sort_by="time")
     except Exception as e:
-        logger.warning(f"[历史/同步] 实时获取账号 @{screen_name} 最新推文受阻: {e}，降级使用本地历史缓存")
+        logger.warning(f"[历史/同步] 实时获取账号矩阵最新推文受阻: {e}，降级使用本地历史缓存")
 
     if not posts_by_acc:
         posts_by_acc = load_cached_x_posts(accounts=target_specs, sort_by="time")
@@ -279,13 +280,68 @@ def build_account_historical_posts_block(account: Dict[str, Any], count: int = H
 # 四、强模型决策与双重门禁校验
 # ==============================================================================
 
+def safe_parse_llm_json(raw_content: str) -> Dict[str, Any]:
+    """
+    鲁棒解析 LLM 返回的 JSON 字典：
+    1. 剥离 Markdown 代码块（```json ... ```）；
+    2. 剥离变量赋值前缀（如 `texts = ` 或 `result = `）；
+    3. 提取最外层匹配的 { ... }；
+    4. 采用 strict=False 允许字符串内存在未转义换行/制表符；
+    5. 兜底回退 string_to_object 双引擎解析。
+    """
+    if not isinstance(raw_content, str) or not raw_content.strip():
+        return {}
+
+    cleaned = raw_content.strip()
+    if "```" in cleaned:
+        cleaned = re.sub(r"^```(?:json|python)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = cleaned.strip()
+
+    assign_match = re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*", cleaned)
+    if assign_match:
+        cleaned = cleaned[assign_match.end():].strip()
+
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx != -1 and end_idx > start_idx:
+        json_candidate = cleaned[start_idx : end_idx + 1]
+    else:
+        json_candidate = cleaned
+
+    try:
+        obj = json.loads(json_candidate, strict=False)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    try:
+        obj = string_to_object(json_candidate)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    try:
+        repaired = re.sub(r",\s*([}\]])", r"\1", json_candidate)
+        obj = json.loads(repaired, strict=False)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    return {}
+
+
 def query_ai_for_structured_selection(
     account: Dict[str, Any],
     historical_block: str,
     candidate_prompt_list: List[Dict[str, Any]],
+    max_retries: int = AI_MAX_RETRIES,
 ) -> Dict[str, Any]:
     """
-    将客观历史数据与候选帖子装填入结构化提示词，请求强模型输出决策 JSON。
+    将客观历史数据与候选帖子装填入结构化提示词，请求强模型输出决策 JSON（失败自动重试机制）。
     """
     if not os.path.exists(PROMPT_TEMPLATE_PATH):
         raise FileNotFoundError(f"未找到提示词模板文件: {PROMPT_TEMPLATE_PATH}")
@@ -299,47 +355,37 @@ def query_ai_for_structured_selection(
 
     logger.info(
         f"🤖 [AI决策/启动] 正在调度强模型组 [{MODEL_PRESET_GROUP}] 审查候选池 | "
-        f"账号: [@{account['screen_name']}] | 候选帖数: [{len(candidate_prompt_list)}] 篇"
+        f"发帖账号: [@{account['screen_name']}] | 候选帖数: [{len(candidate_prompt_list)}] 篇 | 最大重试: [{max_retries}] 次"
     )
 
-    t0 = time.time()
-    res = generate_content(
-        prompt=full_prompt,
-        preset_model_group=MODEL_PRESET_GROUP,
-        timeout=180,
-    )
-    elapsed = time.time() - t0
-
-    # 容灾降级：若 high 组因上游额度或冷却失败，自动无缝切换至多源备选池 medium 组重试
-    if (not isinstance(res, dict) or res.get("status") != "ok" and str(res.get("status")).startswith("❌")) and MODEL_PRESET_GROUP == "high":
-        logger.warning(
-            f"⚠️ [AI决策/降级] 模型组 [high] 暂不可用（可能处于上游冷却），自动无缝降级至 [medium] 模型组..."
-        )
+    for attempt in range(1, max_retries + 1):
         t0 = time.time()
         res = generate_content(
             prompt=full_prompt,
-            preset_model_group="medium",
+            preset_model_group=MODEL_PRESET_GROUP,
             timeout=180,
         )
         elapsed = time.time() - t0
 
-    if not isinstance(res, dict) or res.get("status") != "ok" and str(res.get("status")).startswith("❌"):
-        err_detail = res.get("error_history") if isinstance(res, dict) else "未知异常"
-        logger.error(f"❌ [AI决策/失败] 强模型调用未确认成功 | 耗时: {elapsed:.2f}s | 错误详情: {err_detail}")
-        return {}
-
-    raw_content = res.get("content", "")
-    try:
-        parsed_obj = string_to_object(raw_content)
-        if isinstance(parsed_obj, dict):
-            logger.info(f"✅ [AI决策/完成] 结构化决策返回成功 | 耗时: {elapsed:.2f}s")
-            return parsed_obj
+        if isinstance(res, dict) and res.get("status") == "ok":
+            raw_content = res.get("content", "")
+            parsed_obj = safe_parse_llm_json(raw_content)
+            if isinstance(parsed_obj, dict) and parsed_obj:
+                logger.info(f"✅ [AI决策/完成] 结构化决策返回成功 | 尝试: [第{attempt}次] | 耗时: {elapsed:.2f}s")
+                return parsed_obj
+            else:
+                logger.warning(f"⚠️ [AI决策/解析异常] 模型返回非有效 JSON 字典 (第 {attempt}/{max_retries} 次)")
         else:
-            logger.warning(f"❌ [AI决策/解析] 模型返回非字典对象 | 原始内容片段: {str(raw_content)[:200]}")
-            return {}
-    except Exception as e:
-        logger.error(f"❌ [AI决策/解析] 解析模型输出 JSON 异常: {e} | 原始内容片段: {str(raw_content)[:200]}")
-        return {}
+            err_detail = res.get("error_history") if isinstance(res, dict) else "未知异常"
+            logger.warning(f"⚠️ [AI决策/重试] 强模型组 [{MODEL_PRESET_GROUP}] 第 {attempt}/{max_retries} 次调用未成功: {err_detail}")
+
+        if attempt < max_retries:
+            wait_sec = AI_RETRY_DELAY_SECONDS * attempt
+            logger.info(f"⏳ [AI重试等待] 将在 {wait_sec} 秒后自动发起第 {attempt + 1} 次重试...")
+            time.sleep(wait_sec)
+
+    logger.error(f"❌ [AI决策/耗尽] 连续 {max_retries} 次调用强模型组 [{MODEL_PRESET_GROUP}] 均未确认成功，本轮放弃")
+    return {}
 
 
 def validate_double_gates(selected_item: Dict[str, Any]) -> Tuple[bool, str, int, int]:
@@ -649,12 +695,12 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
 
 
 def main() -> None:
-    """应用层总控主入口（支持 CLI 参数与无尽循环）"""
+    """应用层总控主入口（在 IDE 中直接点击绿色三角运行即可常驻无尽循环；亦支持命令行参数）"""
     import argparse
     parser = argparse.ArgumentParser(description="X (Twitter) 自动化精选图文发帖总控")
     parser.add_argument("--dry-run", action="store_true", help="模拟测试：执行完整选帖与双重门禁校验，但不实际调用浏览器发帖")
     parser.add_argument("--once", action="store_true", help="单次执行：仅执行单轮巡检后立即退出（不进入循环休眠）")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     print("\n" + "=" * 90)
     print("🚀 X (Twitter) 全自动精选图文发帖总控启动")
