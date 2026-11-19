@@ -454,19 +454,72 @@ def get_image_content_id(file_path: str) -> str:
     return p.stem.lower()
 
 
+def _get_url_index_path(save_dir_path: Path, url: str) -> Path:
+    """根据图片 URL 生成分片索引文件路径（不依赖数据库，256 个子目录防单目录文件过多）。"""
+    digest = hashlib.md5(url.encode("utf-8")).hexdigest()
+    return save_dir_path / "_url_idx" / digest[:2] / f"{digest}.path"
+
+
+def _lookup_cached_media(save_dir_path: Path, url: str) -> Optional[str]:
+    """若该 URL 已有本地索引且目标图片文件有效存在，直接返回绝对路径（跳过网络下载）。"""
+    idx_path = _get_url_index_path(save_dir_path, url)
+    try:
+        if not idx_path.is_file():
+            return None
+        raw = idx_path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        target = Path(raw)
+        if not target.is_absolute():
+            target = save_dir_path / target
+        if target.is_file() and target.stat().st_size > 0:
+            return str(target.resolve())
+    except Exception:
+        return None
+    return None
+
+
+def _save_cached_media_index(save_dir_path: Path, url: str, saved_path: Path) -> None:
+    """原子写入 URL -> 本地图片文件索引，供后续请求直接复用。"""
+    idx_path = _get_url_index_path(save_dir_path, url)
+    tmp_path = idx_path.with_name(f".{idx_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_saved = saved_path.resolve()
+        value = resolved_saved.name if resolved_saved.parent == save_dir_path.resolve() else str(resolved_saved)
+        tmp_path.write_text(value, encoding="utf-8")
+        os.replace(tmp_path, idx_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
 async def _download_media_async(url: str, save_dir: Optional[str] = None, proxy: Optional[str] = None) -> Optional[str]:
     """
-    异步核心：先下载媒体内容字节，再基于【图片视觉内容唯一标识（dHash）】或【文件二进制内容哈希】生成唯一文件名。
-    彻底摒弃基于 URL 的 MD5 命名，杜绝同图异链或平台二次上传换链导致的重复落地与自产自销复用。
+    异步核心：先查询本地 URL 索引缓存，未命中再下载媒体内容字节，
+    并基于【图片视觉内容唯一标识（dHash）】或【文件二进制内容哈希】落盘且记录 URL 索引。
     """
     import aiofiles
     import httpx
 
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        return None
+
     save_dir = resolve_cross_platform_path(save_dir, get_media_save_dir())
+    save_dir_path = Path(save_dir)
+
+    cached_path = _lookup_cached_media(save_dir_path, clean_url)
+    if cached_path:
+        return cached_path
+
     if proxy in (None, "http://127.0.0.1:7890"):
         proxy = get_proxy_url(default=proxy or "http://127.0.0.1:7890")
 
-    suffix = Path(urlparse(url).path).suffix.lower()
+    suffix = Path(urlparse(clean_url).path).suffix.lower()
     if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm"):
         suffix = ".jpg"
 
@@ -477,7 +530,7 @@ async def _download_media_async(url: str, save_dir: Optional[str] = None, proxy:
     try:
         chunks = []
         async with httpx.AsyncClient(proxy=proxy, verify=False) as client:
-            async with client.stream("GET", url, headers=headers, timeout=30.0) as response:
+            async with client.stream("GET", clean_url, headers=headers, timeout=30.0) as response:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
                     if chunk:
@@ -491,22 +544,37 @@ async def _download_media_async(url: str, save_dir: Optional[str] = None, proxy:
         if not content_id:
             content_id = hashlib.sha256(raw_bytes).hexdigest()[:32]
 
-        save_dir_path = Path(save_dir)
         save_dir_path.mkdir(parents=True, exist_ok=True)
 
         for ext in (suffix, ".jpg", ".jpeg", ".png", ".webp"):
             candidate = save_dir_path / f"{content_id}{ext}"
             if candidate.exists() and candidate.stat().st_size > 0:
+                _save_cached_media_index(save_dir_path, clean_url, candidate)
                 return str(candidate.resolve())
 
         save_path = save_dir_path / f"{content_id}{suffix}"
-        async with aiofiles.open(save_path, "wb") as f:
-            await f.write(raw_bytes)
+        tmp_media = save_dir_path / f".{content_id}.{os.getpid()}.{threading.get_ident()}{suffix}.tmp"
+        try:
+            async with aiofiles.open(tmp_media, "wb") as f:
+                await f.write(raw_bytes)
+            if not save_path.exists() or save_path.stat().st_size == 0:
+                try:
+                    os.replace(tmp_media, save_path)
+                except OSError:
+                    if not (save_path.is_file() and save_path.stat().st_size > 0):
+                        raise
+            if tmp_media.exists():
+                tmp_media.unlink()
+        except Exception:
+            if tmp_media.exists():
+                tmp_media.unlink()
+            raise
 
+        _save_cached_media_index(save_dir_path, clean_url, save_path)
         return str(save_path.resolve())
 
     except Exception as e:
-        logger.debug(f"[MediaDownload] 下载失败 {url}: {e}")
+        logger.debug(f"[MediaDownload] 下载失败 {clean_url}: {e}")
         return None
 
 
@@ -517,13 +585,22 @@ def download_web_media(
     proxies: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """
-    同步入口：下载网络媒体文件并按纯内容唯一标识命名，返回本地绝对路径。
+    同步入口：优先命中本地 URL 索引缓存直接返回；未命中时下载并按内容哈希落盘，返回本地绝对路径。
     同时兼容 proxy (str) 与 proxies (dict) 两种代理传参方式。
     """
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        return None
+
+    resolved_dir = Path(resolve_cross_platform_path(save_dir, get_media_save_dir()))
+    cached_path = _lookup_cached_media(resolved_dir, clean_url)
+    if cached_path:
+        return cached_path
+
     effective_proxy = proxy
     if not effective_proxy and isinstance(proxies, dict):
         effective_proxy = proxies.get("https") or proxies.get("http")
-    return asyncio.run(_download_media_async(url, save_dir, proxy=effective_proxy))
+    return asyncio.run(_download_media_async(clean_url, str(resolved_dir), proxy=effective_proxy))
 
 
 # ==============================================================================
