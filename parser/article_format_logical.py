@@ -2176,7 +2176,7 @@ def _select_and_polish_best_candidate(article_manager, platform, account, accoun
         t0 = time.monotonic()
         res = generate_content(
             prompt=editor_prompt,
-            preset_model_group="high",
+            preset_model_group="medium",
         )
         parsed = string_to_object(res.get("content", ""))
         if not isinstance(parsed, dict):
