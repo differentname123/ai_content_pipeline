@@ -192,26 +192,86 @@ def _check_post_activity_eligible(
     return None
 
 
-def _candidate_priority_key(doc: Dict[str, Any], now_ts: int) -> Tuple[int, int, float, int]:
+PUBLISH_STRATEGY_VERSION = "proven_v1_age4_traction_replies_asc"
+
+
+def _age_bucket(age_sec: int) -> int:
+    """将推文距今时长归入四档实证新鲜度区间：0=<=2h, 1=2~6h, 2=6~12h, 3=12~24h。"""
+    if age_sec <= 7200:
+        return 0
+    if age_sec <= 21600:
+        return 1
+    if age_sec <= 43200:
+        return 2
+    return 3
+
+
+def _build_publish_telemetry(
+    doc: Dict[str, Any],
+    *,
+    parent_snap: Dict[str, Any],
+    live_pub_ts: int,
+    select_ts: int,
+    done_ts: int,
+    candidate_rank: int,
+    candidate_pool_size: int,
+    fresh_2h_pool_size: int,
+    max_post_comments_cap: int,
+) -> Dict[str, Any]:
     """
-    发评优先级（越小越优先），仅依据 N=52 实测中经显著性检验的事前信号，不使用无区分力的评分/回复升序：
-    1. 已起势优先（likes>=1 或 replies>=1）：评论曝光完全寄生于原帖后续增长，零互动空帖排后（不硬删，避免 DB 快照滞后误杀）；
-    2. 发帖 <=2h 优先：作者在前 2 小时回复我方评论的概率显著更高；
-    3. 浏览增速（views/小时）降序：与原帖后续增量相关性最强（ρ≈0.71, p<0.001）；
-    4. 同分时发布时间新者优先。
+    记录发评瞬间客观特征与候选池上下文（埋点保留，不改动当前过滤/排序），便于后续积累大样本后检验未定假说：
+    1. views_per_hour_at_publish：供后续验证在同新鲜度/低回复区间内，浏览增速是否能带来净曝光增益；
+    2. is_quote / has_images / author_followers：供大样本后检验引用帖与粉丝分段效应；
+    3. candidate_pool_size / fresh_2h_pool_size：区分选用 >=2h 帖时是因 2h 内缺货还是排序所致；
+    4. db_engagement_at_select：量化库内快照与详情页实时数据的漂移幅度。
+    """
+    author_obj = doc.get("author") or {}
+    db_eng = doc.get("engagement") or {}
+    pmeta = doc.get("metadata") or {}
+    pextra = pmeta.get("platform_extra") or {}
+    post_age_sec = max(0, int(done_ts) - int(live_pub_ts))
+    pub_views = safe_int(parent_snap.get("view_count"), 0)
+    return {
+        "strategy_version": PUBLISH_STRATEGY_VERSION,
+        "max_post_comments_cap": int(max_post_comments_cap),
+        "candidate_rank": int(candidate_rank),
+        "candidate_pool_size": int(candidate_pool_size),
+        "fresh_2h_pool_size": int(fresh_2h_pool_size),
+        "post_age_sec_at_publish": post_age_sec,
+        "age_bucket": _age_bucket(post_age_sec),
+        "views_per_hour_at_publish": round(pub_views / max(post_age_sec / 3600.0, 0.25), 2),
+        "author_followers": safe_int(author_obj.get("followers_count"), 0),
+        "is_quote": bool(pextra.get("quoted_post")),
+        "has_images": bool((doc.get("media") or {}).get("images")),
+        "post_text_len": len(str((doc.get("content") or {}).get("text_content") or "")),
+        "db_engagement_at_select": {
+            "ts": int(select_ts),
+            "view_count": safe_int(db_eng.get("view_count"), 0),
+            "like_count": safe_int(db_eng.get("like_count"), 0),
+            "comment_count": safe_int(db_eng.get("comment_count"), 0),
+        },
+    }
+
+
+def _candidate_priority_key(doc: Dict[str, Any], now_ts: int) -> Tuple[int, int, int, float, int]:
+    """
+    回归并锁定经 C1~C3 (N=52, 互动率 69.2%) 多轮实证稳健的优先级（越小越优先）：
+    1. 四档时效优先（0:<=2h, 1:2~6h, 2:6~12h, 3:12~24h）：delay_h 与互动/增长高度负相关（p<0.01）；
+    2. 已有起势优先（likes>=1 或 replies>=1）：仅在同档内排在零互动快照前，绝不放任 8~22h 老帖反超 <2h 新帖；
+    3. 当前回复数升序（replies）：在 max_post_comments=15 安全兜底下自然优先占领 0~5 评低竞争区；
+    4. 独立盲测分降序 + 发布时间降序。
     """
     pub_ts = safe_int(doc.get("publish_time"), 0)
     age_sec = max(0, now_ts - pub_ts)
+    age_bucket = _age_bucket(age_sec)
 
     eng = doc.get("engagement") or {}
-    views = max(0, safe_int(eng.get("view_count"), 0))
     likes = max(0, safe_int(eng.get("like_count"), 0))
     replies = max(0, safe_int(eng.get("comment_count"), 0))
 
-    no_traction = 0 if (likes >= 1 or replies >= 1) else 1
-    over_2h = 0 if age_sec <= 7200 else 1
-    views_per_hour = views / max(age_sec / 3600.0, 0.25)
-    return (no_traction, over_2h, -views_per_hour, -pub_ts)
+    has_traction = 0 if (likes >= 1 or replies >= 1) else 1
+    best_score = float((doc.get(AUTO_COMMENT_FIELD) or {}).get("best_score") or 0.0)
+    return (age_bucket, has_traction, replies, -best_score, -pub_ts)
 
 
 def _filter_and_rank_candidates(
@@ -540,7 +600,11 @@ def publish_comments_from_db(
                 live_sent_count = 0
                 halt_status: Optional[str] = None
                 halt_warning: Optional[str] = None
-                for doc in candidates:
+                candidate_pool_size = len(candidates)
+                fresh_2h_pool_size = sum(
+                    1 for c in candidates if max(0, now_ts - safe_int(c.get("publish_time"), 0)) <= 7200
+                )
+                for cand_rank, doc in enumerate(candidates, start=1):
                     if len(published_items) >= target_limit:
                         break
 
@@ -720,6 +784,17 @@ def publish_comments_from_db(
                         else doc
                     )
                     parent_snap = _build_engagement_snapshot(parent_source, ts=done_ts, time_str=done_iso)
+                    publish_telemetry = _build_publish_telemetry(
+                        doc,
+                        parent_snap=parent_snap,
+                        live_pub_ts=live_pub_ts,
+                        select_ts=now_ts,
+                        done_ts=done_ts,
+                        candidate_rank=cand_rank,
+                        candidate_pool_size=candidate_pool_size,
+                        fresh_2h_pool_size=fresh_2h_pool_size,
+                        max_post_comments_cap=max_comments_cap,
+                    )
                     col.update_one(
                         {"source": "x", "post_id": pid},
                         {
@@ -732,6 +807,7 @@ def publish_comments_from_db(
                                 f"{AUTO_COMMENT_FIELD}.published_comment_id": comment_id,
                                 f"{AUTO_COMMENT_FIELD}.published_comment_text": comment_text,
                                 f"{AUTO_COMMENT_FIELD}.parent_engagement_at_publish": parent_snap,
+                                f"{AUTO_COMMENT_FIELD}.publish_telemetry": publish_telemetry,
                                 f"{AUTO_COMMENT_FIELD}.follow_state": follow_state,
                                 f"{AUTO_COMMENT_FIELD}.last_publish_error": None,
                                 f"{AUTO_COMMENT_FIELD}.updated_at": done_iso,
@@ -979,6 +1055,8 @@ def _resolve_publisher_pool(
     seen_dirs: Set[str] = set()
     for item in raw_items:
         if isinstance(item, dict):
+            if item.get("enabled") is False:
+                continue
             raw_dir = str(item.get("user_data_dir") or "").strip()
             name = str(item.get("name") or "").strip()
             overrides = {k: item[k] for k in _PUBLISHER_OVERRIDE_KEYS if k in item}

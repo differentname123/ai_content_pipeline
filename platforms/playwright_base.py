@@ -50,6 +50,14 @@ GUARD_INTERVAL_MS = 700
 USER_DATA_LOCK_TIMEOUT_SEC = 300
 NEWLINE_SAFE_MODE = False
 
+# Pin Blink C++ fingerprint metrics that otherwise mutate across local vs. Remote Desktop/Headless sessions
+# (Chrome Remote Desktop injects SM_MAXIMUMTOUCHES=10 / altered scaling, breaking OKX ont.js AES-GCM key decryption).
+STABLE_DESKTOP_FINGERPRINT_ARGS = (
+    "--blink-settings=maxTouchPoints=0",
+    "--touch-events=disabled",
+    "--force-device-scale-factor=1",
+)
+
 RE_MORE = re.compile(r"更多|More|Options|Expand", re.IGNORECASE)
 RE_ADD_LINK = re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
 RE_CONFIRM = re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
@@ -1152,9 +1160,21 @@ def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=Tr
     return context
 
 
-def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN", proxy=None):
+def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN", proxy=None, args=None, viewport=None):
     """启动可见浏览器交由人工自由操作（关闭浏览器窗口后自动保存会话并退出）。"""
     logger.info(f"\n{'=' * 60}\n[人工/Manual] 启动本地浏览器交接控制权 | 目录: <{user_data_dir}>\n{'=' * 60}")
+    if args is None:
+        launch_args = ["--disable-blink-features=AutomationControlled", "--start-maximized", "--window-position=0,0"]
+        is_okx_target = (
+            "okx" in str(home_url or "").lower()
+            or "okx" in Path(str(user_data_dir).replace("\\", "/")).name.lower()
+        )
+        if is_okx_target:
+            launch_args.extend(STABLE_DESKTOP_FINGERPRINT_ARGS)
+            launch_args.extend(["--disable-restore-session-state", "--no-default-browser-check"])
+    else:
+        launch_args = list(args)
+
     with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
         with sync_playwright() as p:
             context = None
@@ -1162,7 +1182,8 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
                 context = _launch_persistent(
                     p,
                     user_data_dir,
-                    args=["--disable-blink-features=AutomationControlled", "--start-maximized", "--window-position=0,0"],
+                    args=launch_args,
+                    viewport=viewport,
                     debug=True,
                     proxy=proxy,
                 )

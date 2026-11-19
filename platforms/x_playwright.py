@@ -920,17 +920,22 @@ def _submit_x_post(
         except Exception:
             continue
 
-    try:
-        toast_link = page.locator('[data-testid="toast"] a[href*="/status/"]').first
-        if toast_link.count() > 0:
-            href = toast_link.get_attribute("href") or ""
-            m = re.search(r"/status/(\d{15,22})", href)
-            if m:
-                post_id = m.group(1)
-                logger.info(f"[发送/校验] 从底部 Toast 提示捕获到新推文 ID: 【{post_id}】 | 结果: [Success]")
-                return post_id
-    except Exception:
-        pass
+    def _extract_toast_post_id():
+        try:
+            toast_link = page.locator('[data-testid="toast"] a[href*="/status/"]').first
+            if toast_link.count() > 0:
+                href = toast_link.get_attribute("href") or ""
+                m = re.search(r"/status/(\d{15,22})", href)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    post_id = _extract_toast_post_id()
+    if post_id:
+        logger.info(f"[发送/校验] 从底部 Toast 提示捕获到新推文 ID: 【{post_id}】 | 结果: [Success]")
+        return post_id
 
     bad_http = next((getattr(r, "status", 0) for r in reversed(watcher.primary) if getattr(r, "status", 0) >= 400), None)
     if bad_http:
@@ -941,11 +946,37 @@ def _submit_x_post(
 
     text_after, media_after = _snapshot_x_editor(editor_container, real_editor)
     if (text_before > 0 and text_after == 0) or (media_before > 0 and media_after == 0):
-        logger.info(
-            f"[发送/校验] DOM 兜底比对通过（X 编辑器已清空） | 文本: 【{text_before}→{text_after}】 "
-            f"| 媒体: 【{media_before}→{media_after}】 | 结果: [Success]"
+        # 编辑器已清空时短轮询 Toast 链接复核，未拿到真实 post_id 绝不假成功放行
+        for _ in range(3):
+            page.wait_for_timeout(1000)
+            post_id = _extract_toast_post_id()
+            if post_id:
+                logger.info(f"[发送/校验] 延迟 Toast 复核捕获到新推文 ID: 【{post_id}】 | 结果: [Success]")
+                return post_id
+
+        toast_txt = ""
+        try:
+            t_loc = page.locator('[data-testid="toast"], [role="alert"]').first
+            if t_loc.count() > 0:
+                toast_txt = (t_loc.inner_text() or "").strip()[:160]
+        except Exception:
+            pass
+        _forensics(
+            page,
+            "x_send_unconfirmed",
+            {
+                "text_before": text_before,
+                "text_after": text_after,
+                "media_before": media_before,
+                "media_after": media_after,
+                "toast_text": toast_txt,
+                "url": page.url,
+            },
         )
-        return post_id
+        raise Exception(
+            f"X 编辑器虽已清空（文本 {text_before}→{text_after}，媒体 {media_before}→{media_after}），"
+            f"但未捕获 CreateTweet rest_id 或成功 Toast 状态链接（toast={toast_txt or '无'}），拒绝假成功放行。"
+        )
 
     _forensics(
         page,

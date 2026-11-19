@@ -78,10 +78,13 @@ TARGET_ACCOUNTS = [
 
 # 2. 轮询巡检与发帖冷却间隔（秒）
 CHECK_INTERVAL_SECONDS: int = 600           # 循环休眠轮询间隔（默认 10 分钟 = 600 秒）
-ACCOUNT_POST_COOLDOWN_SECONDS: int = 1800   # 每个账号连续发帖的最小冷却间隔（默认至少半小时 = 1800 秒）
+# 【保留冷却原因说明】避开 X AuthorDiversityScorer 短时间同号连续发帖相互降权，并避免高频空转消耗模型额度；
+# 每篇发布后冷却 3 小时（10800 秒），兼顾自然发布节奏与额度消耗控制。
+ACCOUNT_POST_COOLDOWN_SECONDS: int = 10800
 
 # 3. 严格门禁配置（严格精品制）
-ALLOWED_GRADES: List[str] = ["S"]           # 允许发布的最高评级（默认仅限 "S" 强烈必发；后续需求大时可改为 ["S", "A"]）
+# 【保留过滤原因说明】优先按 S -> A 顺序精选发布；配合 3 小时冷却控制日发总量约 4~6 条，既不错杀高爆发 A 级交易故事，又不低质刷屏。
+ALLOWED_GRADES: List[str] = ["S", "A"]      # 允许发布的评级（优先发布 S，缺 S 时择优发布高潜 A；若仅需 S 可改为 ["S"]）
 MAX_X_RAW_CHARS: int = 140                  # 纯汉字数上限（X 平台单条推文标准建议上限）
 MAX_X_UNITS: int = 280                      # X 平台标准计数单位上限（半角字符记 1，汉字/Emoji/全角记 2，URL 记 23）
 STRICT_X_LENGTH_GATE: bool = True           # 是否启用字符数量代码级二次强制校验
@@ -94,8 +97,8 @@ HISTORICAL_REF_COUNT: int = 50              # 参考历史已发推文数量（�
 
 # 5. 运行模式与模型调用
 BROWSER_VISIBLE: bool = True                # Playwright 发帖是否显示浏览器可见窗口（方便实时观测发帖状态）
-MODEL_PRESET_GROUP: str = "high"            # 调用的最强模型组（100% 走 high，使用 gpt-6.1-sol-max 等最强模型）
-AI_TIMEOUT_SECONDS: int = 1200              # 模型调用超时阈值（秒），设为 20 分钟 = 1200 秒，确保最强模型（如 gpt-6.1-sol-max 深度推理）充足运算不中断
+MODEL_PRESET_GROUP: str = "medium"          # 按用户要求切换至中等模型组（避免消耗 high 组额度）
+AI_TIMEOUT_SECONDS: int = 1200              # 模型调用超时阈值（秒），确保长候选列表推理不提前超时中断
 AI_MAX_RETRIES: int = 3                     # 模型调用失败时的最大重试次数（默认 3 次）
 AI_RETRY_DELAY_SECONDS: int = 15            # 重试退避等待基础间隔（秒）
 PROMPT_TEMPLATE_PATH: str = str(PROMPT_DIR / "X平台_结构化自动选帖与改写提示词.txt")
@@ -486,6 +489,7 @@ def execute_publish_and_update_state(
     grade = str(selected_item.get("grade") or "").strip().upper()
     reason = str(selected_item.get("decision_reason") or "").strip()
     final_text = str(selected_item.get("final_x_text") or "").strip()
+    bait_comments = [str(c).strip() for c in (selected_item.get("bait_comments") or []) if str(c).strip()]
 
     if dry_run:
         logger.info(
@@ -494,6 +498,7 @@ def execute_publish_and_update_state(
             f"候选ID: [{cand_id}] | 评级: [{grade}] | 字数: [{raw_chars}字 / {x_units} X单位]\n"
             f"有效配图: [{len(image_paths)}张] -> {image_paths}\n"
             f"入选理由: {reason}\n"
+            f"一楼神评备选: {bait_comments}\n"
             f"最终正文:\n{final_text}\n"
             f"{'*' * 85}"
         )
@@ -536,6 +541,7 @@ def execute_publish_and_update_state(
             f"🎉🎉🎉 [X发帖成功] 账号 [@{screen_name}] 发推成功！\n"
             f"Tweet ID: {tweet_id or '已发出'}\n"
             f"候选ID: {cand_id} | 评级: {grade}\n"
+            f"一楼神评备选: {bait_comments}\n"
             f"发布时间: {now_str}\n"
             + "=" * 90 + "\n"
         )
@@ -565,6 +571,7 @@ def execute_publish_and_update_state(
             "selection_reason": reason,
             "raw_chars": raw_chars,
             "x_units": x_units,
+            "bait_comments": bait_comments,
             "last_error": err_msg if not success else None,
         }
         if article_id and hasattr(article_manager, "db") and hasattr(article_manager.db, "get_collection"):
@@ -611,12 +618,12 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
         alias = account["alias"]
         screen_name = account["screen_name"]
 
-        # 1. 冷却门禁校验
+        # 1. 冷却门禁校验（强制执行账号发帖冷却，规避同号短时密集连发触发 AuthorDiversityScorer 降权）
         in_cooldown, remaining_sec = is_account_in_cooldown(account, state)
-        # if in_cooldown and not dry_run:
-        #     rem_min = max(1, int(remaining_sec // 60))
-        #     logger.info(f"⏳ [冷却跳过] 账号 [@{screen_name}] 处于发帖冷却中（还需等待约 {rem_min} 分钟）")
-        #     continue
+        if in_cooldown and not dry_run:
+            rem_min = max(1, int(remaining_sec // 60))
+            logger.info(f"⏳ [冷却跳过] 账号 [@{screen_name}] 处于发帖冷却中（还需等待约 {rem_min} 分钟）")
+            continue
 
         logger.info(f"🎯 [账号就绪] 账号 [@{screen_name}] 冷却完毕，开始执行选帖与发布检查")
 
@@ -652,7 +659,11 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
             )
             continue
 
-        # 5. 逐一应用双重门禁（优先审核排在最前的高潜帖）
+        # 5. 逐一应用双重门禁（严格确保 S 级优先于 A 级，再按模型排位审核）
+        selected_posts = sorted(
+            selected_posts,
+            key=lambda item: 0 if isinstance(item, dict) and str(item.get("grade") or "").strip().upper() == "S" else 1,
+        )
         published_this_round = False
         for rank_idx, sel_item in enumerate(selected_posts, 1):
             cand_id = str(sel_item.get("id") or "").strip()

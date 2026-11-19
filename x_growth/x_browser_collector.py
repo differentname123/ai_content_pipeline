@@ -1019,25 +1019,32 @@ def collect_posts_via_browser(
                 page.on("response", sniffer.on_response)
                 install_overlay_guard(page)
 
-                # ── 第 1 步：刷首页推荐流 ──
-                prev_home_ops = sniffer.op_counts.get("HomeTimeline", 0) + sniffer.op_counts.get("HomeLatestTimeline", 0)
-                page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
-                sniffer.wait_for_op_increment(page, ("HomeTimeline", "HomeLatestTimeline"), prev_home_ops, timeout_ms=15000)
-                page.wait_for_timeout(random.randint(1800, 3200))
-                _dismiss_overlays(page, aggressive=False, desc="x-growth-home")
-                check_for_crash(page)
+                # ── 第 1 步：刷首页推荐流（若首次加载无 GraphQL 响应则轻量刷新重试 1 次） ──
+                for attempt in range(2):
+                    prev_home_ops = sniffer.op_counts.get("HomeTimeline", 0) + sniffer.op_counts.get("HomeLatestTimeline", 0)
+                    if attempt == 0:
+                        page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
+                    else:
+                        logger.warning("[PostCollector/首页重载] 首次加载未监听到 GraphQL 响应，尝试刷新重试 1 次...")
+                        page.reload(timeout=45000, wait_until="domcontentloaded")
+                    sniffer.wait_for_op_increment(page, ("HomeTimeline", "HomeLatestTimeline"), prev_home_ops, timeout_ms=15000)
+                    page.wait_for_timeout(random.randint(1800, 3200))
+                    _dismiss_overlays(page, aggressive=False, desc="x-growth-home")
+                    check_for_crash(page)
 
-                acc_status, acc_msg = inspect_x_page_account_status(page)
-                if acc_status != "ok":
-                    return {
-                        "account_status": acc_status,
-                        "account_message": acc_msg,
-                        "self_handle": "",
-                        "all_captured_posts": [],
-                        "peer_users_discovered": 0,
-                        "threads_clicked": 0,
-                        "profiles_visited": 0,
-                    }
+                    acc_status, acc_msg = inspect_x_page_account_status(page)
+                    if acc_status != "ok":
+                        return {
+                            "account_status": acc_status,
+                            "account_message": acc_msg,
+                            "self_handle": "",
+                            "all_captured_posts": [],
+                            "peer_users_discovered": 0,
+                            "threads_clicked": 0,
+                            "profiles_visited": 0,
+                        }
+                    if sum(sniffer.op_counts.values()) > 0:
+                        break
 
                 self_uid, self_handle = extract_logged_in_identity(context, page)
                 if self_handle:
@@ -1135,6 +1142,18 @@ def collect_posts_via_browser(
                     max_posts_per_author=max_posts_per_author,
                     peer_follower_range=(min_followers, max_followers),
                 )
+                if not all_captured_posts and sum(sniffer.op_counts.values()) == 0:
+                    msg = "首页浏览未监听到任何 GraphQL 响应 (gql_ops={})，疑似页面加载异常或网络抖动，拒绝静默伪装为正常 0 条。"
+                    logger.warning(f"⚠️ [PostCollector/空采告警] 采集号=@{self_handle or self_uid or '未知'} | {msg}")
+                    return {
+                        "account_status": "empty_capture",
+                        "account_message": msg,
+                        "self_handle": self_handle,
+                        "all_captured_posts": [],
+                        "peer_users_discovered": len(peer_users),
+                        "threads_clicked": clicked_threads,
+                        "profiles_visited": visited_profiles,
+                    }
                 logger.info(
                     f"[PostCollector/浏览完成] 采集号=@{self_handle or self_uid or '已登录'} | "
                     f"gql_ops={sniffer.op_counts} | 24h避让作者={len(skip_authors)}人 | 点热帖={clicked_threads}条 | "

@@ -7,6 +7,7 @@ OKX 星球 (OKX Orbit) Playwright 浏览器自动化模块：
 - 人工接管 (open_browser_for_manual_use)
 - 底层锁、缓存清理、浮层免疫、光标控制与故障取证统一复用 platforms.playwright_base
 """
+import ctypes
 import os
 import re
 import sys
@@ -20,11 +21,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import expect, sync_playwright
 
-from common.common_utils import resolve_session_dir, setup_logger
+from common.common_utils import get_config, resolve_session_dir, setup_logger
 from platforms.playwright_base import (
     RE_COMMENT_BTN_EXACT,
     RE_SEND,
     RE_SEND_EXACT,
+    STABLE_DESKTOP_FINGERPRINT_ARGS,
     TYPE_CHUNK_SIZE,
     TYPE_DELAY_MS,
     USER_DATA_LOCK_TIMEOUT_SEC,
@@ -69,6 +71,202 @@ RE_SUBMIT_API_SECONDARY = re.compile(r"content/.*/publish|ugc/publish|orbit/.*/p
 RE_COMMENT_API_PRIMARY = re.compile(r"priapi/v5/content/user/comment|content/user/comment", re.IGNORECASE)
 RE_COMMENT_API_SECONDARY = re.compile(r"content/.*/comment|ugc/comment|orbit/.*/comment", re.IGNORECASE)
 
+_CACHED_DESKTOP_UA = {}
+
+
+class _VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", ctypes.c_uint32),
+        ("dwStrucVersion", ctypes.c_uint32),
+        ("dwFileVersionMS", ctypes.c_uint32),
+        ("dwFileVersionLS", ctypes.c_uint32),
+        ("dwProductVersionMS", ctypes.c_uint32),
+        ("dwProductVersionLS", ctypes.c_uint32),
+        ("dwFileFlagsMask", ctypes.c_uint32),
+        ("dwFileFlags", ctypes.c_uint32),
+        ("dwFileOS", ctypes.c_uint32),
+        ("dwFileType", ctypes.c_uint32),
+        ("dwFileSubtype", ctypes.c_uint32),
+        ("dwFileDateMS", ctypes.c_uint32),
+        ("dwFileDateLS", ctypes.c_uint32),
+    ]
+
+
+def _read_pe_major_version(exe_path):
+    """读取 Windows PE 可执行文件主版本号，失败返回 None。"""
+    if os.name != "nt" or not exe_path or not os.path.isfile(exe_path):
+        return None
+    try:
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(exe_path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(exe_path, None, size, buf):
+            return None
+        ptr = ctypes.c_void_p()
+        length = ctypes.c_uint()
+        if not ctypes.windll.version.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        if not ptr.value or length.value < ctypes.sizeof(_VS_FIXEDFILEINFO):
+            return None
+        ffi = _VS_FIXEDFILEINFO.from_address(ptr.value)
+        return str(ffi.dwFileVersionMS >> 16)
+    except Exception:
+        return None
+
+
+def _detect_installed_chrome_major():
+    """检测本机 Google Chrome 主版本号，用于无头模式下生成一致的桌面 UA。"""
+    if os.name != "nt":
+        return None
+
+    app_dirs = []
+    for env_key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        base = os.environ.get(env_key)
+        if base:
+            app_dirs.append(os.path.join(base, "Google", "Chrome", "Application"))
+
+    for app_dir in app_dirs:
+        major = _read_pe_major_version(os.path.join(app_dir, "chrome.exe"))
+        if major and major.isdigit():
+            return major
+
+    try:
+        import winreg
+
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for sub in (r"SOFTWARE\Google\Chrome\BLBeacon", r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon"):
+                try:
+                    with winreg.OpenKey(root, sub) as key:
+                        ver, _ = winreg.QueryValueEx(key, "version")
+                        m = re.match(r"^(\d+)\.", str(ver or ""))
+                        if m:
+                            return m.group(1)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+
+    for app_dir in app_dirs:
+        if os.path.isdir(app_dir):
+            vers = [name for name in os.listdir(app_dir) if re.match(r"^\d+\.\d+\.\d+\.\d+$", name)]
+            if vers:
+                latest = max(vers, key=lambda v: tuple(int(p) for p in v.split(".")))
+                return latest.split(".")[0]
+    return None
+
+
+def _get_okx_desktop_user_agent():
+    """返回与当前系统 Chrome 主版本匹配的桌面 UA（避免无头模式暴露 HeadlessChrome）。"""
+    channel = str(get_config("browser_channel", default="chrome") or "").strip().lower()
+    if channel != "chrome":
+        return None
+    if channel not in _CACHED_DESKTOP_UA:
+        major = _detect_installed_chrome_major()
+        _CACHED_DESKTOP_UA[channel] = (
+            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+            if major
+            else None
+        )
+    return _CACHED_DESKTOP_UA[channel]
+
+
+def _build_okx_launch_options(debug=False):
+    """构建人工接管与后台自动化统一的 OKX 浏览器启动参数（消除环境指纹漂移导致 code=805 登出）。"""
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        *STABLE_DESKTOP_FINGERPRINT_ARGS,
+        "--window-position=0,0",
+        "--disable-restore-session-state",
+        "--no-default-browser-check",
+    ]
+    if debug:
+        args.append("--start-maximized")
+        return {"args": args, "viewport": None}
+
+    # 无头模式走 Chrome 原生 --headless=new 并保留硬件 GPU，避免 --disable-gpu 触发 SwiftShader 虚拟机判定。
+    args.append("--window-size=1920,1080")
+    desktop_ua = _get_okx_desktop_user_agent()
+    if desktop_ua:
+        args.append(f"--user-agent={desktop_ua}")
+    return {"args": args, "viewport": {"width": 1920, "height": 1080}}
+
+
+def _detect_okx_auth_error(page, wait_ms=3000):
+    """检测 OKX 页面是否已跳回登录页或被 code=805 强制登出；正常返回 None。"""
+    def _check_url_or_notice():
+        cur_url = (page.url or "").lower()
+        if "/account/notice" in cur_url:
+            if "code=805" in cur_url:
+                return "检测到 OKX 账号被强制登出 (notice?code=805)，请更新脚本后重新登录。"
+            return f"检测到 OKX 账号安全提示页 ({page.url})，登录态可能已失效，请重新登录。"
+        if "/account/login" in cur_url:
+            return f"检测到页面跳转至 OKX 登录页 ({page.url})，本地 Cookie 已过期失效，请重新登录。"
+        try:
+            body_hint = page.evaluate(
+                "() => document.body ? (document.body.innerText || '').slice(0, 600) : ''"
+            )
+            if "您的账号被自动登出" in body_hint or "浏览器环境发生了变化" in body_hint:
+                return "检测到 OKX 账号被自动登出提示，请更新脚本后重新登录。"
+        except Exception:
+            pass
+        return None
+
+    immediate = _check_url_or_notice()
+    if immediate:
+        return immediate
+
+    if wait_ms > 0:
+        try:
+            page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=wait_ms)
+            return "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。"
+        except PlaywrightTimeoutError:
+            pass
+        return _check_url_or_notice()
+    return None
+
+
+def _open_okx_page_and_check_auth(
+    context,
+    url,
+    nav_desc,
+    extra_init_script=None,
+    page_label="主页",
+    log_prefix="[任务]",
+):
+    """在持久化上下文中打开目标页面、安装守卫并校验登录态，返回 (page, err_msg_or_none)。"""
+    context.set_default_timeout(60000)
+    context.set_default_navigation_timeout(60000)
+
+    page = context.new_page()
+    for old_page in context.pages:
+        if old_page != page:
+            try:
+                old_page.close()
+            except Exception:
+                pass
+    page.bring_to_front()
+
+    install_overlay_guard(page)
+    if extra_init_script:
+        page.add_init_script(extra_init_script)
+
+    response = page.goto(url, timeout=60000, wait_until="domcontentloaded")
+    _dismiss_overlays(page, aggressive=False, desc=nav_desc)
+    report_guard_hits(page, nav_desc)
+
+    if response and response.status >= 400:
+        return page, f"OKX {page_label}加载异常 (HTTP {response.status})"
+
+    auth_err = _detect_okx_auth_error(page, wait_ms=3000)
+    if auth_err:
+        logger.error(f"{log_prefix} {auth_err}")
+        return page, auth_err
+
+    check_for_crash(page)
+    return page, None
+
 
 # ==============================================================================
 #                    OKX 星球编辑器：定位 / 唤醒 / 键入 / 图片上传
@@ -106,6 +304,10 @@ def _locate_post_creator(page):
         except Exception:
             continue
 
+    auth_err = _detect_okx_auth_error(page, wait_ms=0)
+    if auth_err:
+        raise BusinessErrorException(auth_err)
+
     logger.warning("[定位/DOM] 精确组合策略未命中，降级锁定页面首个包含 ProseMirror 的上层容器")
     fallback = page.locator('div:has(div.tiptap.ProseMirror[contenteditable="true"])').first
     fallback.wait_for(state="visible", timeout=10000)
@@ -141,6 +343,10 @@ def _locate_comment_box(page):
                 return loc
         except Exception:
             continue
+
+    auth_err = _detect_okx_auth_error(page, wait_ms=0)
+    if auth_err:
+        raise BusinessErrorException(auth_err)
 
     logger.warning("[定位/DOM] 精确评论容器策略未命中，降级锁定包含 ProseMirror 的容器")
     fallback = page.locator('div:has(div.tiptap.ProseMirror[contenteditable="true"])').first
@@ -895,30 +1101,10 @@ def create_okx_post(
         f"\n{'=' * 70}\n[任务/Main] 启动 OKX 星球自动化发帖 | URL: <{OKX_ORBIT_URL}> "
         f"| 正文: 【{text_summary}】 | 图片数量: 【{img_count}】张 "
         f"| 热门标签: 【{add_hot_tag}】 | 仓位分享: 【{add_position}】 "
-        f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
-
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+    launch_opts = _build_okx_launch_options(debug=debug)
 
     try:
         with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
@@ -928,38 +1114,19 @@ def create_okx_post(
                     context = _launch_persistent(
                         p,
                         user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
+                        args=launch_opts["args"],
+                        viewport=launch_opts["viewport"],
                         debug=debug,
                     )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
-
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
-
-                    install_overlay_guard(page)
-
-                    response = page.goto(OKX_ORBIT_URL, timeout=60000, wait_until="domcontentloaded")
-                    _dismiss_overlays(page, aggressive=False, desc="orbit-nav")
-                    report_guard_hits(page, "orbit-nav")
-
-                    if response and response.status >= 400:
-                        return f"OKX 星球主页加载异常 (HTTP {response.status})", False, None
-
-                    try:
-                        page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=3000)
-                        return "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。", False, None
-                    except PlaywrightTimeoutError:
-                        pass
-
-                    check_for_crash(page)
+                    page, pre_err = _open_okx_page_and_check_auth(
+                        context,
+                        OKX_ORBIT_URL,
+                        nav_desc="orbit-nav",
+                        page_label="星球主页",
+                        log_prefix="[任务/Main]",
+                    )
+                    if pre_err:
+                        return pre_err, False, None
 
                     try:
                         editor_container = _locate_post_creator(page)
@@ -1032,30 +1199,10 @@ def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=U
 
     logger.info(
         f"\n{'=' * 70}\n[任务/Comment] 启动 OKX 星球自动化互动 | 目标帖子: <{target_post_url}> "
-        f"| 评论字数: 【{len(content)}字】 | 是否点赞: 【{like}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 评论字数: 【{len(content)}字】 | 是否点赞: 【{like}】 | 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
-
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+    launch_opts = _build_okx_launch_options(debug=debug)
 
     try:
         with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
@@ -1065,38 +1212,19 @@ def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=U
                     context = _launch_persistent(
                         p,
                         user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
+                        args=launch_opts["args"],
+                        viewport=launch_opts["viewport"],
                         debug=debug,
                     )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
-
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
-
-                    install_overlay_guard(page)
-
-                    response = page.goto(target_post_url, timeout=60000, wait_until="domcontentloaded")
-                    _dismiss_overlays(page, aggressive=False, desc="comment-nav")
-                    report_guard_hits(page, "comment-nav")
-
-                    if response and response.status >= 400:
-                        return f"OKX 帖子详情页加载异常 (HTTP {response.status})", False, None
-
-                    try:
-                        page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=3000)
-                        return "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。", False, None
-                    except PlaywrightTimeoutError:
-                        pass
-
-                    check_for_crash(page)
+                    page, pre_err = _open_okx_page_and_check_auth(
+                        context,
+                        target_post_url,
+                        nav_desc="comment-nav",
+                        page_label="帖子详情页",
+                        log_prefix="[任务/Comment]",
+                    )
+                    if pre_err:
+                        return pre_err, False, None
 
                     if like:
                         try:
@@ -1187,8 +1315,14 @@ def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=U
 
 
 def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url=OKX_ORBIT_URL):
-    """主控入口 2：启动可见浏览器交由人工自由操作（用于首次扫码/账号登录）。"""
-    return _base_open_browser_for_manual_use(user_data_dir=user_data_dir, home_url=home_url)
+    """主控入口 2：启动可见浏览器交由人工自由操作（与后台任务共享完全一致的环境指纹）。"""
+    launch_opts = _build_okx_launch_options(debug=True)
+    return _base_open_browser_for_manual_use(
+        user_data_dir=user_data_dir,
+        home_url=home_url,
+        args=launch_opts["args"],
+        viewport=launch_opts["viewport"],
+    )
 
 
 # ==============================================================================
@@ -1545,30 +1679,10 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
     logger.info(
         f"\n{'=' * 70}\n[任务/Delete] 启动 OKX 星球批量接口删帖 | URL: <{OKX_ORBIT_URL}> "
         f"| 去重后待删数量: 【{len(clean_id_list)}】条 | 间隔: 【{interval_sec}s】 "
-        f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
-
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+    launch_opts = _build_okx_launch_options(debug=debug)
 
     success_ids = []
     failed_ids = {}
@@ -1581,41 +1695,20 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
                     context = _launch_persistent(
                         p,
                         user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
+                        args=launch_opts["args"],
+                        viewport=launch_opts["viewport"],
                         debug=debug,
                     )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
-
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
-
-                    install_overlay_guard(page)
-                    page.add_init_script(_DELETE_SIGN_HOOK_INIT_JS)
-
-                    response = page.goto(OKX_ORBIT_URL, timeout=60000, wait_until="domcontentloaded")
-                    _dismiss_overlays(page, aggressive=False, desc="delete-nav")
-                    report_guard_hits(page, "delete-nav")
-
-                    if response and response.status >= 400:
-                        err_msg = f"OKX 星球主页加载异常 (HTTP {response.status})"
-                        return err_msg, False, {"success_ids": success_ids, "failed_ids": failed_ids}
-
-                    try:
-                        page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=3000)
-                        err_msg = "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。"
-                        return err_msg, False, {"success_ids": success_ids, "failed_ids": failed_ids}
-                    except PlaywrightTimeoutError:
-                        pass
-
-                    check_for_crash(page)
+                    page, pre_err = _open_okx_page_and_check_auth(
+                        context,
+                        OKX_ORBIT_URL,
+                        nav_desc="delete-nav",
+                        extra_init_script=_DELETE_SIGN_HOOK_INIT_JS,
+                        page_label="星球主页",
+                        log_prefix="[任务/Delete]",
+                    )
+                    if pre_err:
+                        return pre_err, False, {"success_ids": success_ids, "failed_ids": failed_ids}
 
                     for wait_round in range(12):
                         page.wait_for_timeout(500)

@@ -140,6 +140,8 @@ def run_comment_pipeline_daemon(
             if st != "ok":
                 if st in ("locked_challenge", "suspended", "not_logged_in"):
                     sleep_base = cooldown_sec
+                elif st == "empty_capture":
+                    sleep_base = min(base_interval, 600)
                 logger.error(
                     f"⚠️ [CommentPipeline/轮次 #{round_no} 待处理(冷却{sleep_base}s)] status={st} | {res.get('account_warning')}"
                 )
