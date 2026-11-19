@@ -29,6 +29,7 @@ from platforms.playwright_base import (
     RE_MORE,
     RE_SEND,
     RE_SEND_EXACT,
+    STABLE_DESKTOP_FINGERPRINT_ARGS,
     TYPE_CHUNK_SIZE,
     USER_DATA_LOCK_TIMEOUT_SEC,
     BusinessErrorException,
@@ -620,6 +621,14 @@ def _submit_comment(
             send_btn_cands, action="wait", timeout=5000, desc="发送按钮"
         )
         expect(send_button).to_be_enabled(timeout=8000)
+        # 币安使用自定义 CSS 类 inactive 表示图片异步上传中/校验未完成状态，必须等待激活
+        for _w in range(20):
+            cls_val = (send_button.get_attribute("class") or "").split()
+            if "inactive" not in cls_val:
+                break
+            page.wait_for_timeout(1000)
+        else:
+            logger.warning("[发送/按钮] 发送按钮持续带有 inactive 类（可能图片上传耗时较长或正在校验）")
     except PlaywrightTimeoutError:
         _forensics(
             page,
@@ -643,48 +652,61 @@ def _submit_comment(
     )
     watcher = _ApiWatcher(page)
     try:
-        clicked = False
-        for attempt in range(3):
-            hit = _hit_test(page, send_button)
-            if not hit.get("ok"):
-                logger.warning(
-                    f"[发送/提交] 发送按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】"
-                )
-                _dismiss_overlays(page, aggressive=(attempt >= 1), desc=f"send-blocked-{attempt}")
+        max_send_rounds = 2
+        for s_round in range(max_send_rounds):
+            clicked = False
+            for attempt in range(3):
+                hit = _hit_test(page, send_button)
+                if not hit.get("ok"):
+                    logger.warning(
+                        f"[发送/提交] 发送按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】"
+                    )
+                    _dismiss_overlays(page, aggressive=(attempt >= 1), desc=f"send-blocked-{attempt}")
+                try:
+                    if attempt == 0:
+                        _robust_click(send_button)
+                    elif attempt == 1:
+                        send_button.click(timeout=5000, force=True)
+                    else:
+                        send_button.evaluate("el => el.click()")
+                    clicked = True
+                    break
+                except Exception as ce:
+                    logger.warning(f"[发送/提交] 第【{attempt + 1}】次点击失败，升级点击方式重试 | 详情: 【{str(ce)[:150]}】")
+
+            if not clicked:
+                _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
+                raise Exception("发送按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
+
             try:
-                if attempt == 0:
-                    _robust_click(send_button)
-                elif attempt == 1:
-                    send_button.click(timeout=5000, force=True)
-                else:
-                    send_button.evaluate("el => el.click()")
-                clicked = True
+                re_follow_and_reply = re.compile(r"关注并回复|Follow and [R|r]eply", re.IGNORECASE)
+                follow_reply_btn = (
+                    page.locator("div[role='dialog'], [class*='modal']")
+                    .get_by_role("button", name=re_follow_and_reply)
+                    .first
+                )
+
+                if follow_reply_btn.is_visible(timeout=1500):
+                    logger.info("[发送/权限] 触发了「仅限关注者评论」限制，正在自动点击【关注并回复】")
+                    watcher.primary.clear()
+                    watcher.secondary.clear()
+                    follow_reply_btn.click(timeout=3000)
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            api_success, comment_id = _read_api_verdict(page, watcher)
+            if api_success:
                 break
-            except Exception as ce:
-                logger.warning(f"[发送/提交] 第【{attempt + 1}】次点击失败，升级点击方式重试 | 详情: 【{str(ce)[:150]}】")
 
-        if not clicked:
-            _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
-            raise Exception("发送按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
-
-        try:
-            re_follow_and_reply = re.compile(r"关注并回复|Follow and [R|r]eply", re.IGNORECASE)
-            follow_reply_btn = (
-                page.locator("div[role='dialog'], [class*='modal']")
-                .get_by_role("button", name=re_follow_and_reply)
-                .first
-            )
-
-            if follow_reply_btn.is_visible(timeout=1500):
-                logger.info("[发送/权限] 触发了「仅限关注者评论」限制，正在自动点击【关注并回复】")
-                watcher.primary.clear()
-                watcher.secondary.clear()
-                follow_reply_btn.click(timeout=3000)
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
-
-        api_success, comment_id = _read_api_verdict(page, watcher)
+            if s_round < max_send_rounds - 1:
+                cur_text, _ = _snapshot_editor(real_editor)
+                if cur_text > 0:
+                    cls_val = (send_button.get_attribute("class") or "").split()
+                    if "inactive" not in cls_val:
+                        logger.info("[发送/重试] 首次点击未捕获接口响应且按钮目前处于可用状态，准备重试点击一次...")
+                        page.wait_for_timeout(1500)
+                        continue
     except PlaywrightTimeoutError as e:
         logger.warning(f"[发送/校验] 等待接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
     finally:
@@ -879,26 +901,16 @@ def create_binance_post(
     )
 
     anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
+    desktop_args = [
         "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
+        "--window-position=0,0",
+    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
 
     debug_args = [
         "--disable-blink-features=AutomationControlled",
         "--start-maximized",
         "--window-position=0,0",
-    ] + anti_freeze_args
+    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
 
     try:
         with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
@@ -908,7 +920,7 @@ def create_binance_post(
                     context = _launch_persistent(
                         p,
                         user_data_dir,
-                        args=debug_args if debug else offscreen_args,
+                        args=debug_args if debug else desktop_args,
                         viewport=None if debug else {"width": 1920, "height": 1080},
                         debug=debug,
                     )
@@ -1029,26 +1041,16 @@ def comment_on_binance_post(
     )
 
     anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
+    desktop_args = [
         "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
+        "--window-position=0,0",
+    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
 
     debug_args = [
         "--disable-blink-features=AutomationControlled",
         "--start-maximized",
         "--window-position=0,0",
-    ] + anti_freeze_args
+    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
 
     try:
         with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
@@ -1058,7 +1060,7 @@ def comment_on_binance_post(
                     context = _launch_persistent(
                         p,
                         user_data_dir,
-                        args=debug_args if debug else offscreen_args,
+                        args=debug_args if debug else desktop_args,
                         viewport=None if debug else {"width": 1920, "height": 1080},
                         debug=debug,
                     )
