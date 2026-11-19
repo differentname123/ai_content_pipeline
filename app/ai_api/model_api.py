@@ -51,9 +51,7 @@ API_KEY = get_config("local_api_key")
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
 HIGH_MODEL_LIST = [
     # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
-    # {"model_name": "gemini-aistudio-4-hydrogen", "权重": 1, "备注": "来源aistudio_web"},
-
-    {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号 (占组内总权重 90%)"},
+    {"model_name": "gpt-6.1-sol-max", "权重": 90, "备注": "来源codex 订阅账号 (占组内总权重 90%)"},
     # {"model_name": "antigravity-argon-high", "权重": 10, "备注": "来源antigravity 本地客户端 (占组内总权重 10%)"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
@@ -63,7 +61,6 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 4, "备注": "来源gemini_web"},
 
     {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 1, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-4-hydrogen", "权重": 4, "备注": "来源aistudio_web"},
 
@@ -91,9 +88,9 @@ LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
     # {"model_name": "gemma-aistudio-api-key-4-31b-it", "权重": 0, "备注": "来源api key aistudio "},
-    # {"model_name": "gemini-aistudio-api-key-3.5-flash", "权重": 0, "备注": "来源api key aistudio (与 3.6-flash 共用 20/day 额度桶，停用以免互相消耗)"},
-    {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "权重": 0.1, "备注": "来源api key aistudio "},
-    {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "权重": 0.1, "备注": "来源api key aistudio "},
+    {"model_name": "gemini-aistudio-api-key-3.5-flash", "权重": 0, "备注": "来源api key aistudio (与 3.6-flash 共用 20/day 额度桶；权重=0 在 _select_models 中已严格禁用)"},
+    {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "权重": 0, "备注": "来源api key aistudio "},
+    {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "权重": 0, "备注": "来源api key aistudio "},
 
     {"model_name": "gemini-aistudio-3.5-flash-lite", "权重": 0.5, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0.1, "备注": "来源aistudio_web"},
