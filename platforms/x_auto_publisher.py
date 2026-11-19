@@ -83,8 +83,8 @@ CHECK_INTERVAL_SECONDS: int = 600           # 循环休眠轮询间隔（默认 
 ACCOUNT_POST_COOLDOWN_SECONDS: int = 10800
 
 # 3. 严格门禁配置（严格精品制）
-# 【保留过滤原因说明】优先按 S -> A 顺序精选发布；配合 3 小时冷却控制日发总量约 4~6 条，既不错杀高爆发 A 级交易故事，又不低质刷屏。
-ALLOWED_GRADES: List[str] = ["S", "A"]      # 允许发布的评级（优先发布 S，缺 S 时择优发布高潜 A；若仅需 S 可改为 ["S"]）
+# 【保留过滤原因说明】严格执行精品门禁，仅允许发布 S 级顶级爆款；宁缺毋滥，非 S 级绝不推送。
+ALLOWED_GRADES: List[str] = ["S"]           # 允许发布的评级（严格仅限 "S" 顶级爆款；A 级及以下严禁发送）
 MAX_X_RAW_CHARS: int = 140                  # 纯汉字数上限（X 平台单条推文标准建议上限）
 MAX_X_UNITS: int = 280                      # X 平台标准计数单位上限（半角字符记 1，汉字/Emoji/全角记 2，URL 记 23）
 STRICT_X_LENGTH_GATE: bool = True           # 是否启用字符数量代码级二次强制校验
