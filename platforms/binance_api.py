@@ -636,18 +636,20 @@ def _enrich_single_post(item, session, download_media: bool = True):
                 except Exception as dl_e:
                     logger.debug(f"[币安富化/媒体下载] 下载异常 | 帖子ID: [{post_id}] | URL: <{url}> | 原因: [{dl_e}]")
 
-        try:
-            comment_count = item.get("engagement", {}).get("comment_count", 0)
-            # 【保留过滤原因说明】已知 0 评论帖短路跳过：避免对无评论帖发起注定返回空数组的 HTTP 请求浪费耗时。
-            if comment_count == 0:
-                item["comments"] = []
-            else:
-                replies = fetch_binance_replies(content_id=post_id, sort_by=1, required_count=10, session=session)
-                item["comments"] = replies
-                if replies:
-                    stats["comments_fetched"] = 1
-        except Exception as reply_e:
-            logger.debug(f"[币安富化/评论] 评论拉取异常 | 帖子ID: [{post_id}] | 原因: [{reply_e}]")
+        # 【流量优化节流】跳过额外的单帖评论拉取以节省代理流量；如后续需要恢复，直接解开下方注释即可
+        item["comments"] = []
+        # try:
+        #     comment_count = item.get("engagement", {}).get("comment_count", 0)
+        #     # 【保留过滤原因说明】已知 0 评论帖短路跳过：避免对无评论帖发起注定返回空数组的 HTTP 请求浪费耗时。
+        #     if comment_count == 0:
+        #         item["comments"] = []
+        #     else:
+        #         replies = fetch_binance_replies(content_id=post_id, sort_by=1, required_count=10, session=session)
+        #         item["comments"] = replies
+        #         if replies:
+        #             stats["comments_fetched"] = 1
+        # except Exception as reply_e:
+        #     logger.debug(f"[币安富化/评论] 评论拉取异常 | 帖子ID: [{post_id}] | 原因: [{reply_e}]")
 
     except Exception as e:
         stats["failed"] = 1
