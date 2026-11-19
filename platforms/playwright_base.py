@@ -1189,9 +1189,21 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
                 )
                 page = context.pages[0] if context.pages else context.new_page()
                 page.bring_to_front()
-                page.goto(home_url)
+                try:
+                    page.goto(home_url, wait_until="commit", timeout=60000)
+                except Exception as nav_err:
+                    logger.warning(
+                        f"[人工/Manual] 初始页面导航偏慢或遇网络波动 ({nav_err})，"
+                        f"浏览器仍保持开启供人工自由操作。"
+                    )
                 logger.info("[人工/Manual] ✅ 浏览器已就绪，控制权已交接 | 🛑 退出方式: 【直接关闭浏览器窗口，程序自动结束】")
-                page.wait_for_event("close", timeout=0)
+                while context.pages:
+                    try:
+                        context.pages[-1].wait_for_event("close", timeout=1000)
+                    except PlaywrightTimeoutError:
+                        continue
+                    except Exception:
+                        break
             except Exception as e:
                 logger.warning(f"[人工/Manual] 浏览器运行异常 | 可能原因: 【环境损坏或窗口被手动强杀: {e}】")
             finally:
