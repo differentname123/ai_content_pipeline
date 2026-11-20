@@ -320,7 +320,8 @@ def _generate_validated_info(action, prompt, validator, context, **model_kwargs)
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         raw_response = ""
         try:
-            result = generate_content(prompt=prompt, preset_model_group='low',**model_kwargs)
+            model_kwargs.setdefault("preset_model_group", "low")
+            result = generate_content(prompt=prompt, **model_kwargs)
             raw_response = result.get("content", "")
             data = string_to_object(raw_response)
             valid, error = validator(data)
