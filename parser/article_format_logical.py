@@ -126,9 +126,9 @@ ARTICLE_MATERIAL_LIMIT = 10
 ARTICLE_MIN_MATERIALS = 5
 ARTICLE_POST_USAGE_LIMIT = 2
 ARTICLE_MAX_CHARS = 260
-ARTICLE_VARIANTS = 2
+ARTICLE_VARIANTS = 1
 ARTICLE_CONCURRENCY = 5
-ARTICLE_GENERATION_INTERVAL_SECONDS = 600
+ARTICLE_GENERATION_INTERVAL_SECONDS = 1200
 
 # 流水线各模块独立启停控制面板
 TASK_SWITCHES = {
@@ -320,7 +320,7 @@ def _generate_validated_info(action, prompt, validator, context, **model_kwargs)
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         raw_response = ""
         try:
-            result = generate_content(prompt=prompt, **model_kwargs)
+            result = generate_content(prompt=prompt, preset_model_group='low',**model_kwargs)
             raw_response = result.get("content", "")
             data = string_to_object(raw_response)
             valid, error = validator(data)
