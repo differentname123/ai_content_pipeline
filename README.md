@@ -55,7 +55,7 @@ ai_content_pipeline/
 │   ├── comment_generator.py          # `low` 批量生成与分类 + `medium` 独立盲测打分（20 条/波清零）
 │   ├── comment_pipeline.py           # 【生产守护进程 3】采集 + 生成一键串联守护进程
 │   ├── comment_publisher.py          # 【生产守护进程 4】主号神评消费、防爆楼（<=15 评 / >=75 分）与免登指标回流
-│   └── auto_follower.py              # 极简每小时自动互关守护进程（含 `--dry-run` / `--status` / `--once`）
+│   └── auto_follower.py              # 极简高内聚自动互关脚本（`x_user_profiles` 首页+评论+蓝V粉丝圈评分 + `x_follow_records` 分账号关注）
 │
 ├── prompt/                           # 当前活跃的 11 个生产/人工复盘提示词模板
 └── tests/                            # 确定性离线单元测试套件（零真实网络/数据库/浏览器副作用）
@@ -96,12 +96,10 @@ playwright install chromium
   python x_growth/comment_publisher.py --once --dry-run
   python x_growth/comment_publisher.py --sync-metrics
   ```
-- **X 极简每小时自动互关**：
+- **X 极简高内聚每小时自动互关**（直接在 [x_growth/auto_follower.py](x_growth/auto_follower.py) 顶部修改 `RUN_MODE` 与 `TARGET_ACCOUNTS`）：
   ```bash
-  python x_growth/auto_follower.py                   # 默认每小时巡检一次，为 x_myself (@peterzhu1003) 执行互关（8/时, 80/天）
-  python x_growth/auto_follower.py --dry-run         # 零浏览器预览下一批待关注候选名单
-  python x_growth/auto_follower.py --status          # 只读查看当前合格池、24h 配额与真实回关率
-  python x_growth/auto_follower.py --once --check-followbacks
+  python x_growth/auto_follower.py                   # 按代码顶部 RUN_MODE 运行（默认 "daemon" 每小时采集推荐流/评论区/高分蓝V的 /verified_followers 并关注 20/轮、400/天；间隔 3~5s + 180s 持锁止损，满 48h 未回关自动取关）
+  # 可选在代码顶部切换 RUN_MODE = "harvest_once" / "follow_once" / "unfollow_once" / "preview" / "status" / "login"
   ```
 - **人工扫码/登录浏览器会话接管**：直接运行 `platforms/binance_playwright.py`、`platforms/okx_playwright.py` 或 `platforms/x_playwright.py`。
 

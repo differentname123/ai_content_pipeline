@@ -809,23 +809,51 @@ def _has_binance_logged_out_text(page):
         return False
 
 
-def _detect_binance_logged_out(page, wait_ms=3000):
-    """快速探测币安未登录侧边栏、Login 入口或会话超时弹窗，避免无效等待编辑器超时。"""
+def _is_binance_post_editor_visible(page):
+    """探测币安广场主页发帖区是否已可见（仅登录态展示，用于排除 SSR 瞬态未登录侧栏误报）。"""
+    try:
+        return page.locator("div.short-editor-inner").first.is_visible() is True
+    except Exception:
+        return False
+
+
+def _detect_binance_logged_out(page, wait_ms=3000, settle_ms=5000):
+    """快速探测币安未登录侧边栏、Login 入口或会话超时弹窗，并排除 SSR 水合期瞬态误报。"""
     err_msg = "页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。"
     if _has_binance_logged_out_text(page):
         return err_msg
 
     if wait_ms > 0:
+        login_probe = page.locator('[data-signup-widget="true"], a[href*="login"]').first
         try:
-            page.locator('[data-signup-widget="true"], a[href*="login"]').first.wait_for(
-                state="visible", timeout=wait_ms
-            )
-            return err_msg
+            login_probe.wait_for(state="visible", timeout=wait_ms)
         except PlaywrightTimeoutError:
             if _has_binance_logged_out_text(page):
                 return err_msg
+            return None
         except Exception:
-            pass
+            return None
+
+        # 币安广场 SSR 首屏会短暂渲染 [data-signup-widget="true"]，待前端水合完成后自动移除；
+        # 若在 settle_ms 内消失或广场发帖区已真实可见（且无会话超时提示），判定为水合期瞬态误报并放行。
+        if settle_ms > 0:
+            try:
+                login_probe.wait_for(state="hidden", timeout=settle_ms)
+                if _has_binance_logged_out_text(page):
+                    return err_msg
+                logger.info("[登录态/Auth] 检测到登录组件在前端水合后自动消失，判定为已登录并放行")
+                return None
+            except PlaywrightTimeoutError:
+                pass
+            except Exception:
+                pass
+
+        if _has_binance_logged_out_text(page):
+            return err_msg
+        if _is_binance_post_editor_visible(page):
+            logger.warning("[登录态/Auth] 登录组件仍存在但广场发帖区已可见，按已登录放行")
+            return None
+        return err_msg
     return None
 
 

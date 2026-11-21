@@ -166,26 +166,77 @@ class TestBinanceWafDetection(unittest.TestCase):
     def test_detects_binance_logged_out_modal_and_signup_widget(self):
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+        def _make_auth_page(*, body_text, visible_ok, hidden_ok, editor_visible):
+            login_probe = MagicMock()
+
+            def _wait_for(*, state="visible", timeout=None):
+                if state == "visible" and not visible_ok:
+                    raise PlaywrightTimeoutError("timeout")
+                if state == "hidden" and not hidden_ok:
+                    raise PlaywrightTimeoutError("timeout")
+
+            login_probe.wait_for.side_effect = _wait_for
+            login_loc = MagicMock()
+            login_loc.first = login_probe
+
+            editor_probe = MagicMock()
+            editor_probe.is_visible.return_value = editor_visible
+            editor_loc = MagicMock()
+            editor_loc.first = editor_probe
+
+            page = MagicMock()
+            page.evaluate.return_value = body_text
+            page.locator.side_effect = lambda sel: editor_loc if "short-editor-inner" in sel else login_loc
+            return page
+
         # Case 1: Session expired modal text
-        page_modal = MagicMock()
-        page_modal.evaluate.return_value = "需要验证 登录会话已超时，请完成安全验证以保持登录状态 执行安全验证"
-        err_modal = _detect_binance_logged_out(page_modal, wait_ms=10)
+        page_modal = _make_auth_page(
+            body_text="需要验证 登录会话已超时，请完成安全验证以保持登录状态 执行安全验证",
+            visible_ok=False,
+            hidden_ok=True,
+            editor_visible=False,
+        )
+        err_modal = _detect_binance_logged_out(page_modal, wait_ms=10, settle_ms=10)
         self.assertIsNotNone(err_modal)
         self.assertIn("会话已超时", err_modal)
 
-        # Case 2: Signup widget visible in DOM
-        page_widget = MagicMock()
-        page_widget.evaluate.return_value = "币安广场"
-        page_widget.locator.return_value.first.wait_for.return_value = None
-        err_widget = _detect_binance_logged_out(page_widget, wait_ms=10)
+        # Case 2: Truly logged-out persistent signup widget (stays visible and no post editor)
+        page_widget = _make_auth_page(
+            body_text="币安广场",
+            visible_ok=True,
+            hidden_ok=False,
+            editor_visible=False,
+        )
+        err_widget = _detect_binance_logged_out(page_widget, wait_ms=10, settle_ms=10)
         self.assertIsNotNone(err_widget)
         self.assertIn("登录", err_widget)
 
-        # Case 3: Logged-in healthy page (no modal text, signup widget times out)
-        page_ok = MagicMock()
-        page_ok.evaluate.return_value = "币安广场 写点什么吧"
-        page_ok.locator.return_value.first.wait_for.side_effect = PlaywrightTimeoutError("timeout")
-        self.assertIsNone(_detect_binance_logged_out(page_ok, wait_ms=10))
+        # Case 3: SSR hydration flash (signup widget disappears within settle_ms)
+        page_ssr_flash = _make_auth_page(
+            body_text="币安广场",
+            visible_ok=True,
+            hidden_ok=True,
+            editor_visible=False,
+        )
+        self.assertIsNone(_detect_binance_logged_out(page_ssr_flash, wait_ms=10, settle_ms=10))
+
+        # Case 4: Slow hydration where signup widget lingers, but post editor is already visible
+        page_slow_hydration = _make_auth_page(
+            body_text="币安广场 写点什么吧",
+            visible_ok=True,
+            hidden_ok=False,
+            editor_visible=True,
+        )
+        self.assertIsNone(_detect_binance_logged_out(page_slow_hydration, wait_ms=10, settle_ms=10))
+
+        # Case 5: Healthy logged-in page (no modal text, signup widget times out)
+        page_ok = _make_auth_page(
+            body_text="币安广场 写点什么吧",
+            visible_ok=False,
+            hidden_ok=True,
+            editor_visible=True,
+        )
+        self.assertIsNone(_detect_binance_logged_out(page_ok, wait_ms=10, settle_ms=10))
 
     def test_waf_error_prefix_is_not_duplicated(self):
         class _DummySession:

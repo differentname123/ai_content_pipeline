@@ -22,7 +22,7 @@ from common.common_utils import (
 # 1. 提示词版本与模板配置
 # ==============================================================================
 prompt_version = "1016-1"
-SELECTION_PROMPT_VERSION = "20261121-v4_human_calibrated"
+SELECTION_PROMPT_VERSION = "20261121-v6_minimal_pick_only"
 
 PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
 MLU_EXTRACT_PROMPT_NAME = "内容生成方案_分析类MLU提取.txt"
