@@ -26,6 +26,7 @@ from common.common_utils import (
     POST_SOURCES,
     SELF_AUTHOR_IDS,
     SELF_AUTHOR_NAMES,
+    download_web_media,
     is_self_post as _common_is_self_post,
 )
 from common.daemon import run_daemon_loop
@@ -192,8 +193,14 @@ def _is_self_post(post: Any, self_post_ids: Optional[set] = None) -> bool:
     return bool(author_name and author_name in SELF_AUTHOR_NAMES)
 
 
-def _is_valid_raw_post(post: Dict[str, Any]) -> bool:
-    """校草原帖基础结构、48h 时效、非视频、图片映射完整性及非自营账号约束。"""
+_FAILED_MEDIA_LOCK = threading.Lock()
+_FAILED_MEDIA_UNTIL: Dict[str, float] = {}
+_FAILED_MEDIA_TTL_SECONDS = 1800.0
+_FAILED_MEDIA_MAX_ENTRIES = 4096
+
+
+def _is_valid_raw_post(post: Dict[str, Any], *, require_local_media: bool = True) -> bool:
+    """校验原帖基础结构、48h 时效、非视频、媒体数量及（可选）本地图片完整性约束。"""
     if _is_self_post(post):
         return False
     post_id = post.get("post_id")
@@ -203,17 +210,80 @@ def _is_valid_raw_post(post: Dict[str, Any]) -> bool:
     video_duration = media.get("video_duration")
     if video_duration and video_duration > 0:
         return False
-    mapping = media.get("local_mapping") or {}
-    paths = list(mapping.values())
-    if len(paths) >= MAX_MEDIA_COUNT or any(not path for path in paths):
-        return False
     text = (post.get("content") or {}).get("text_content") or ""
-    if not text.strip() or any(not mapping.get(match.group(2)) for match in MEDIA_PATTERN.finditer(text)):
+    if not text.strip():
+        return False
+    media_matches = list(MEDIA_PATTERN.finditer(text))
+    if any(match.group(1) == "视频" for match in media_matches):
+        return False
+    unique_urls = {match.group(2) for match in media_matches}
+    if len(unique_urls) >= MAX_MEDIA_COUNT or len(media.get("images") or []) >= MAX_MEDIA_COUNT:
         return False
     publish_time = _publish_time_seconds(post.get("publish_time", 0))
     if (time.time() - publish_time) / 3600 > POST_MAX_AGE_HOURS:
         return False
+    if not require_local_media:
+        return True
+    mapping = media.get("local_mapping") or {}
+    paths = list(mapping.values())
+    if len(paths) >= MAX_MEDIA_COUNT or any(not path for path in paths):
+        return False
+    if any(not mapping.get(match.group(2)) for match in media_matches):
+        return False
     return all(_is_valid_image_file(path) for path in paths)
+
+
+def ensure_post_media_downloaded(post: Dict[str, Any]) -> bool:
+    """按需下载并校验原帖缺失的配图至 `post['media']['local_mapping']`（复用磁盘 URL 缓存）。"""
+    if not _is_valid_raw_post(post, require_local_media=False):
+        return False
+    text = (post.get("content") or {}).get("text_content") or ""
+    seen_urls = set()
+    urls: List[str] = []
+    for match in MEDIA_PATTERN.finditer(text):
+        if match.group(1) == "视频":
+            continue
+        url = match.group(2)
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            urls.append(url)
+    if not urls:
+        return _is_valid_raw_post(post, require_local_media=True)
+
+    media = post.setdefault("media", {})
+    if not isinstance(media, dict):
+        return False
+    mapping = media.setdefault("local_mapping", {})
+    if not isinstance(mapping, dict):
+        return False
+
+    for url in urls:
+        existing = mapping.get(url)
+        if existing and _is_valid_image_file(existing):
+            continue
+        now = time.monotonic()
+        with _FAILED_MEDIA_LOCK:
+            failed_until = _FAILED_MEDIA_UNTIL.get(url, 0.0)
+        if failed_until > now:
+            return False
+
+        local_path = download_web_media(url=url)
+        if local_path and _is_valid_image_file(local_path):
+            mapping[url] = local_path
+            continue
+
+        with _FAILED_MEDIA_LOCK:
+            if len(_FAILED_MEDIA_UNTIL) >= _FAILED_MEDIA_MAX_ENTRIES:
+                expired = [k for k, v in _FAILED_MEDIA_UNTIL.items() if v <= now]
+                for k in expired:
+                    _FAILED_MEDIA_UNTIL.pop(k, None)
+                if len(_FAILED_MEDIA_UNTIL) >= _FAILED_MEDIA_MAX_ENTRIES:
+                    oldest_key = min(_FAILED_MEDIA_UNTIL, key=_FAILED_MEDIA_UNTIL.get)
+                    _FAILED_MEDIA_UNTIL.pop(oldest_key, None)
+            _FAILED_MEDIA_UNTIL[url] = now + _FAILED_MEDIA_TTL_SECONDS
+        return False
+
+    return _is_valid_raw_post(post, require_local_media=True)
 
 
 def normalize_post_media(post_data: Dict[str, Any]) -> Tuple[str, List[str], Dict[str, str]]:
@@ -263,11 +333,11 @@ def _fetch_hot_posts(
     for token in token_list:
         token_count += 1
         for order in (1, 2):
-            batch = fetch_feed(token=token, count=100, orderBy=order)
+            batch = fetch_feed(token=token, count=100, orderBy=order, download_media=False)
             if batch:
                 post_manager.upsert_posts(batch)
                 total_posts += len(batch)
-    rec_batch = fetch_feed(count=200)
+    rec_batch = fetch_feed(count=200, download_media=False)
     if rec_batch:
         post_manager.upsert_posts(rec_batch)
         total_posts += len(rec_batch)
@@ -393,6 +463,7 @@ __all__ = [
     "_key_error",
     "_publish_time_seconds",
     "build_source_image_mapping",
+    "ensure_post_media_downloaded",
     "fetch_all_hot_posts",
     "fetch_all_hot_posts_once",
     "fetch_binance_hot_post",

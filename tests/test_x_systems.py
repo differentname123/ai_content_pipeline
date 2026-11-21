@@ -19,7 +19,13 @@ from platforms.x_api import (
     extract_domain_cookies_from_user_data_dir,
     fetch_x_tweet_zero_auth,
 )
-from platforms.x_auto_publisher import run_single_check_cycle, validate_double_gates
+from platforms.x_auto_publisher import (
+    build_account_historical_posts_block,
+    build_candidate_prompt_data,
+    rank_and_trim_x_candidates,
+    run_single_check_cycle,
+    validate_double_gates,
+)
 from platforms.x_playwright import _submit_x_post
 from x_growth.comment_publisher import _filter_and_rank_candidates, sync_recent_comment_metrics
 from x_growth.x_browser_collector import collect_and_save_posts
@@ -281,6 +287,86 @@ class TestXApiAndAutoPublisher(unittest.TestCase):
         mock_fetch.assert_not_called()
         self.assertEqual(res["status"], "cooldown")
         self.assertGreater(res["next_sleep_seconds"], 10600)
+
+    def test_x_auto_publisher_rank_trim_split_history_and_compact_candidates(self):
+        # 1. rank_and_trim_x_candidates trims to top N using viral_score + source engagement
+        cands = [
+            {
+                "article_id": f"art_{i}",
+                "post_id_list": [f"p_{i}"],
+                "creation_brief": {"original_post": {"text_content": f"原帖人话 {i} [插图: https://a.com/{i}.jpg]"}},
+                "article_info": {
+                    "viral_score": 6.0 + (i % 4),
+                    "topic_tag": "搞钱与盈亏",
+                    "post_text": f"改写稿 {i}",
+                    "image_semantics": [
+                        {"id": "[IMAGE_1]", "semantic_role": "核心实盘图", "keep": True},
+                        {"id": "[IMAGE_2]", "semantic_role": "废图", "keep": False},
+                    ],
+                },
+                "_src_engagement": {"view_count": 1000 * (i + 1), "like_count": i, "comment_count": 0},
+            }
+            for i in range(10)
+        ]
+        from platforms.x_auto_publisher import MAX_LLM_CANDIDATES
+
+        self.assertEqual(MAX_LLM_CANDIDATES, 50)
+        with patch("platforms.x_auto_publisher.UniversalPostManager") as mock_pm:
+            mock_pm.return_value.find_posts.return_value = []
+            trimmed = rank_and_trim_x_candidates(cands, max_candidates=4, now_ts=1_800_000_000.0)
+        self.assertEqual(len(trimmed), 4)
+        self.assertGreaterEqual(trimmed[0]["_src_views"], trimmed[-1]["_src_views"])
+
+        # Stale penalty applies past 24h, not at 20h
+        age_cands = [
+            {"article_id": "a_20h", "post_id_list": ["p20"], "article_info": {"viral_score": 8.0}, "_src_engagement": {"view_count": 5000}, "_src_publish_time": 1_800_000_000 - 20 * 3600},
+            {"article_id": "a_30h", "post_id_list": ["p30"], "article_info": {"viral_score": 8.0}, "_src_engagement": {"view_count": 5000}, "_src_publish_time": 1_800_000_000 - 30 * 3600},
+        ]
+        with patch("platforms.x_auto_publisher.UniversalPostManager") as mock_pm:
+            mock_pm.return_value.find_posts.return_value = []
+            age_ranked = rank_and_trim_x_candidates(age_cands, max_candidates=2, now_ts=1_800_000_000.0)
+        self.assertEqual([c["article_id"] for c in age_ranked], ["a_20h", "a_30h"])
+
+        plist, cmap = build_candidate_prompt_data(trimmed)
+        self.assertEqual(len(plist), 4)
+        self.assertIn(plist[0]["id"], cmap)
+        self.assertIn("original_text", plist[0])
+        self.assertNotIn("[插图:", plist[0]["original_text"])
+        self.assertEqual(len(plist[0]["kept_images"]), 1)
+        self.assertEqual(plist[0]["kept_images"][0]["id"], "[IMAGE_1]")
+
+        # 2. build_account_historical_posts_block physically splits anti-dup vs cross-account benchmarks
+        fake_posts = {
+            "peterzhu1003": [
+                {
+                    "post_id": "111",
+                    "publish_time": 1_800_000_000,
+                    "publish_time_str": "2026-11-21 10:00:00",
+                    "author": {"username": "peterzhu1003", "followers_count": 17},
+                    "content": {"text_content": "本号自己发过的旧闻"},
+                    "engagement": {"view_count": 40, "like_count": 1, "comment_count": 0, "share_count": 0, "bookmark_count": 0, "engagement_rate_pct": 2.5},
+                    "media": {"images": []},
+                }
+            ],
+            "2434954452qqc": [
+                {
+                    "post_id": "222",
+                    "publish_time": 1_799_990_000,
+                    "publish_time_str": "2026-11-21 08:00:00",
+                    "author": {"username": "2434954452qqc", "followers_count": 665},
+                    "content": {"text_content": "对照号跑出的大爆款"},
+                    "engagement": {"view_count": 80000, "like_count": 120, "comment_count": 50, "share_count": 10, "bookmark_count": 30, "engagement_rate_pct": 0.26},
+                    "media": {"images": []},
+                }
+            ],
+        }
+        with patch("platforms.x_auto_publisher.fetch_multi_x_user_posts", return_value=fake_posts):
+            hist_block = build_account_historical_posts_block({"alias": "myself", "screen_name": "peterzhu1003"})
+        self.assertIn("<target_account_posted_history>", hist_block)
+        self.assertIn("<cross_account_viral_benchmarks>", hist_block)
+        self.assertIn("本号自己发过的旧闻", hist_block.split("</target_account_posted_history>")[0])
+        self.assertNotIn("对照号跑出的大爆款", hist_block.split("</target_account_posted_history>")[0])
+        self.assertIn("对照号跑出的大爆款", hist_block.split("<cross_account_viral_benchmarks>")[1])
 
 
 class TestXGrowth(unittest.TestCase):

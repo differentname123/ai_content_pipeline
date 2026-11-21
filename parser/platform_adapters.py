@@ -42,6 +42,11 @@ logger = setup_logger(app_name="media_format")
 BEIJING_TZ = timezone(timedelta(hours=8))
 COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
 
+METRICS_FIRST_SYNC_MIN_AGE_SECONDS = 600
+METRICS_MATURE_AGE_SECONDS = 24 * 3600
+METRICS_REFRESH_INTERVAL_SECONDS = 2 * 3600
+METRICS_MAX_REFRESH_AGE_SECONDS = 48 * 3600
+
 _HOT_COIN_CACHE: Dict[str, Any] = {"ts": 0.0, "coins": []}
 _HOT_COIN_LOCK = threading.Lock()
 
@@ -299,11 +304,17 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
     info = article["article_info"]
     topic, text = (article.get("topic") or "").strip(), info.get("text", "").strip()
     if topic:
-        text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda _: f"${topic} ", text, flags=re.IGNORECASE)
+        # 使用 ASCII 字符边界匹配（兼容如 "ZEC破800" 紧贴中文），避免与前缀叠加出 "$ZEC ZEC" 重复
+        text = re.sub(
+            rf"(?<![A-Za-z0-9$]){re.escape(topic)}(?![A-Za-z0-9]) ?",
+            lambda _: f"${topic} ",
+            text,
+            flags=re.IGNORECASE,
+        )
     adapter = PLATFORMS[PLATFORM_BINANCE if platform == PLATFORM_BINANCE else PLATFORM_OKX]
     text = adapter.decorate_analysis(text, topic)
     if platform == PLATFORM_BINANCE:
-        text += "\n\n\n\n\n\n👇"
+        text += "\n\n👇"
     if topic and not text.upper().startswith(f"${topic}".upper()):
         text = f"${topic} {text}"
     mapping = info.get("image_mapping") or {}
@@ -316,11 +327,18 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
 
 
 def _format_viral_post_content(info: Dict[str, Any], matched_coin: str) -> Tuple[str, List[str]]:
-    """流量文章 `article_info` + 热币前缀 -> `(最终发布正文, 有序本地图片路径列表)`。"""
+    """流量文章 `article_info` + 热币标签 -> `(最终发布正文, 有序本地图片路径列表)`。"""
     text = str(info.get("post_text") or "").strip()
-    prefix = f"${matched_coin}"
-    if not text.upper().startswith(prefix.upper()):
-        text = f"{prefix} {text}" if text else prefix
+    prefix = f"${matched_coin}" if matched_coin else ""
+    if prefix:
+        has_prefix = bool(
+            re.search(rf"(?<![A-Za-z0-9]){re.escape(prefix)}(?![A-Za-z0-9])", text, re.IGNORECASE)
+        )
+        if not text:
+            text = prefix
+        elif not has_prefix and not COIN_TAG_PATTERN.search(text):
+            # 正文尚未包含任何币种标签时追加至文末，避免强插在句首破坏前 3 秒钩子
+            text = f"{text}\n\n{prefix}"
     mapping = info.get("image_mapping") or {}
     paths = [
         mapping[key].get("local_path")
@@ -352,7 +370,7 @@ def sync_published_metrics(
     now_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
-    为发布超过 10 分钟且尚未记录浏览量的历史文章免登只读同步真实阅读/点赞/评论数，
+    为已发布历史文章免登只读同步真实阅读/点赞/评论数（48h 内周期刷新、成熟前不冻僵），
     回写至数据库后返回供总编擂台参考的历史战报列表。
     """
     cur_ts = time.time() if now_ts is None else float(now_ts)
@@ -370,9 +388,32 @@ def sync_published_metrics(
         views = rec.get("view_count")
         likes = rec.get("like_count")
         comments = rec.get("comment_count")
-        pub_time = rec.get("publish_time", 0) or 0
+        raw_pub_time = rec.get("publish_time", 0) or 0
+        pub_time = (raw_pub_time / 1000.0) if raw_pub_time > 1e11 else float(raw_pub_time)
+        age_sec = max(0.0, cur_ts - pub_time) if pub_time > 0 else 0.0
+        last_synced = float(rec.get("metrics_synced_at") or 0.0)
 
-        if pid and views is None and (cur_ts - pub_time > 600):
+        need_sync = bool(
+            pid
+            and str(pid) != "None"
+            and pub_time > 0
+            and (
+                (views is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS)
+                or (
+                    METRICS_FIRST_SYNC_MIN_AGE_SECONDS <= age_sec <= METRICS_MAX_REFRESH_AGE_SECONDS
+                    and (cur_ts - last_synced) >= METRICS_REFRESH_INTERVAL_SECONDS
+                )
+                or (
+                    age_sec > METRICS_MAX_REFRESH_AGE_SECONDS
+                    and (
+                        (last_synced > 0 and (last_synced - pub_time) < METRICS_MATURE_AGE_SECONDS)
+                        or (views is not None and last_synced == 0.0)
+                    )
+                )
+            )
+        )
+
+        if need_sync:
             try:
                 if platform == PLATFORM_BINANCE:
                     detail = fetch_binance_post_detail(str(pid))
@@ -380,6 +421,7 @@ def sync_published_metrics(
                         views = rec["view_count"] = detail.get("viewCount", 0)
                         likes = rec["like_count"] = detail.get("likeCount", 0)
                         comments = rec["comment_count"] = detail.get("commentCount", 0)
+                        rec["metrics_synced_at"] = cur_ts
                         need_upsert.append(d)
                 elif platform == PLATFORM_OKX:
                     detail = fetch_okx_post_detail(str(pid))
@@ -387,18 +429,30 @@ def sync_published_metrics(
                         views = rec["view_count"] = detail.get("viewCount", 0)
                         likes = rec["like_count"] = detail.get("likeCount", 0)
                         comments = rec["comment_count"] = detail.get("commentNum", 0)
+                        rec["metrics_synced_at"] = cur_ts
                         need_upsert.append(d)
             except Exception as exc:
                 logger.debug(f"[发布/指标同步] 拉取 {platform} 帖子 {pid} 详情失败(已降级跳过): {exc}")
 
-        time_str = datetime.fromtimestamp(pub_time, tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M") if pub_time else "未知"
+        time_str = datetime.fromtimestamp(pub_time, tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M") if pub_time > 0 else "未知"
+        age_hours = round(age_sec / 3600.0, 1) if pub_time > 0 else None
+        is_mature = bool(pub_time > 0 and age_sec >= 6 * 3600)
+        if pub_time > 0 and age_sec < 2 * 3600:
+            display_views: Any = "爬坡中(发布<2h)"
+        elif views is not None:
+            display_views = views
+        else:
+            display_views = "统计中"
+
         history_items.append(
             {
                 "account": rec.get("published_by"),
                 "topic": d.get("topic"),
                 "stance": d.get("stance"),
                 "published_at": time_str,
-                "views": views if views is not None else "统计中",
+                "age_hours": age_hours,
+                "is_mature": is_mature,
+                "views": display_views,
                 "likes": likes if likes is not None else 0,
                 "comments": comments if comments is not None else 0,
                 "content": text[:150],
@@ -407,7 +461,20 @@ def sync_published_metrics(
 
     if need_upsert:
         try:
-            article_manager.upsert_articles(need_upsert)
+            if (
+                hasattr(article_manager, "db")
+                and hasattr(article_manager.db, "get_collection")
+                and hasattr(article_manager, "collection_name")
+                and all(isinstance(doc, dict) and doc.get("article_id") for doc in need_upsert)
+            ):
+                col = article_manager.db.get_collection(article_manager.collection_name)
+                for doc in need_upsert:
+                    col.update_one(
+                        {"article_id": doc["article_id"]},
+                        {"$set": {f"publish_records.{platform}": doc["publish_records"][platform]}},
+                    )
+            else:
+                article_manager.upsert_articles(need_upsert)
         except Exception as exc:
             logger.warning(f"[发布/指标同步] 批量回写阅读指标至数据库失败: {exc}")
 

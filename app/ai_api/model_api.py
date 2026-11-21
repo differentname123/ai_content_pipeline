@@ -7,6 +7,7 @@
 
 import base64
 import errno
+import io
 import json
 import logging
 import math
@@ -29,6 +30,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
 
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
+
 from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
 if os.name == "nt":
@@ -36,7 +43,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-__all__ = ["generate_content", "probe_models"]
+__all__ = ["generate_content", "probe_models", "reset_ai_cooldowns"]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -129,6 +136,109 @@ MEDIA_TYPES = {
     ".mkv": ("video", "video/x-matroska"),
 }
 
+_MODEL_COOLDOWN_LOCK = threading.Lock()
+_MODEL_COOLDOWN_UNTIL = {}
+_MODEL_CONSECUTIVE_FAILS = {}
+_RESET_SECONDS_RE = re.compile(r"reset_seconds[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_IMAGE_COMPRESS_MIN_BYTES = 8192
+_IMAGE_JPEG_QUALITY = 85
+
+
+def _is_empty_response_error(status_code, error_text):
+    """判定 HTTP 200 空响应（如上游吞掉流式报错后返回空 choices/content）。"""
+    text = str(error_text or "")
+    return status_code == 200 and (
+        "没有返回任何 choices" in text or "没有返回有效的文本 content" in text
+    )
+
+
+def _is_rate_limit_or_exhausted_error(status_code, error_text):
+    """判定限流、配额耗尽、服务高负载或空响应等应快速切换并短冷却的异常。"""
+    if status_code in (429, 503) or _is_empty_response_error(status_code, error_text):
+        return True
+    lower = str(error_text or "").lower()
+    return any(
+        token in lower
+        for token in (
+            "429",
+            "rate limit",
+            "quota",
+            "resource_exhausted",
+            "high demand",
+            "auth_unavailable",
+            "throttled",
+            "上传上限",
+        )
+    )
+
+
+def _parse_reset_seconds(error_text):
+    """从错误信息中提取服务端返回的 reset_seconds / retry-after 秒数。"""
+    raw = str(error_text or "")
+    for pattern in (_RESET_SECONDS_RE, _RETRY_AFTER_RE):
+        match = pattern.search(raw)
+        if match:
+            try:
+                val = float(match.group(1))
+                if math.isfinite(val) and val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _record_model_outcome(model_name, *, success, status_code=None, error_text=""):
+    """记录单次请求结局；对限流/空响应/渠道不可用与连续失败触发短暂模型级冷却。"""
+    if not model_name:
+        return False
+    with _MODEL_COOLDOWN_LOCK:
+        if success:
+            _MODEL_CONSECUTIVE_FAILS.pop(model_name, None)
+            _MODEL_COOLDOWN_UNTIL.pop(model_name, None)
+            return False
+
+        if _is_rate_limit_or_exhausted_error(status_code, error_text):
+            parsed = _parse_reset_seconds(error_text)
+            cooldown = min(600.0, max(60.0, parsed)) if parsed is not None else 120.0
+            _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + cooldown
+            return True
+
+        if status_code in (401, 403, 404):
+            _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + 300.0
+            return True
+
+        fails = _MODEL_CONSECUTIVE_FAILS.get(model_name, 0) + 1
+        _MODEL_CONSECUTIVE_FAILS[model_name] = fails
+        if fails >= 3:
+            cooldown = min(600.0, 60.0 * (2 ** (fails - 3)))
+            _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + cooldown
+            return True
+        return False
+
+
+def _partition_models_by_cooldown(model_names):
+    """将模型划分为健康组与冷却组（冷却组按最早恢复时间升序兜底）。"""
+    now = time.monotonic()
+    healthy = []
+    cooling_pairs = []
+    with _MODEL_COOLDOWN_LOCK:
+        for name in model_names:
+            until = _MODEL_COOLDOWN_UNTIL.get(name, 0.0)
+            if until > now:
+                cooling_pairs.append((until, name))
+            else:
+                healthy.append(name)
+    cooling_pairs.sort(key=lambda item: item[0])
+    return healthy, [name for _, name in cooling_pairs]
+
+
+def reset_ai_cooldowns():
+    """清空内存级模型冷却与连续失败计数（供测试隔离与运维手动恢复）。"""
+    with _MODEL_COOLDOWN_LOCK:
+        _MODEL_COOLDOWN_UNTIL.clear()
+        _MODEL_CONSECUTIVE_FAILS.clear()
+
 
 def _redact(value):
     """统一隐藏配置密钥、常见凭据和 URL 用户信息。"""
@@ -204,6 +314,36 @@ def _close_client(client, context):
     return None
 
 
+def _encode_image_for_llm(path, default_mime_type):
+    """在内存中保留原始分辨率并将图片优化为 JPEG Q85；动图/小图/失败或未变小时回退原字节。"""
+    raw_bytes = path.read_bytes()
+    if Image is None or default_mime_type == "image/gif" or len(raw_bytes) <= _IMAGE_COMPRESS_MIN_BYTES:
+        return raw_bytes, default_mime_type
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
+                return raw_bytes, default_mime_type
+            transposed = ImageOps.exif_transpose(img) if ImageOps is not None else img
+            if transposed.mode in ("RGBA", "LA") or (
+                transposed.mode == "P" and "transparency" in transposed.info
+            ):
+                rgba = transposed.convert("RGBA")
+                out_img = Image.new("RGB", rgba.size, (255, 255, 255))
+                out_img.paste(rgba, mask=rgba.getchannel("A"))
+            elif transposed.mode != "RGB":
+                out_img = transposed.convert("RGB")
+            else:
+                out_img = transposed
+            buf = io.BytesIO()
+            out_img.save(buf, format="JPEG", quality=_IMAGE_JPEG_QUALITY, optimize=True)
+            encoded_bytes = buf.getvalue()
+            if encoded_bytes and len(encoded_bytes) < len(raw_bytes):
+                return encoded_bytes, "image/jpeg"
+    except Exception:
+        pass
+    return raw_bytes, default_mime_type
+
+
 def _build_content(prompt, file_paths):
     """将提示词与路径序列转为内容块；每块含 type 和 text 或 image_url/video_url.url。"""
     content = [{"type": "text", "text": prompt}]
@@ -232,7 +372,11 @@ def _build_content(prompt, file_paths):
         if suffix not in MEDIA_TYPES:
             raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
         kind, mime_type = MEDIA_TYPES[suffix]
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        if kind == "image":
+            media_bytes, mime_type = _encode_image_for_llm(path, mime_type)
+        else:
+            media_bytes = path.read_bytes()
+        encoded = base64.b64encode(media_bytes).decode("ascii")
         media_key = f"{kind}_url"
         content.extend([
             {"type": "text", "text":
@@ -244,7 +388,7 @@ def _build_content(prompt, file_paths):
 
 
 def _select_models(model, fallback_model_list, preset_model_group):
-    """显式模型使用指定备用列表；未指定模型时，按预制组生成完整尝试顺序。"""
+    """显式模型使用指定备用列表；未指定模型时，按预制组生成完整尝试顺序并避让冷却中模型。"""
     if model is not None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model 必须是非空字符串或 None")
@@ -290,11 +434,26 @@ def _select_models(model, fallback_model_list, preset_model_group):
     largest_weight = max(weights)
     if largest_weight <= 0:
         raise ValueError("预制模型组至少需要一个权重大于 0 的模型")
-    # 归一化避免多个很大的有限权重相加后溢出；不改变相对概率。
-    primary = random.choices(names, weights=[w / largest_weight for w in weights], k=1)[0]
-    fallbacks = [name for name in names if name != primary]
-    random.shuffle(fallbacks)
-    return [primary] + fallbacks
+
+    weight_map = dict(zip(names, weights))
+    healthy, cooling = _partition_models_by_cooldown(names)
+    healthy_weighted = [name for name in healthy if weight_map[name] > 0]
+    if healthy_weighted:
+        # 归一化避免多个很大的有限权重相加后溢出；不改变相对概率。
+        largest_healthy = max(weight_map[name] for name in healthy_weighted)
+        primary = random.choices(
+            healthy_weighted,
+            weights=[weight_map[name] / largest_healthy for name in healthy_weighted],
+            k=1,
+        )[0]
+        fallbacks = [name for name in healthy if name != primary]
+        random.shuffle(fallbacks)
+        return [primary] + fallbacks + cooling
+    if healthy:
+        fallbacks = list(healthy)
+        random.shuffle(fallbacks)
+        return fallbacks + cooling
+    return cooling
 
 
 def _beijing_now():
@@ -319,8 +478,9 @@ def _new_model_usage_event(model_name, trace_id, call_time_bj=None):
 
 def _reset_model_usage_lock_after_fork():
     """fork 后重建线程锁，避免子进程继承其他线程已持有的锁。"""
-    global _MODEL_USAGE_THREAD_LOCK
+    global _MODEL_USAGE_THREAD_LOCK, _MODEL_COOLDOWN_LOCK
     _MODEL_USAGE_THREAD_LOCK = threading.Lock()
+    _MODEL_COOLDOWN_LOCK = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -585,6 +745,7 @@ def generate_content(
 
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
+                    _record_model_outcome(current_model, success=True)
                     metrics["model_used"] = response_model_name
                     if isinstance(usage, dict) and usage.get("account_email"):
                         metrics["account_used"] = usage.get("account_email")
@@ -611,14 +772,25 @@ def generate_content(
                         if failed_account
                         else ""
                     )
+                    err_summary = f"{type(exc).__name__}: {exc}"
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
                                     + (f" | account: {failed_account}" if failed_account else "")
-                                    + f" | Error: {type(exc).__name__}: {exc}")
+                                    + f" | Error: {err_summary}")
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
+                    cooled_model = (not failed_account) and _record_model_outcome(
+                        current_model,
+                        success=False,
+                        status_code=status_code,
+                        error_text=err_summary,
+                    )
                     is_upstream_timeout = isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
-                    is_channel_exhausted = (not failed_account) and (status_code in (401, 403, 404, 429, 503))
+                    is_channel_exhausted = (not failed_account) and (
+                        status_code in (401, 403, 404, 429, 503)
+                        or _is_rate_limit_or_exhausted_error(status_code, err_summary)
+                        or cooled_model
+                    )
                     if is_upstream_timeout and model_index < len(models) - 1:
                         fast_switch_model = True
                         terminal = False
@@ -626,7 +798,10 @@ def generate_content(
                     elif is_channel_exhausted and model_index < len(models) - 1:
                         fast_switch_model = True
                         terminal = False
-                        action = f"当前模型渠道配额或状态不可用(HTTP {status_code})，0延迟立即切换备用模型 {models[model_index + 1]}"
+                        action = (
+                            f"当前模型渠道配额或状态不可用(HTTP {status_code or 'N/A'})，"
+                            f"0延迟立即切换备用模型 {models[model_index + 1]}"
+                        )
                     else:
                         terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                         if attempt < max_retries_per_model:

@@ -11,8 +11,11 @@ X (Twitter) 自动化应用层调度脚本 (x_auto_publisher.py)
 - 显式故障报警：发帖或模型调用异常时，在控制台打印醒目的报错 Banner；
 - 状态持久化：发布成功/失败结果幂等回写至 MongoDB publish_records.x 与本地运行时状态文件。
 """
+import json
 import logging
+import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -36,10 +39,9 @@ from common.common_utils import (
 from common.daemon import run_daemon_loop
 from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
-from common.mongo_db.mongo_manager import GeneratedArticleManager
+from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 from common.x_text import calc_x_weighted_length
 from platforms.x_api import (
-    _format_candidate_posts_literal,
     fetch_multi_x_user_posts,
     format_historical_x_posts_for_prompt,
     load_cached_x_posts,
@@ -86,11 +88,17 @@ MAX_X_RAW_CHARS: int = 140                  # 纯汉字数上限（X 平台单�
 MAX_X_UNITS: int = 280                      # X 平台标准计数单位上限（半角字符记 1，汉字/Emoji/全角记 2，URL 记 23）
 STRICT_X_LENGTH_GATE: bool = True           # 是否启用字符数量代码级二次强制校验
 
-# 4. 候选素材抓取配置（与 x_api 默认保持 100% 一致：近 6h，limit=0 全量拉取，零人为截断）
+# 4. 候选素材抓取与精简排序配置
 HISTORICAL_PROMPT_ACCOUNTS: List[str] = get_config("x_prompt_accounts", ["dahao", "myself"])  # 对比账号矩阵（包含大号与发帖号）
-CANDIDATE_LOOKBACK_HOURS: int = 6           # 抓取近 6 小时内的全部候选帖（与 x_api 一致）
-CANDIDATE_QUERY_LIMIT: int = 0              # 0 表示全量拉取，绝不截断（获取全量 100+ 篇候选）
-HISTORICAL_REF_COUNT: int = 50              # 参考历史已发推文数量（跨账号矩阵共 50 条）
+CANDIDATE_LOOKBACK_HOURS: int = 6           # 抓取近 6 小时内的全部候选帖
+CANDIDATE_QUERY_LIMIT: int = 0              # 0 表示从数据库全量拉取 6h 候选，再按热度与新鲜度预排精选
+HISTORICAL_REF_COUNT: int = 50              # 单账号实时抓取参考历史上限
+HISTORICAL_SELF_ANTIDUP_COUNT: int = 30     # 仅当前待发账号近期已发条数，构成严格撞题禁止区
+HISTORICAL_BENCHMARK_COUNT: int = 8         # 跨账号高浏览代表作条数，仅作风格与写法参考（绝不作为本号防重门槛）
+# 【保留过滤原因说明】实测 6h 全量 198 篇候选拼接超 17 万字符，导致中档模型注意力分散且耗时翻倍；
+# 经 6 窗口历史回放校准，前 35 篇会截断少数头部历史爆款，调整为前 50 篇既完整覆盖爆款池，又较原全量压缩 ~70% 上下文。
+MAX_LLM_CANDIDATES: int = 50
+_MEDIA_TAG_RE = re.compile(r"\[(?:插图|长文封面|视频封面|视频|ASSET_IMG|IMAGE|VIDEO)[^\]]*\]")
 
 # 5. 运行模式与模型调用
 BROWSER_VISIBLE: bool = True                # Playwright 发帖是否显示浏览器可见窗口（方便实时观测发帖状态）
@@ -195,9 +203,82 @@ def fetch_unposted_viral_candidates(hours: int = CANDIDATE_LOOKBACK_HOURS, limit
     return valid_candidates
 
 
+def _strip_media_markers(text: str) -> str:
+    cleaned = _MEDIA_TAG_RE.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def rank_and_trim_x_candidates(
+    candidates: List[Dict[str, Any]],
+    max_candidates: int = MAX_LLM_CANDIDATES,
+    now_ts: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    批量关联原帖热度与发布时间，按确定性综合分排序并截取前 `max_candidates` 篇送审，
+    避免百篇长上下文稀释模型注意力。
+    """
+    if not candidates:
+        return []
+
+    cur_ts = time.time() if now_ts is None else float(now_ts)
+    src_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw_pids: List[Any] = []
+        for art in candidates:
+            for pid in art.get("post_id_list") or []:
+                if pid is not None:
+                    raw_pids.append(pid)
+                    if str(pid).isdigit():
+                        raw_pids.append(int(pid))
+                        raw_pids.append(str(pid))
+        if raw_pids:
+            post_mgr = UniversalPostManager(gen_db_object())
+            src_docs = post_mgr.find_posts(query={"post_id": {"$in": list(dict.fromkeys(raw_pids))}}, limit=0) or []
+            for sp in src_docs:
+                src_map[str(sp.get("post_id"))] = sp
+    except Exception as exc:
+        logger.debug(f"[候选/预排] 查询原帖热度异常，降级仅按 viral_score 排序: {exc}")
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for art in candidates:
+        info = art.get("article_info") or {}
+        v_score = float(info.get("viral_score") or 0.0)
+        pid_str = str((art.get("post_id_list") or [""])[0]).strip()
+        sp = src_map.get(pid_str) or {}
+        eng = sp.get("engagement") or art.get("_src_engagement") or {}
+        views = int(eng.get("view_count") or 0)
+        likes = int(eng.get("like_count") or 0)
+        comments = int(eng.get("comment_count") or 0)
+
+        age_h = 0.0
+        raw_spt = sp.get("publish_time") or art.get("_src_publish_time") or 0
+        if raw_spt:
+            try:
+                spt_val = float(raw_spt)
+                spt_s = spt_val / 1000.0 if spt_val > 1e11 else spt_val
+                age_h = round(max(0.0, (cur_ts - spt_s) / 3600.0), 1)
+            except (TypeError, ValueError):
+                age_h = 0.0
+
+        hot_energy = views + likes * 30 + comments * 80
+        rank_score = v_score + math.log10(max(hot_energy, 1000)) * 1.0 - (0.5 if age_h > 24.0 else 0.0)
+
+        enriched = dict(art)
+        if views > 0:
+            enriched["_src_views"] = views
+        if raw_spt:
+            enriched["_src_age_hours"] = age_h
+        scored.append((rank_score, enriched))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    cap = int(max_candidates) if max_candidates and int(max_candidates) > 0 else len(scored)
+    return [item[1] for item in scored[:cap]]
+
+
 def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
-    将候选文章列表转换为 Prompt 所需的精简数据结构，并建立快速查找字典。
+    将候选文章列表转换为高信息密度的精简结构（含原帖人话 `original_text` 与保留图精简描述），
+    并建立快速查找字典。
     返回: (candidate_prompt_list, candidates_map)
     """
     prompt_list = []
@@ -209,7 +290,6 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
         p_list = art.get("post_id_list") or []
         src_pid = str(p_list[0]).strip() if p_list else ""
 
-        # 优先使用 article_id 作为标识，同时 post_id_list 亦做索引映射
         primary_id = art_id or src_pid
         if not primary_id:
             continue
@@ -220,33 +300,46 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
         if src_pid:
             candidates_map[src_pid] = art
 
-        # 【保留过滤原因说明】：纯字段级保留与剔除（保持极简、稳定，绝不搞任何脆弱的字符串切分或二次逻辑）：
-        # 1. 彻底剔除上游 Stage 2 专属思考脚手架（decision_reason 和 image_role，合计 4.5 万字符死重，当前 X 选帖提示词零引用、零依赖）；
-        # 2. 其余业务字段（包含 image_semantics 配图语义列表）100% 完整原样保留。
+        orig_raw = ((art.get("creation_brief") or {}).get("original_post") or {}).get("text_content") or ""
+        original_text = _strip_media_markers(orig_raw)[:220]
+        kept_images = [
+            {"id": img.get("id"), "desc": str(img.get("semantic_role") or "")[:90]}
+            for img in (info.get("image_semantics") or [])
+            if isinstance(img, dict) and img.get("keep")
+        ]
+
+        # 【保留过滤原因说明】：纯字段级精简，仅传 X 选帖与改写高价值信息：
+        # 1. 剔除冗余废图语义（keep=False）与思考脚手架（decision_reason/image_role/viral_score 避免偏见与冗余）；
+        # 2. 补充 original_text 让选帖模型能直接回看活人原话，避免被上游过分改写带偏。
         cleaned_item = {
             "id": primary_id,
             "topic_tag": info.get("topic_tag", ""),
-            "viral_score": info.get("viral_score", 0.0),
-            "image_semantics": info.get("image_semantics", []),
-            "selected_images": info.get("selected_images", []),
-            "viral_analysis": info.get("viral_analysis", ""),
-            "post_text": info.get("post_text", ""),
-            "bait_comments": info.get("bait_comments", []),
+            "source_views": art.get("_src_views"),
+            "source_age_hours": art.get("_src_age_hours"),
+            "original_text": original_text,
+            "draft_text": info.get("post_text", ""),
+            "kept_images": kept_images,
+            "viral_analysis": str(info.get("viral_analysis") or "")[:120],
         }
         cleaned_item = {k: v for k, v in cleaned_item.items() if v not in (None, "", [], {})}
-        prompt_list.append({"remodeled_article": cleaned_item})
+        prompt_list.append(cleaned_item)
 
     return prompt_list, candidates_map
 
 
 def build_account_historical_posts_block(account: Dict[str, Any], count: int = HISTORICAL_REF_COUNT) -> str:
     """
-    获取对比账号矩阵（默认含 dahao 与 myself）最近 count 条客观已发推文并格式化为 Prompt 区块。
-    与 x_api 保持 100% 一致，跨账号合并提取爆款规律。
+    物理隔离「本号防重撞题名单」与「跨号高流爆款标杆」：
+    - 区块 A：仅当前待发账号自己最近 30 条推文（严禁与本区块事件撞题）；
+    - 区块 B：参考账号矩阵（排除本号）高浏览 Top 8 代表作（仅供写法与钩子标尺参考，严禁作本号撞题淘汰依据）。
     """
-    target_specs = resolve_x_accounts(HISTORICAL_PROMPT_ACCOUNTS, default_accounts=["dahao", "myself"])
+    cur_sn = str(account.get("screen_name") or "").lstrip("@").strip()
+    cur_alias = str(account.get("alias") or "").strip()
+    raw_accounts = list(HISTORICAL_PROMPT_ACCOUNTS or [])
+    if cur_sn:
+        raw_accounts.append(f"@{cur_sn}")
+    target_specs = resolve_x_accounts(raw_accounts, default_accounts=["dahao", "myself"])
 
-    # 尝试无登录联网刷新最新推文表现；若受限或异常自动回退至本地缓存
     posts_by_acc = None
     try:
         posts_by_acc = fetch_multi_x_user_posts(accounts=target_specs, count=max(count, 50), sort_by="time")
@@ -256,13 +349,46 @@ def build_account_historical_posts_block(account: Dict[str, Any], count: int = H
     if not posts_by_acc:
         posts_by_acc = load_cached_x_posts(accounts=target_specs, sort_by="time")
 
-    selected_posts = merge_x_account_posts(
+    self_specs = resolve_x_accounts([f"@{cur_sn}"] if cur_sn else [cur_alias])
+    other_specs = [s for s in target_specs if s["screen_name"].lower() != cur_sn.lower()]
+
+    self_posts = merge_x_account_posts(
         posts_by_acc,
-        accounts=target_specs,
-        total_count=count,
+        accounts=self_specs,
+        total_count=HISTORICAL_SELF_ANTIDUP_COUNT,
         sort_by="time",
     )
-    return format_historical_x_posts_for_prompt(selected_posts, recent_count=count, include_account_summary=True)
+    bench_posts = (
+        merge_x_account_posts(
+            posts_by_acc,
+            accounts=other_specs,
+            total_count=HISTORICAL_BENCHMARK_COUNT,
+            sort_by="views",
+        )
+        if other_specs
+        else []
+    )
+
+    self_block = format_historical_x_posts_for_prompt(
+        self_posts,
+        recent_count=HISTORICAL_SELF_ANTIDUP_COUNT,
+        include_account_summary=True,
+    )
+    bench_block = format_historical_x_posts_for_prompt(
+        bench_posts,
+        recent_count=HISTORICAL_BENCHMARK_COUNT,
+        include_account_summary=True,
+    )
+    return (
+        "<target_account_posted_history>\n"
+        f"【严格防重区 — 仅当前发帖账号 @{cur_sn or cur_alias} 近期已发推文；凡与本区内同事件/同钱包/同波操作重合的候选必须淘汰】\n"
+        + self_block.strip()
+        + "\n</target_account_posted_history>\n\n"
+        + "<cross_account_viral_benchmarks>\n"
+        "【爆款风格与写法标杆 — 来自对照账号高浏览代表作；仅供提炼标题钩子、口吻与长度标尺，严禁将其作为本号撞题淘汰依据】\n"
+        + bench_block.strip()
+        + "\n</cross_account_viral_benchmarks>"
+    )
 
 
 # ==============================================================================
@@ -294,7 +420,10 @@ def select_x_posts_via_llm(
     if not prompt_path.is_file():
         raise FileNotFoundError(f"未找到提示词模板文件: {PROMPT_TEMPLATE_PATH}")
 
-    candidate_block = "以下是我待筛选的候选帖子列表：\n" + _format_candidate_posts_literal(candidate_prompt_list)
+    candidate_block = (
+        f"以下是我待筛选的候选帖子列表（共 {len(candidate_prompt_list)} 篇，已按原帖热度与新鲜度预排）：\n"
+        + json.dumps(candidate_prompt_list, ensure_ascii=False)
+    )
     full_prompt, prompt_meta = render_prompt_template(
         prompt_path,
         {
@@ -601,13 +730,14 @@ def run_single_check_cycle(
         ready_count += 1
         logger.info(f"🎯 [账号就绪] 账号 [@{screen_name}] 冷却完毕，开始执行选帖与发布检查")
 
-        # 2. 拉取未发布的精品候选帖
+        # 2. 拉取未发布的精品候选帖并按热度与新鲜度确定性截取送审 Top-N
         candidates = fetch_unposted_viral_candidates(hours=candidate_hours, limit=CANDIDATE_QUERY_LIMIT)
         if not candidates:
             logger.info(f"ℹ️ [候选池为空] 近 {candidate_hours}h 暂无待发布的可用候选文章，跳过本轮")
             continue
 
-        prompt_candidates, candidates_map = build_candidate_prompt_data(candidates)
+        ranked_candidates = rank_and_trim_x_candidates(candidates, max_candidates=MAX_LLM_CANDIDATES)
+        prompt_candidates, candidates_map = build_candidate_prompt_data(ranked_candidates)
         if not prompt_candidates:
             logger.info("ℹ️ [候选池为空] 有效清洗后候选数量为 0，跳过本轮")
             continue

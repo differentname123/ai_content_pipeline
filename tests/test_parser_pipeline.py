@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Parser pipeline unit tests: publish_state, platform_adapters, article_generator, publisher_arena."""
+import json
 import os
 import tempfile
 import threading
@@ -19,20 +20,20 @@ from parser.article_generator import (
 from parser.platform_adapters import (
     BinancePlatform,
     _build_publish_text_list,
+    _format_analysis_post_content,
+    _format_viral_post_content,
     has_rival_keyword,
+    sync_published_metrics,
 )
 from parser.post_ingestion import (
     ARTICLE_TYPE_ANALYSIS,
     ARTICLE_TYPE_VIRAL,
+    _fetch_hot_posts,
+    _is_valid_raw_post,
+    ensure_post_media_downloaded,
     prompt_version,
 )
-from parser.publish_state import (
-    AUTH_BACKOFF_SECONDS,
-    TRANSIENT_BACKOFF_SECONDS,
-    WAF_BACKOFF_SECONDS,
-    AccountPublishStateStore,
-    classify_publish_error,
-)
+from parser.publish_state import AccountPublishStateStore
 from parser.publisher_arena import (
     _collect_publish_candidates,
     _publish_articles_for_platform,
@@ -47,17 +48,6 @@ def _create_tiny_png(directory: Path, name: str = "sample.png") -> str:
 
 
 class TestPublishStateStore(unittest.TestCase):
-    def test_classify_publish_error(self):
-        self.assertEqual(classify_publish_error("广场主页加载异常 (HTTP 405)"), ("waf_challenge", WAF_BACKOFF_SECONDS))
-        self.assertEqual(classify_publish_error("[WAF/人机验证] 我们需要确认您是人类"), ("waf_challenge", WAF_BACKOFF_SECONDS))
-        self.assertEqual(classify_publish_error("页面探测到登录入口，Cookie失效"), ("auth_expired", AUTH_BACKOFF_SECONDS))
-        self.assertEqual(
-            classify_publish_error("页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。"),
-            ("auth_expired", AUTH_BACKOFF_SECONDS),
-        )
-        self.assertEqual(classify_publish_error("需要验证：登录会话已超时，执行安全验证"), ("auth_expired", AUTH_BACKOFF_SECONDS))
-        self.assertEqual(classify_publish_error("timeout waiting for button"), ("transient", TRANSIENT_BACKOFF_SECONDS))
-
     def test_parser_config_is_single_source_of_truth(self):
         import parser.config as pcfg
         import parser.article_format_logical as afl
@@ -65,42 +55,73 @@ class TestPublishStateStore(unittest.TestCase):
         import parser.publish_state as ps
 
         self.assertIs(mt.INTERACTION_CONFIG, pcfg.INTERACTION_CONFIG)
-        self.assertEqual(ps.WAF_BACKOFF_SECONDS, pcfg.WAF_BACKOFF_SECONDS)
-        self.assertEqual(ps.AUTH_BACKOFF_SECONDS, pcfg.AUTH_BACKOFF_SECONDS)
+        self.assertEqual(ps.ACCOUNT_COOLDOWN_SECONDS, pcfg.ACCOUNT_COOLDOWN_SECONDS)
+        self.assertEqual(ps.OKX_ACCOUNT_COOLDOWN_SECONDS, pcfg.OKX_ACCOUNT_COOLDOWN_SECONDS)
         self.assertEqual(set(afl.TASK_SWITCHES.keys()), set(afl.TASK_REGISTRY.keys()))
 
-    def test_cooldown_backoff_topic_and_success_reset(self):
+    def test_failure_does_not_block_and_cooldown_topic_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             store = AccountPublishStateStore(str(state_path))
             t0 = 1_700_000_000.0
 
             # Initially eligible for both analysis and viral
-            ok, reason = store.can_publish("binance", "ruru", is_viral=False, now=t0)
-            self.assertTrue(ok, reason)
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0), (True, ""))
 
-            # Failure with HTTP 405 triggers 60m backoff for analysis ONLY, independent from viral
-            cat, sec, _ = store.record_failure("binance", "ruru", "HTTP 405", is_viral=False, now=t0)
-            self.assertEqual((cat, sec), ("waf_challenge", 3600))
-            ok_an, _ = store.can_publish("binance", "ruru", is_viral=False, now=t0 + 1800)
-            ok_vi, _ = store.can_publish("binance", "ruru", is_viral=True, now=t0 + 1800)
-            self.assertFalse(ok_an)
-            self.assertTrue(ok_vi)
+            # Auth-expired, HTTP 405/WAF, and transient failures record diagnostics but do NOT block publishing
+            store.record_failure(
+                "binance",
+                "ruru",
+                "页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。",
+                is_viral=False,
+                now=t0,
+            )
+            store.record_failure("binance", "ruru", "HTTP 405", is_viral=False, now=t0 + 1)
+            detail = store.record_failure("binance", "ruru", "timeout waiting for button", is_viral=False, now=t0 + 2)
+            self.assertEqual(detail, "timeout waiting for button")
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 3), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 3), (True, ""))
 
-            # After 60m backoff expires, success clears backoff and sets 6h cooldown + 2h topic cooldown
-            t1 = t0 + 3601
+            snap_fail = store.get_account_state("binance", "ruru")
+            self.assertEqual(snap_fail["consecutive_failures"], 3)
+            self.assertEqual(snap_fail["last_error_msg"], "timeout waiting for button")
+            self.assertEqual(snap_fail["last_error_time"], t0 + 2)
+
+            # Legacy future backoff_until / viral_backoff_until timestamps in state JSON are ignored and cleaned on write
+            raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+            raw_state["binance"]["ruru"]["backoff_until"] = t0 + 99_999
+            raw_state["binance"]["ruru"]["backoff_reason"] = "auth_expired"
+            raw_state["binance"]["ruru"]["viral_backoff_until"] = t0 + 99_999
+            raw_state["binance"]["ruru"]["viral_backoff_reason"] = "waf_challenge"
+            state_path.write_text(json.dumps(raw_state), encoding="utf-8")
+
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 10), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 10), (True, ""))
+
+            store.record_failure("binance", "ruru", "HTTP 405", is_viral=True, now=t0 + 11)
+            snap_after_viral_fail = store.get_account_state("binance", "ruru")
+            self.assertNotIn("viral_backoff_until", snap_after_viral_fail)
+            self.assertNotIn("viral_backoff_reason", snap_after_viral_fail)
+            self.assertEqual(snap_after_viral_fail["viral_consecutive_failures"], 1)
+
+            # Success resets consecutive_failures, cleans legacy backoff keys, and enforces 6h cooldown + 2h topic cooldown
+            t1 = t0 + 100
             store.record_success("binance", "ruru", is_viral=False, topic="BTC", now=t1)
             snap = store.get_account_state("binance", "ruru")
-            self.assertEqual(snap["backoff_until"], 0.0)
+            self.assertNotIn("backoff_until", snap)
+            self.assertNotIn("backoff_reason", snap)
             self.assertEqual(snap["consecutive_failures"], 0)
             self.assertTrue(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 3600))
             self.assertFalse(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 7201))
 
-            # Analysis cooldown is 6h
+            # Analysis cooldown is 6h, independent from viral eligibility
             ok_before_6h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 5 * 3600)
             ok_after_6h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 6 * 3600 + 1)
+            ok_viral, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 5 * 3600)
             self.assertFalse(ok_before_6h)
             self.assertTrue(ok_after_6h)
+            self.assertTrue(ok_viral)
 
     def test_thread_safety_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,6 +170,96 @@ class TestPlatformAdapters(unittest.TestCase):
         self.assertIn("$BTC ", decorated)
         self.assertIn("#ETH", decorated)
         self.assertIn("$ETH ", decorated)
+
+    def test_format_analysis_and_viral_post_content_fixes(self):
+        an_art = {
+            "topic": "ZEC",
+            "article_info": {
+                "text": "ZEC破800后持续走弱。",
+                "image_placeholders": [],
+                "image_mapping": {},
+            },
+        }
+        with patch("parser.platform_adapters.fetch_binance_hot_hashtags", return_value=[{"hashtag": "#Hot"}]), \
+             patch("parser.platform_adapters.fetch_binance_future_hot_coins", return_value=[{"symbol": "BTCUSDT"}]):
+            bn_text, _ = _format_analysis_post_content(an_art, platform="binance")
+        self.assertTrue(bn_text.startswith("$ZEC 破800"))
+        self.assertNotIn("$ZEC ZEC", bn_text)
+        self.assertNotIn("\n\n\n\n\n\n👇", bn_text)
+        self.assertIn("\n\n👇", bn_text)
+
+        okx_text, _ = _format_analysis_post_content(an_art, platform="okx")
+        self.assertTrue(okx_text.startswith("$ZEC 破800"))
+        self.assertNotIn("$ZEC ZEC", okx_text)
+
+        # Viral: existing $SYMBOL preserves opening hook; missing $SYMBOL appends cleanly at tail
+        v_with_tag, _ = _format_viral_post_content({"post_text": "凌晨暴跌，我的 $DOGE 多单扛不住了", "selected_images": [], "image_mapping": {}}, "BTC")
+        self.assertTrue(v_with_tag.startswith("凌晨暴跌"))
+        self.assertNotIn("$BTC", v_with_tag)
+
+        v_no_tag, _ = _format_viral_post_content({"post_text": "三十天账面蒸发四千万", "selected_images": [], "image_mapping": {}}, "BTC")
+        self.assertEqual(v_no_tag, "三十天账面蒸发四千万\n\n$BTC")
+
+    def test_sync_published_metrics_refreshes_until_mature_and_marks_ramping(self):
+        now = 1_800_000_000.0
+        docs = [
+            {
+                "article_id": "a_ramp",
+                "topic": "BTC",
+                "stance": "看多",
+                "article_info": {"text": "刚发布不久的新帖"},
+                "publish_records": {"binance": {"post_id": "101", "published_by": "myself", "publish_time": now - 1800, "view_count": None}},
+            },
+            {
+                "article_id": "a_refresh",
+                "topic": "ETH",
+                "stance": "看空",
+                "article_info": {"text": "12小时前发的老帖，此前停留在15"},
+                "publish_records": {
+                    "binance": {
+                        "post_id": "102",
+                        "published_by": "myself",
+                        "publish_time": now - 12 * 3600,
+                        "view_count": 15,
+                        "metrics_synced_at": now - 3 * 3600,
+                    }
+                },
+            },
+            {
+                "article_id": "a_settled",
+                "topic": "SOL",
+                "stance": "看多",
+                "article_info": {"text": "72小时前已完成成熟定型同步的帖子"},
+                "publish_records": {
+                    "binance": {
+                        "post_id": "103",
+                        "published_by": "myself",
+                        "publish_time": now - 72 * 3600,
+                        "view_count": 500,
+                        "metrics_synced_at": now - 40 * 3600,
+                    }
+                },
+            },
+        ]
+        mock_mgr = MagicMock(spec=["upsert_articles"])
+
+        def _fake_detail(pid):
+            if pid == "101":
+                return {"contentStatus": 2, "viewCount": 18, "likeCount": 0, "commentCount": 0}
+            if pid == "102":
+                return {"contentStatus": 2, "viewCount": 680, "likeCount": 4, "commentCount": 2}
+            raise AssertionError(f"settled post {pid} should not be re-fetched")
+
+        with patch("parser.platform_adapters.fetch_binance_post_detail", side_effect=_fake_detail) as mock_fetch:
+            hist = sync_published_metrics(mock_mgr, "binance", docs, now_ts=now)
+
+        self.assertEqual(mock_fetch.call_count, 2)
+        mock_mgr.upsert_articles.assert_called_once()
+        self.assertEqual(hist[0]["views"], "爬坡中(发布<2h)")
+        self.assertFalse(hist[0]["is_mature"])
+        self.assertEqual(hist[1]["views"], 680)
+        self.assertTrue(hist[1]["is_mature"])
+        self.assertEqual(hist[2]["views"], 500)
 
 
 class TestArticleGenerator(unittest.TestCase):
@@ -244,10 +355,10 @@ class TestPublisherArena(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = AccountPublishStateStore(str(Path(tmp) / "state.json"))
             now = time.time()
-            # Force all configured binance accounts into WAF backoff
+            # Force all configured binance accounts into normal 6h publish cooldown
             with patch("parser.publisher_arena.PLATFORM_ACCOUNTS", {"binance": ["myself", "ruru"]}):
-                store.record_failure("binance", "myself", "HTTP 405", is_viral=False, now=now)
-                store.record_failure("binance", "ruru", "HTTP 405", is_viral=False, now=now)
+                store.record_success("binance", "myself", is_viral=False, now=now)
+                store.record_success("binance", "ruru", is_viral=False, now=now)
                 mock_mgr = MagicMock()
                 with patch("parser.publisher_arena.call_llm_json") as mock_llm:
                     _publish_articles_for_platform(mock_mgr, "binance", ["BTC"], ARTICLE_TYPE_ANALYSIS, state_store=store)
@@ -366,6 +477,143 @@ class TestPublisherArena(unittest.TestCase):
             # Original clean text preserved because polished output mentioned rival OKX
             self.assertEqual(art["article_info"]["text"], "原始干净正文")
             self.assertEqual(art["_selection_meta"]["model_used"], "editor-model-v1")
+
+    def test_chief_editor_isolates_article_type_and_filters_throttled_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img_p = _create_tiny_png(Path(tmp), "editor2.png")
+            art = {
+                "article_id": "art_2",
+                "type": ARTICLE_TYPE_VIRAL,
+                "topic": "搞钱与盈亏",
+                "creation_brief": {},
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "原始干净吃瓜正文",
+                    "bait_comments": ["笑死"],
+                    "selected_images": ["[IMAGE_1]"],
+                    "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "收益截图", "keep": True}],
+                    "viral_score": 8.5,
+                    "image_mapping": {"[IMAGE_1]": {"local_path": img_p}},
+                },
+            }
+            now = time.time()
+            # Simulate 5 throttled qiqi posts (<50 med) + 2 normal ruru posts
+            hist_docs = [
+                {
+                    "article_id": f"q{i}",
+                    "type": ARTICLE_TYPE_VIRAL,
+                    "topic": "BTC",
+                    "article_info": {"post_text": f"限流号样本{i}"},
+                    "publish_records": {"binance": {"published_by": "qiqi", "publish_time": now - 10 * 3600, "view_count": 20, "metrics_synced_at": now - 100}},
+                }
+                for i in range(5)
+            ] + [
+                {
+                    "article_id": "r1",
+                    "type": ARTICLE_TYPE_VIRAL,
+                    "topic": "ETH",
+                    "article_info": {"post_text": "正常号大爆款样本"},
+                    "publish_records": {"binance": {"published_by": "ruru", "publish_time": now - 10 * 3600, "view_count": 1200, "metrics_synced_at": now - 100}},
+                }
+            ]
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.return_value = hist_docs
+            mock_mgr.collection_name = "generated_articles"
+            captured_payload = {}
+
+            def _fake_editor(**kwargs):
+                captured_payload["prompt"] = kwargs["prompt"]
+                return (
+                    {"selected_candidate_no": 1, "final_text": "原始干净吃瓜正文", "final_comments": ["笑死"], "reason": "ok"},
+                    {"ok": True, "model_used": "editor-model-v2"},
+                )
+
+            with patch("parser.publisher_arena.call_llm_json", side_effect=_fake_editor):
+                _select_and_polish_best_candidate(
+                    mock_mgr,
+                    "binance",
+                    "ruru",
+                    {"topic_publish_history": {}},
+                    [(art, {"cid_2"}, "BTC")],
+                    now,
+                    set(),
+                    ARTICLE_TYPE_VIRAL,
+                )
+
+            # Query must isolate by article type
+            q_used = mock_mgr.find_articles.call_args.kwargs["query"]
+            self.assertEqual(q_used.get("type"), ARTICLE_TYPE_VIRAL)
+            self.assertIn("account_view_baselines", captured_payload["prompt"])
+            self.assertIn("正常号大爆款样本", captured_payload["prompt"])
+            self.assertNotIn("限流号样本0", captured_payload["prompt"])
+
+
+class TestLazyMediaDownload(unittest.TestCase):
+    def test_is_valid_raw_post_require_local_media_modes(self):
+        now = time.time()
+        post = {
+            "source": "binance",
+            "post_id": "lazy_1",
+            "publish_time": now - 60,
+            "author": {"username": "someone_else"},
+            "content": {"text_content": "BTC 分析\n[插图: https://example.com/a.png]"},
+            "media": {"images": ["https://example.com/a.png"], "local_mapping": {}},
+        }
+        self.assertTrue(_is_valid_raw_post(post, require_local_media=False))
+        self.assertFalse(_is_valid_raw_post(post))
+
+        video_post = {
+            **post,
+            "content": {"text_content": "BTC 视频\n[视频: https://example.com/v.mp4]"},
+        }
+        self.assertFalse(_is_valid_raw_post(video_post, require_local_media=False))
+
+    def test_ensure_post_media_downloaded_downloads_once_and_caches_failures(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = _create_tiny_png(Path(tmp), "dl.png")
+            post = {
+                "source": "binance",
+                "post_id": "lazy_dl_1",
+                "publish_time": now - 60,
+                "author": {"username": "someone_else"},
+                "content": {"text_content": "图表信号\n[插图: https://example.com/ok_unique_1.png]"},
+                "media": {"images": ["https://example.com/ok_unique_1.png"], "local_mapping": {}},
+            }
+            with patch("parser.post_ingestion.download_web_media", return_value=img_path) as mock_dl:
+                self.assertTrue(ensure_post_media_downloaded(post))
+                self.assertEqual(mock_dl.call_count, 1)
+                self.assertEqual(post["media"]["local_mapping"]["https://example.com/ok_unique_1.png"], img_path)
+                # Second call reuses local verified mapping with zero downloads
+                self.assertTrue(ensure_post_media_downloaded(post))
+                self.assertEqual(mock_dl.call_count, 1)
+
+            dead_url = "https://example.com/dead_unique_test_404.png"
+            bad_post = {
+                "source": "okx",
+                "post_id": "lazy_dl_bad",
+                "publish_time": now - 60,
+                "author": {"author_id": "99999"},
+                "content": {"text_content": f"缺图帖\n[插图: {dead_url}]"},
+                "media": {"images": [dead_url], "local_mapping": {}},
+            }
+            with patch("parser.post_ingestion.download_web_media", return_value=None) as mock_fail:
+                self.assertFalse(ensure_post_media_downloaded(bad_post))
+                self.assertFalse(ensure_post_media_downloaded(bad_post))
+                self.assertEqual(mock_fail.call_count, 1)
+
+    def test_fetch_hot_posts_disables_eager_media_download(self):
+        calls = []
+
+        def _fake_fetch_feed(**kwargs):
+            calls.append(dict(kwargs))
+            return []
+
+        mock_mgr = MagicMock()
+        _fetch_hot_posts(mock_mgr, ["BTC"], _fake_fetch_feed, "binance")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c.get("download_media") is False for c in calls))
 
 
 if __name__ == "__main__":

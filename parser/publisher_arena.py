@@ -4,7 +4,7 @@
 
 核心职责与进化点：
 1. 发布前零成本账号可用性预检：通过 `AccountPublishStateStore.get_eligible_accounts` 优先剔除
-   常规间隔冷却、60m WAF/405 退避与 6h 登录失效退避账号；全平台无可用账号时立即跳过，
+   常规间隔冷却账号；全平台无可用账号时立即跳过，
    **零 DB 查询、零指标同步、零总编大模型调用**；
 2. 7 天跨文章类型视觉内容去重 (`content_id` dHash + URL + 本地路径) 与 2 小时同账号同币冷却；
 3. 保留 OKX 平台流量帖排除 OKX 原创 (`source == "okx"` -> `source_conflict`) 的跨平台搬运规范；
@@ -14,6 +14,7 @@
 import json
 import math
 import re
+import statistics
 import threading
 import time
 from collections import Counter
@@ -287,6 +288,7 @@ def _collect_publish_candidates(
 
     if viral and candidates:
         eng_map: Dict[str, Dict[str, Any]] = {}
+        src_pub_time_map: Dict[str, Any] = {}
         try:
             db_obj = article_manager.db if hasattr(article_manager, "db") else gen_db_object()
             post_mgr = UniversalPostManager(db_obj)
@@ -301,9 +303,13 @@ def _collect_publish_candidates(
             if raw_pids:
                 src_posts = post_mgr.find_posts(query={"post_id": {"$in": list(dict.fromkeys(raw_pids))}}, limit=0) or []
                 for sp in src_posts:
-                    eng_map[str(sp.get("post_id"))] = sp.get("engagement") or {}
+                    spid = str(sp.get("post_id"))
+                    eng_map[spid] = sp.get("engagement") or {}
+                    src_pub_time_map[spid] = sp.get("publish_time")
         except Exception as exc:
             logger.warning(f"[高流量/选材] 批量查询原帖互动数据异常，降级按 viral_score 排序: {exc}")
+
+        now_ts = time.time()
 
         def _viral_rank_key(item: Tuple[Dict[str, Any], Set[str], str]) -> float:
             art = item[0]
@@ -316,7 +322,21 @@ def _collect_publish_candidates(
             likes = int(eng.get("like_count", 0) or 0)
             comments = int(eng.get("comment_count", 0) or 0)
             hot_energy = views + likes * 30 + comments * 80
-            return v_score + math.log10(max(hot_energy, 1000)) * 1.2
+            fresh_bonus = 0.0
+            raw_spt = src_pub_time_map.get(pid_str)
+            if raw_spt:
+                try:
+                    spt_val = float(raw_spt)
+                    spt_s = spt_val / 1000.0 if spt_val > 1e11 else spt_val
+                    age_h = (now_ts - spt_s) / 3600.0
+                    # 【保留过滤原因说明】不硬删旧帖防冷清期断供，仅按原帖新鲜度做温和优先级加权（<=12h 优先，>18h 降权）
+                    if age_h <= 12.0:
+                        fresh_bonus = 0.5
+                    elif age_h > 18.0:
+                        fresh_bonus = -1.0
+                except (TypeError, ValueError):
+                    pass
+            return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + fresh_bonus
 
         candidates.sort(key=_viral_rank_key, reverse=True)
     else:
@@ -332,12 +352,15 @@ def _get_recent_published_history_with_metrics(
     platform: str,
     target_accounts: Optional[Sequence[str]] = None,
     limit: int = 50,
+    article_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """拉取目标账号近期已发战报，并按需增量同步免登阅读/互动数。"""
+    """拉取目标账号近期已发战报（支持按文章类型隔离），并按需增量同步免登阅读/互动数。"""
     query: Dict[str, Any] = {
         "status": "ok",
         f"publish_records.{platform}.status": "success",
     }
+    if article_type:
+        query["type"] = article_type
     if target_accounts:
         query[f"publish_records.{platform}.published_by"] = {"$in": list(target_accounts)}
 
@@ -389,7 +412,45 @@ def _select_and_polish_best_candidate(
         platform,
         target_accounts=target_accs,
         limit=50,
+        article_type=article_type,
     )
+
+    acc_views_map: Dict[str, List[float]] = {}
+    for item in historical_performance:
+        if (
+            item.get("is_mature")
+            and isinstance(item.get("views"), (int, float))
+            and not isinstance(item.get("views"), bool)
+        ):
+            acc_name = str(item.get("account") or "").strip() or "unknown"
+            acc_views_map.setdefault(acc_name, []).append(float(item["views"]))
+    account_view_baselines: Dict[str, Dict[str, Any]] = {
+        acc_name: {
+            "mature_posts": len(vals),
+            "median_views": round(statistics.median(vals), 1),
+        }
+        for acc_name, vals in acc_views_map.items()
+    }
+    throttled_other_accounts = {
+        acc_name
+        for acc_name, base_info in account_view_baselines.items()
+        if acc_name != account and base_info["mature_posts"] >= 5 and base_info["median_views"] < 50.0
+    }
+    filtered_history: List[Dict[str, Any]] = []
+    for item in historical_performance:
+        acc_name = str(item.get("account") or "").strip() or "unknown"
+        if acc_name in throttled_other_accounts and len(account_view_baselines) > len(throttled_other_accounts):
+            continue
+        enriched_item = dict(item)
+        base_med = (account_view_baselines.get(acc_name) or {}).get("median_views") or 0.0
+        if (
+            item.get("is_mature")
+            and base_med > 0
+            and isinstance(item.get("views"), (int, float))
+            and not isinstance(item.get("views"), bool)
+        ):
+            enriched_item["vs_account_median"] = f"{round(float(item['views']) / base_med, 2)}x"
+        filtered_history.append(enriched_item)
 
     arena_items = []
     for rank_no, idx in enumerate(valid_indices, 1):
@@ -443,8 +504,10 @@ def _select_and_polish_best_candidate(
     prompt_name = VIRAL_EDITOR_PROMPT_NAME if viral else ANALYSIS_EDITOR_PROMPT_NAME
     payload = {
         "platform": platform.upper(),
+        "current_account": account,
         "platform_constraints": f"{rival_ban}；正文非空白字符数 <= {ARTICLE_MAX_CHARS}",
-        "historical_published_performance": historical_performance,
+        "account_view_baselines": account_view_baselines,
+        "historical_published_performance": filtered_history,
         "candidates": arena_items,
     }
 
@@ -551,7 +614,7 @@ def _persist_publish_result(
     *,
     state_store: Optional[AccountPublishStateStore] = None,
 ) -> str:
-    """持久化账号状态（含分级退避清理/设置）与数据库 `publish_records`。"""
+    """持久化账号状态与数据库 `publish_records`。"""
     store = state_store or default_state_store
     viral = article_type == ARTICLE_TYPE_VIRAL
     error_detail = ""
@@ -591,7 +654,7 @@ def _persist_publish_result(
                 plat_record["selection_model_used"] = sel_meta["model_used"]
         else:
             error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"
-            category, backoff_sec, _ = store.record_failure(
+            store.record_failure(
                 platform,
                 account,
                 str(err_msg or ""),
@@ -606,15 +669,6 @@ def _persist_publish_result(
                 attempts=attempts,
                 last_attempt_time=now,
                 publish_price=latest_price,
-            )
-            _log(
-                f"{PUBLISH_RULES[article_type]['action']}/退避",
-                "账号已记录分级故障退避窗口",
-                level="warning",
-                平台=platform,
-                账号=account,
-                分类=category,
-                退避时长=f"{backoff_sec}s",
             )
         saved.append("账号状态")
     except Exception as exc:
@@ -668,7 +722,7 @@ def _publish_articles_for_platform(
     rule, now = PUBLISH_RULES[article_type], time.time()
     viral = article_type == ARTICLE_TYPE_VIRAL
 
-    # 第一道成本防线：全部账号均在正常冷却或 WAF/登录退避窗口时，零 DB 查询、零总编 LLM 调用直接跳过
+    # 第一道成本防线：全部账号均在正常发帖间隔冷却窗口时，零 DB 查询、零总编 LLM 调用直接跳过
     eligible_accounts, blocked_reasons = store.get_eligible_accounts(
         platform,
         accounts,

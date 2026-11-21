@@ -61,6 +61,7 @@ from parser.post_ingestion import (
     _key_error,
     _publish_time_seconds,
     build_source_image_mapping,
+    ensure_post_media_downloaded,
     normalize_post_media,
     prompt_version,
 )
@@ -93,7 +94,7 @@ def is_need_viral_screening(post: Dict[str, Any]) -> bool:
     text = (post.get("content") or {}).get("text_content") or ""
     if any(match.group(1) == "视频" for match in MEDIA_PATTERN.finditer(text)):
         return False
-    return _is_valid_raw_post(post)
+    return _is_valid_raw_post(post, require_local_media=False)
 
 
 def check_viral_stage1_info(json_data: Any, expected_post_ids: Iterable[Any]) -> Tuple[bool, str]:
@@ -838,7 +839,7 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
             continue
         if not (post.get("media") or {}).get("images"):
             continue
-        if not _is_valid_raw_post(post):
+        if not _is_valid_raw_post(post, require_local_media=False):
             continue
         hot_weight = view_count + like_count * 20 + comment_count * 50
         candidates.append((post, hot_weight, publish_time))
@@ -1289,7 +1290,12 @@ def generate_viral_articles_once() -> List[Dict[str, Any]]:
     """单轮并发执行高流量二阶段多模态重塑任务。"""
     started = time.monotonic()
     manager = GeneratedArticleManager(gen_db_object())
-    tasks = [build_viral_article_task(post) for post in extract_valid_viral_posts(manager)]
+    tasks = []
+    for post in extract_valid_viral_posts(manager):
+        if not ensure_post_media_downloaded(post):
+            logger.debug(f"[高流量/媒体] 按需下载或图片校验未通过，跳过原帖 | 原帖: [{post.get('post_id')}]")
+            continue
+        tasks.append(build_viral_article_task(post))
     if not tasks:
         return []
     _log(

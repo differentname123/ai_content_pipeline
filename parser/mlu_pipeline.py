@@ -32,6 +32,7 @@ from parser.post_ingestion import (
     PRE_SCREEN_PROMPT_NAME,
     _is_valid_raw_post,
     _key_error,
+    ensure_post_media_downloaded,
     normalize_post_media,
     prompt_version,
 )
@@ -48,7 +49,7 @@ def is_need_pre_screening(post: Dict[str, Any]) -> bool:
         and isinstance(screen.get("no_evidence"), bool)
     ):
         return False
-    return _is_valid_raw_post(post)
+    return _is_valid_raw_post(post, require_local_media=False)
 
 
 def is_need_formatting(post: Dict[str, Any]) -> bool:
@@ -61,7 +62,7 @@ def is_need_formatting(post: Dict[str, Any]) -> bool:
         or screen.get("no_evidence") is not False
     ):
         return False
-    return _is_valid_raw_post(post)
+    return _is_valid_raw_post(post, require_local_media=False)
 
 
 def build_pre_screen_item(post: Dict[str, Any]) -> Dict[str, Any]:
@@ -274,6 +275,9 @@ def process_and_save_single_post(post: Dict[str, Any], post_manager: Any) -> Non
     started = time.monotonic()
     post_id = post.get("post_id", "UNKNOWN_ID") if isinstance(post, dict) else "UNKNOWN_ID"
     try:
+        if not ensure_post_media_downloaded(post):
+            logger.debug(f"[帖子/媒体] 按需下载或图片校验未通过，跳过本帖 | 帖子: [{post_id}]")
+            return
         info = gen_media_format_info(post)
         if not info:
             return

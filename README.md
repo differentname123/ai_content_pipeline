@@ -39,8 +39,8 @@ ai_content_pipeline/
 │   └── x_auto_publisher.py           # 【生产守护进程 2】X 中文爆款精选改写与自动发帖
 │
 ├── parser/                           # 【生产守护进程 1】Binance / OKX 内容采编发布流水线
-│   ├── config.py                     # 统一调参中心（提示词版本、冷却/退避时长、阈值、互动开关、字数规则）
-│   ├── publish_state.py              # 线程安全账号状态与分级退避中心（405/WAF 60m、登录失效 6h、常规 10m）
+│   ├── config.py                     # 统一调参中心（提示词版本、冷却时长、阈值、互动开关、字数规则）
+│   ├── publish_state.py              # 线程安全账号发帖状态与间隔冷却中心（不启用失败退避阻塞）
 │   ├── platform_adapters.py          # 双平台发帖格式、热币缓存、竞品词检查、免登阅读/互动指标同步
 │   ├── post_ingestion.py             # 双平台热榜/推荐流采集与原帖校验归一化
 │   ├── mlu_pipeline.py               # 分析帖纯文本初筛与多模态论据（MLU）精提
@@ -49,12 +49,14 @@ ai_content_pipeline/
 │   ├── maintenance_tasks.py          # 评论区互评/点赞、按时间/行情删帖与人工抽样复盘工具
 │   └── article_format_logical.py     # 任务总开关（TASK_SWITCHES 首屏配置）与主控入口（`--once` / `--tasks` / `--dry-run`）
 │
-├── x_growth/                         # 【生产守护进程 3 & 4】X 英/日蓝 V 神评增长流水线
-│   ├── growth_config.py              # 采集/生成/多账号发评统一配置中心
+├── x_growth/                         # 【生产守护进程 3 & 4】X 英/日蓝 V 神评增长与每小时自动互关流水线
+│   ├── growth_config.py              # 采集/生成/多账号发评/自动关注统一配置中心
 │   ├── x_browser_collector.py        # 真实 Chrome GraphQL 被动嗅探采集（严禁触碰 `x_myself`）
 │   ├── comment_generator.py          # `low` 批量生成与分类 + `medium` 独立盲测打分（20 条/波清零）
 │   ├── comment_pipeline.py           # 【生产守护进程 3】采集 + 生成一键串联守护进程
-│   └── comment_publisher.py          # 【生产守护进程 4】主号神评消费、防爆楼（<=15 评 / >=75 分）与免登指标回流
+│   ├── comment_publisher.py          # 【生产守护进程 4】主号神评消费、防爆楼（<=15 评 / >=75 分）与免登指标回流
+│   ├── follow_selector.py            # 高互关概率账号筛选评分（S/A/B）、暖线索识别与回关核验台账
+│   └── auto_follower.py              # 每小时自动补采+双号关注守护进程（含 `--dry-run` / `--status` / `--login`）
 │
 ├── prompt/                           # 当前活跃的 11 个生产/人工复盘提示词模板
 └── tests/                            # 确定性离线单元测试套件（零真实网络/数据库/浏览器副作用）
@@ -76,7 +78,7 @@ playwright install chromium
 - **Binance / OKX 采集-生产-总编发布主流水线**：
   ```bash
   python parser/article_format_logical.py            # 启动 7 个启用后台线程常驻运行
-  python parser/article_format_logical.py --dry-run  # 只读检查任务清单与账号可用/退避状态
+  python parser/article_format_logical.py --dry-run  # 只读检查任务清单与账号可用/冷却状态
   python parser/article_format_logical.py --once --tasks single_analysis_pub
   ```
 - **X 中文爆款自动选帖与发布**：
@@ -94,6 +96,14 @@ playwright install chromium
   python x_growth/comment_publisher.py               # 常驻消费（24 条/天，replies<=15，score>=75）
   python x_growth/comment_publisher.py --once --dry-run
   python x_growth/comment_publisher.py --sync-metrics
+  ```
+- **X 高互关账号筛选与每小时自动关注**：
+  ```bash
+  python x_growth/auto_follower.py                   # 默认每小时巡检一次，为 x_myself 与 x_dahao 执行互关
+  python x_growth/auto_follower.py --dry-run         # 零浏览器预览当前 S/A/B 级候选名单
+  python x_growth/auto_follower.py --status          # 只读查看候选池、24h 配额与各档真实回关率
+  python x_growth/auto_follower.py --once --check-followbacks
+  python x_growth/auto_follower.py --login x_dahao   # 首次为 x_dahao 扫码登录固化浏览器目录
   ```
 - **人工扫码/登录浏览器会话接管**：直接运行 `platforms/binance_playwright.py`、`platforms/okx_playwright.py` 或 `platforms/x_playwright.py`。
 

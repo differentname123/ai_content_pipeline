@@ -66,7 +66,7 @@ logger = setup_logger(app_name="binance_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("qiqi_browser_session_dir", "biance_ruru")
+USER_DATA_DIR = resolve_session_dir("myself_browser_session_dir", "biance_ruru")
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 RE_SUBMIT_API_PRIMARY = re.compile(r"pgc/content/add|pgc/comment/add", re.IGNORECASE)

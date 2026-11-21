@@ -72,7 +72,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Binance / OKX 内容采编与发布主控流水线")
     parser.add_argument("--tasks", nargs="*", help="临时覆盖启用任务名（默认读取 TASK_SWITCHES）")
     parser.add_argument("--once", action="store_true", help="对选定任务顺序跑一轮后退出")
-    parser.add_argument("--dry-run", action="store_true", help="只读查看启用任务与各账号冷却/退避状态")
+    parser.add_argument("--dry-run", action="store_true", help="只读查看启用任务与各账号发帖冷却状态")
     args = parser.parse_args(argv)
 
     if args.tasks:

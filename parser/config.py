@@ -4,7 +4,7 @@
 
 所有面向人的可调业务参数集中在此（任务启停开关直接置顶在 `parser/article_format_logical.py`）：
 1. 提示词版本与模板文件名；
-2. 账号发帖冷却、同币冷却与分级故障退避时长；
+2. 账号发帖冷却与同币冷却时长；
 3. 原帖采集、初筛、高流量筛选、文章生成与互动参数。
 """
 import re
@@ -22,7 +22,7 @@ from common.common_utils import (
 # 1. 提示词版本与模板配置
 # ==============================================================================
 prompt_version = "1016-1"
-SELECTION_PROMPT_VERSION = "20261118-v2_data_driven"
+SELECTION_PROMPT_VERSION = "20261121-v4_human_calibrated"
 
 PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
 MLU_EXTRACT_PROMPT_NAME = "内容生成方案_分析类MLU提取.txt"
@@ -41,7 +41,7 @@ VIRAL_STAGE2_PROMPT_FILE_PATH = str(PROMPT_DIR / VIRAL_STAGE2_PROMPT_NAME)
 VIRAL_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / VIRAL_EDITOR_PROMPT_NAME)
 
 # ==============================================================================
-# 2. 账号发布冷却、故障退避与互动开关
+# 2. 账号发布冷却与互动开关
 # ==============================================================================
 STATE_FILE = str(
     get_runtime_file_path(
@@ -53,10 +53,6 @@ STATE_FILE = str(
 ACCOUNT_COOLDOWN_SECONDS = 6 * 3600       # Binance 单账号发帖间隔（6h）
 OKX_ACCOUNT_COOLDOWN_SECONDS = 6 * 3600   # OKX 单账号发帖间隔（6h）
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600 # 同账号同币种冷却（2h）
-
-WAF_BACKOFF_SECONDS = 3600                # HTTP 405 / WAF 人机验证退避（60m）
-AUTH_BACKOFF_SECONDS = 6 * 3600           # 登录态 / Cookie 过期退避（6h）
-TRANSIENT_BACKOFF_SECONDS = 600           # 普通临时异常退避（10m）
 
 INTERACTION_CONFIG: Dict[str, Dict[str, Any]] = {
     PLATFORM_OKX: {
