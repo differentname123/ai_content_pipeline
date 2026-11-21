@@ -1,0 +1,143 @@
+# -*- coding: utf-8 -*-
+"""
+双平台（Binance / OKX）流水线统一配置中心 (`parser/config.py`)
+
+所有面向人的可调业务参数集中在此（任务启停开关直接置顶在 `parser/article_format_logical.py`）：
+1. 提示词版本与模板文件名；
+2. 账号发帖冷却、同币冷却与分级故障退避时长；
+3. 原帖采集、初筛、高流量筛选、文章生成与互动参数。
+"""
+import re
+from pathlib import Path
+from typing import Any, Dict
+
+from common.common_utils import (
+    PLATFORM_BINANCE,
+    PLATFORM_OKX,
+    PROMPT_DIR,
+    get_runtime_file_path,
+)
+
+# ==============================================================================
+# 1. 提示词版本与模板配置
+# ==============================================================================
+prompt_version = "1016-1"
+SELECTION_PROMPT_VERSION = "20261118-v2_data_driven"
+
+PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
+MLU_EXTRACT_PROMPT_NAME = "内容生成方案_分析类MLU提取.txt"
+ARTICLE_PROMPT_NAME = "内容生成方案_分析类文章生成.txt"
+ANALYSIS_EDITOR_PROMPT_NAME = "内容生成方案_分析类_发布前总编精选.txt"
+VIRAL_STAGE1_PROMPT_NAME = "内容生成方案_娱乐类_单帖可用性筛选.txt"
+VIRAL_STAGE2_PROMPT_NAME = "内容生成方案_娱乐类_单帖洗稿和神评生成.txt"
+VIRAL_EDITOR_PROMPT_NAME = "内容生成方案_娱乐类_发布前总编精选.txt"
+
+PRE_SCREEN_PROMPT_FILE_PATH = str(PROMPT_DIR / PRE_SCREEN_PROMPT_NAME)
+PROMPT_FILE_PATH = str(PROMPT_DIR / MLU_EXTRACT_PROMPT_NAME)
+ARTICLE_PROMPT_FILE_PATH = str(PROMPT_DIR / ARTICLE_PROMPT_NAME)
+ANALYSIS_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / ANALYSIS_EDITOR_PROMPT_NAME)
+VIRAL_STAGE1_PROMPT_FILE_PATH = str(PROMPT_DIR / VIRAL_STAGE1_PROMPT_NAME)
+VIRAL_STAGE2_PROMPT_FILE_PATH = str(PROMPT_DIR / VIRAL_STAGE2_PROMPT_NAME)
+VIRAL_EDITOR_PROMPT_FILE_PATH = str(PROMPT_DIR / VIRAL_EDITOR_PROMPT_NAME)
+
+# ==============================================================================
+# 2. 账号发布冷却、故障退避与互动开关
+# ==============================================================================
+STATE_FILE = str(
+    get_runtime_file_path(
+        "account_publish_state.json",
+        legacy_path=Path(__file__).resolve().with_name("account_publish_state.json"),
+    )
+)
+
+ACCOUNT_COOLDOWN_SECONDS = 6 * 3600       # Binance 单账号发帖间隔（6h）
+OKX_ACCOUNT_COOLDOWN_SECONDS = 6 * 3600   # OKX 单账号发帖间隔（6h）
+ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600 # 同账号同币种冷却（2h）
+
+WAF_BACKOFF_SECONDS = 3600                # HTTP 405 / WAF 人机验证退避（60m）
+AUTH_BACKOFF_SECONDS = 6 * 3600           # 登录态 / Cookie 过期退避（6h）
+TRANSIENT_BACKOFF_SECONDS = 600           # 普通临时异常退避（10m）
+
+INTERACTION_CONFIG: Dict[str, Dict[str, Any]] = {
+    PLATFORM_OKX: {
+        "enable_like": False,
+        "enable_comment": False,
+        "max_comment_accounts": 1,
+    },
+    PLATFORM_BINANCE: {
+        "enable_like": True,
+        "enable_comment": True,
+        "max_comment_accounts": 1,
+    },
+}
+
+# ==============================================================================
+# 3. 采集、筛选、生成与发布核心业务阈值
+# ==============================================================================
+BINANCE_SOURCE = PLATFORM_BINANCE
+OKX_SOURCE = PLATFORM_OKX
+
+POST_QUERY_LIMIT = 50000
+POST_MAX_AGE_HOURS = 48
+MAX_MEDIA_COUNT = 10
+MAX_CONCURRENCY = 20
+LLM_MAX_RETRIES = 3
+PRE_SCREEN_BATCH_SIZE = 50
+PRE_SCREEN_CONCURRENCY = 5
+
+VIRAL_STAGE1_BATCH_SIZE = 50
+VIRAL_POST_MAX_AGE_HOURS = 24
+VIRAL_PUBLISH_MAX_AGE_HOURS = 24
+VIRAL_MIN_VIEW_COUNT_BINANCE = 1000
+VIRAL_MIN_VIEW_COUNT_OKX = 10000
+VIRAL_MIN_VIEW_COUNTS: Dict[str, int] = {
+    PLATFORM_BINANCE: VIRAL_MIN_VIEW_COUNT_BINANCE,
+    PLATFORM_OKX: VIRAL_MIN_VIEW_COUNT_OKX,
+}
+
+ARTICLE_TYPE_ANALYSIS = "analysis"
+ARTICLE_TYPE_VIRAL = "viral"
+ARTICLE_MATERIAL_LIMIT = 10
+ARTICLE_MIN_MATERIALS = 5
+ARTICLE_POST_USAGE_LIMIT = 2
+ARTICLE_MAX_CHARS = 260
+ARTICLE_VARIANTS = 1
+ARTICLE_CONCURRENCY = 5
+ARTICLE_GENERATION_INTERVAL_SECONDS = 1200
+
+PUBLISH_MAX_ATTEMPTS = 3
+PUBLISH_POLL_SECONDS = 600
+INTERACTION_INTERVAL_SECONDS = 1200
+MAX_REPLAY_DAYS = 7
+DELETE_INTERVAL_SEC = 3600
+IMAGE_DEDUP_LOOKBACK_HOURS = 168  # 7 天内跨文章类型视觉内容哈希去重
+
+ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
+MEDIA_PATTERN = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
+
+SHELF_LIFE_SECONDS: Dict[str, int] = {
+    "hours": 2 * 3600,
+    "days": 24 * 3600,
+    "weeks": 7 * 24 * 3600,
+    "long": 15 * 24 * 3600,
+    "unknown": 24 * 3600,
+}
+
+PUBLISH_RULES: Dict[str, Dict[str, Any]] = {
+    ARTICLE_TYPE_ANALYSIS: {
+        "action": "分析发布",
+        "hours": 6,
+        "text": "text",
+        "images": "image_placeholders",
+        "score": "score",
+        "state_prefix": "",
+    },
+    ARTICLE_TYPE_VIRAL: {
+        "action": "流量发布",
+        "hours": VIRAL_PUBLISH_MAX_AGE_HOURS,
+        "text": "post_text",
+        "images": "selected_images",
+        "score": "viral_score",
+        "state_prefix": "viral_",
+    },
+}

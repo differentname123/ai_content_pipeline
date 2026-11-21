@@ -16,10 +16,10 @@ X 平台极简低耦合评论系统配置与纯文本公共工具 (`x_growth/gro
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from common.common_utils import PROMPT_DIR, get_config, resolve_session_dir, setup_logger
-from platforms.harvesters import NEW_HARVESTED_COLLECTION_NAME
+from common.mongo_db.mongo_manager import HARVESTED_POSTS_COLLECTION
 
 TZ_CN = timezone(timedelta(hours=8))
 
@@ -27,7 +27,7 @@ X_GROWTH_PROMPT_DIR: Path = PROMPT_DIR / "x_growth"
 X_GROWTH_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 唯一复用的帖子集合名，绝不新建额外数据表；所有评论生产与消费状态统一收纳在文档内 `auto_comment` 字段下
-POSTS_COLLECTION_NAME: str = NEW_HARVESTED_COLLECTION_NAME  # "harvested_social_posts"
+POSTS_COLLECTION_NAME: str = HARVESTED_POSTS_COLLECTION  # "harvested_social_posts"
 AUTO_COMMENT_FIELD: str = "auto_comment"
 
 # 仅针对经过验证的高收益语种区（英语 en、日语 ja）生成与发布同语种评论

@@ -41,6 +41,8 @@ from common.common_utils import (
     get_media_save_dir,
     get_requests_proxies,
     get_runtime_file_path,
+    normalize_and_enrich_post_schema,
+    normalize_publish_timestamp,
     read_json,
     safe_int,
     save_json,
@@ -48,6 +50,11 @@ from common.common_utils import (
 )
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager
+from common.post_utils import (
+    AccountIsolationError,
+    assert_not_x_myself_dir,
+    is_fetchable_external_article_url,
+)
 
 setup_logger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -139,8 +146,11 @@ def _is_forbidden_myself_dir(path_str):
     """物理隔离守卫：采集与缓存探测绝不允许读取或触碰主号目录 `x_myself`。"""
     if not path_str:
         return False
-    norm = os.path.normcase(os.path.abspath(str(path_str).strip()))
-    return "x_myself" in norm
+    try:
+        assert_not_x_myself_dir(path_str, context="platforms.x_api")
+        return False
+    except AccountIsolationError:
+        return True
 
 
 def _parse_cookie_dict(cookies_str):
@@ -334,10 +344,307 @@ def fetch_x_user_profile(screen_name=DEFAULT_SCREEN_NAME, proxies=PROXIES):
     return {}
 
 
+def _snowflake_to_unix_ts(tweet_id):
+    """利用 Twitter Snowflake ID 零网络开销换算精确发布秒级时间戳。"""
+    s = str(tweet_id or "").strip()
+    if not s.isdigit():
+        return 0
+    val = int(s)
+    if val < 300000000000000000:
+        return 0
+    return int(((val >> 22) + 1288834974657) // 1000)
+
+
+def _convert_fxtwitter_tweet_to_standard(tw, fallback_screen_name="", proxies=PROXIES):
+    """将公开镜像 `api.fxtwitter.com` 的 tweet 对象转为标准 Schema（含长文 Article、引用帖与全量互动数据）。"""
+    if not isinstance(tw, dict) or not tw.get("id"):
+        return None
+    tid = str(tw["id"]).strip()
+    author = tw.get("author") or {}
+    screen_name = str(author.get("screen_name") or fallback_screen_name or "unknown").strip()
+    author_name = str(author.get("name") or screen_name).strip()
+
+    raw_text_str = str(tw.get("text") or "")
+    article_obj = tw.get("article")
+    title_val = None
+    is_long_article = False
+    if isinstance(article_obj, dict):
+        art_title = clean_post_text(str(article_obj.get("title") or "")).strip()
+        blocks = ((article_obj.get("content") or {}).get("blocks")) or []
+        art_paragraphs = [
+            str(b.get("text") or "").strip()
+            for b in blocks
+            if isinstance(b, dict) and str(b.get("text") or "").strip()
+        ]
+        art_body = "\n".join(art_paragraphs).strip() or str(article_obj.get("preview_text") or "").strip()
+        if art_title:
+            title_val = art_title
+        if art_body and len(art_body) > len(raw_text_str):
+            raw_text_str = art_body
+            is_long_article = True
+
+    text = clean_post_text(raw_text_str)
+
+    hashtags = []
+    mentioned_coins = []
+    external_url = ""
+    facets = ((tw.get("raw_text") or {}).get("facets")) or []
+    for fc in facets:
+        if not isinstance(fc, dict):
+            continue
+        ftype = str(fc.get("type") or "").lower()
+        if ftype == "url":
+            cand_u = str(fc.get("replacement") or fc.get("original") or "").strip()
+            if not external_url and is_fetchable_external_article_url(cand_u):
+                external_url = cand_u
+        elif ftype == "hashtag":
+            ht = str(fc.get("original") or "").lstrip("#").strip()
+            if ht and ht not in hashtags:
+                hashtags.append(ht)
+        elif ftype in ("cashtag", "symbol"):
+            sym = str(fc.get("original") or "").lstrip("$").strip().upper()
+            if sym and sym not in mentioned_coins:
+                mentioned_coins.append(sym)
+
+    if not external_url:
+        for u_match in re.findall(r"https?://[^\s<>\"')]+", text):
+            if is_fetchable_external_article_url(u_match):
+                external_url = u_match
+                break
+
+    media_obj = tw.get("media") or {}
+    photos = media_obj.get("photos") or []
+    videos = media_obj.get("videos") or []
+    main_images = [p["url"] for p in photos if isinstance(p, dict) and p.get("url")]
+    images = list(main_images)
+    video_url = videos[0].get("url") if videos and isinstance(videos[0], dict) else None
+    video_duration = int(safe_int(videos[0].get("duration"), 1)) if video_url else 0
+
+    if isinstance(article_obj, dict):
+        cov_url = ((article_obj.get("cover_media") or {}).get("media_info") or {}).get("original_img_url")
+        if cov_url and cov_url not in images:
+            images.insert(0, cov_url)
+            main_images.insert(0, cov_url)
+
+    quoted_data = None
+    qt = tw.get("quote")
+    if isinstance(qt, dict) and qt.get("id"):
+        q_author = qt.get("author") or {}
+        q_txt = clean_post_text(str(qt.get("text") or ""))
+        if not external_url:
+            for qfc in ((qt.get("raw_text") or {}).get("facets") or []):
+                if isinstance(qfc, dict) and str(qfc.get("type") or "").lower() == "url":
+                    q_u = str(qfc.get("replacement") or "").strip()
+                    if is_fetchable_external_article_url(q_u):
+                        external_url = q_u
+                        break
+        q_media = qt.get("media") or {}
+        q_photos = [p["url"] for p in (q_media.get("photos") or []) if isinstance(p, dict) and p.get("url")]
+        q_vids = q_media.get("videos") or []
+        for qp in q_photos:
+            if qp not in images:
+                images.append(qp)
+        if q_vids and not video_url:
+            video_url = q_vids[0].get("url") or "https://x.com/i/videos/quoted"
+            video_duration = max(1, int(safe_int(q_vids[0].get("duration"), 1)))
+        quoted_data = {
+            "post_id": str(qt.get("id")),
+            "username": str(q_author.get("screen_name") or ""),
+            "text": q_txt,
+            "likes": safe_int(qt.get("likes"), 0),
+            "images": q_photos,
+            "has_video": bool(q_vids),
+        }
+        if q_txt and q_txt not in text:
+            text = f"{text}\n[引用 @{quoted_data['username']}]: {q_txt}".strip()
+
+    card_type = "BUZZ_VIDEO" if video_url else ("BUZZ_LONG" if (is_long_article or len(text) >= 500) else "BUZZ_SHORT")
+    item = create_standard_post_schema(source=PLATFORM_X, card_type=card_type)
+    item["post_id"] = tid
+    item["publish_time"] = (
+        safe_int(tw.get("created_timestamp"), 0)
+        or normalize_publish_timestamp(tw.get("created_at"))
+        or _snowflake_to_unix_ts(tid)
+    )
+    item["author_id"] = str(author.get("id") or "") or None
+    item["author"].update({
+        "username": screen_name,
+        "author_name": author_name,
+        "is_verified": False,
+        "followers_count": safe_int(author.get("followers"), 0),
+    })
+    item["content"].update({
+        "title": title_val,
+        "text_content": text,
+        "hashtags": hashtags,
+        "mentioned_coins": mentioned_coins,
+    })
+    item["media"].update({
+        "cover_image": images[0] if images else None,
+        "images": images,
+        "video_url": video_url,
+        "video_duration": video_duration,
+    })
+    item["engagement"].update({
+        "view_count": safe_int(tw.get("views"), 0),
+        "like_count": safe_int(tw.get("likes"), 0),
+        "comment_count": safe_int(tw.get("replies"), 0),
+        "share_count": safe_int(tw.get("retweets"), 0),
+        "quote_count": safe_int(tw.get("quotes"), 0),
+        "bookmark_count": safe_int(tw.get("bookmarks"), 0),
+    })
+    meta_payload = {
+        "url": str(tw.get("url") or f"https://x.com/{screen_name}/status/{tid}"),
+        "lang": tw.get("lang"),
+        "category": "x_zero_auth",
+        "main_images": main_images,
+        "quoted_post": quoted_data,
+    }
+    if external_url:
+        meta_payload["external_url"] = external_url
+    item["metadata"].update(meta_payload)
+    return normalize_and_enrich_post_schema(item, download_media=False, proxies=proxies)
+
+
+def _convert_syndication_tweet_to_standard(syn, fallback_screen_name="", proxies=PROXIES):
+    """将官方免登嵌入接口 `cdn.syndication.twimg.com/tweet-result` 响应转为标准 Schema。"""
+    if not isinstance(syn, dict) or not syn.get("id_str"):
+        return None
+    tid = str(syn["id_str"]).strip()
+    user_obj = syn.get("user") or {}
+    screen_name = str(user_obj.get("screen_name") or fallback_screen_name or "unknown").strip()
+    author_name = str(user_obj.get("name") or screen_name).strip()
+
+    entities = syn.get("entities") or {}
+    raw_txt = str(syn.get("text") or "")
+    for u_obj in entities.get("urls") or []:
+        if isinstance(u_obj, dict) and u_obj.get("url"):
+            raw_txt = raw_txt.replace(u_obj["url"], u_obj.get("expanded_url") or "")
+    for m_obj in entities.get("media") or []:
+        if isinstance(m_obj, dict) and m_obj.get("url"):
+            raw_txt = raw_txt.replace(m_obj["url"], "")
+    text = clean_post_text(raw_txt)
+
+    external_url = ""
+    for u_obj in entities.get("urls") or []:
+        if isinstance(u_obj, dict):
+            exp_u = str(u_obj.get("expanded_url") or "").strip()
+            if is_fetchable_external_article_url(exp_u):
+                external_url = exp_u
+                break
+
+    main_images = []
+    for p in syn.get("photos") or []:
+        if isinstance(p, dict) and p.get("url") and p["url"] not in main_images:
+            main_images.append(p["url"])
+    for m in syn.get("mediaDetails") or []:
+        if isinstance(m, dict) and m.get("type") == "photo" and m.get("media_url_https"):
+            if m["media_url_https"] not in main_images:
+                main_images.append(m["media_url_https"])
+    images = list(main_images)
+
+    video_url = None
+    video_duration = 0
+    vid_obj = syn.get("video")
+    if isinstance(vid_obj, dict):
+        poster = vid_obj.get("poster")
+        if poster and poster not in images:
+            images.append(poster)
+        mp4s = [
+            v for v in (vid_obj.get("variants") or [])
+            if isinstance(v, dict) and v.get("type") == "video/mp4" and v.get("src")
+        ]
+        if mp4s:
+            video_url = mp4s[-1]["src"]
+        video_duration = max(1, int(safe_int(vid_obj.get("durationMs"), 0) / 1000)) if video_url else 0
+
+    item = create_standard_post_schema(source=PLATFORM_X, card_type="BUZZ_VIDEO" if video_url else "BUZZ_SHORT")
+    item["post_id"] = tid
+    item["publish_time"] = normalize_publish_timestamp(syn.get("created_at")) or _snowflake_to_unix_ts(tid)
+    item["author_id"] = str(user_obj.get("id_str") or "") or None
+    item["author"].update({
+        "username": screen_name,
+        "author_name": author_name,
+        "is_verified": bool(user_obj.get("is_blue_verified") or user_obj.get("verified")),
+        "followers_count": 0,
+    })
+    item["content"].update({
+        "title": None,
+        "text_content": text,
+        "hashtags": [
+            str(h.get("text")).strip()
+            for h in (entities.get("hashtags") or [])
+            if isinstance(h, dict) and h.get("text")
+        ],
+        "mentioned_coins": [],
+    })
+    item["media"].update({
+        "cover_image": images[0] if images else None,
+        "images": images,
+        "video_url": video_url,
+        "video_duration": video_duration,
+    })
+    item["engagement"].update({
+        "view_count": 0,
+        "like_count": safe_int(syn.get("favorite_count"), 0),
+        "comment_count": safe_int(syn.get("conversation_count"), 0),
+        "share_count": 0,
+        "quote_count": 0,
+        "bookmark_count": 0,
+    })
+    meta_payload = {
+        "url": f"https://x.com/{screen_name}/status/{tid}",
+        "lang": syn.get("lang"),
+        "category": "x_zero_auth",
+        "main_images": main_images,
+    }
+    if external_url:
+        meta_payload["external_url"] = external_url
+    item["metadata"].update(meta_payload)
+    return normalize_and_enrich_post_schema(item, download_media=False, proxies=proxies)
+
+
+def fetch_x_tweet_zero_auth(tweet_id, screen_name="", proxies=PROXIES):
+    """
+    100% 免登拉取单条推文标准化完整数据：
+    主通道 `api.fxtwitter.com`，失败自动热备切换 `cdn.syndication.twimg.com`。
+    """
+    tid = str(tweet_id or "").strip()
+    if not tid.isdigit():
+        return None
+
+    handle_seg = str(screen_name or "i").lstrip("@").strip() or "i"
+    tw_obj = fetch_x_single_post_raw(handle_seg, tid, proxies=proxies)
+    if isinstance(tw_obj, dict):
+        parsed = _convert_fxtwitter_tweet_to_standard(tw_obj, fallback_screen_name=screen_name, proxies=proxies)
+        if parsed:
+            return parsed
+
+    try:
+        resp = requests.get(
+            f"https://cdn.syndication.twimg.com/tweet-result?id={tid}&lang=en&token=42",
+            headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+            proxies=proxies,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            syn_obj = resp.json()
+            if isinstance(syn_obj, dict) and syn_obj.get("id_str"):
+                return _convert_syndication_tweet_to_standard(
+                    syn_obj, fallback_screen_name=screen_name, proxies=proxies
+                )
+    except Exception as e:
+        logger.debug(f"[X平台/免登备份] syndication 拉取 {tid} 失败: {e}")
+
+    return None
+
+
 def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES):
     """通过 fxtwitter 接口拉取单条 X 帖子的完整实时数据"""
-    clean_name = str(screen_name).lstrip("@").strip()
+    clean_name = str(screen_name).lstrip("@").strip() or "i"
     clean_id = str(post_id).strip()
+    if not clean_id.isdigit():
+        return None
     url = f"https://api.fxtwitter.com/{clean_name}/status/{clean_id}"
     headers = {"User-Agent": DEFAULT_UA, "Accept": "application/json"}
     client = session if session else requests
@@ -362,9 +669,7 @@ def fetch_x_single_post_raw(screen_name, post_id, session=None, proxies=PROXIES)
 # ============================================================
 def _get_known_ids_cache_path(screen_name):
     clean_name = str(screen_name).lstrip("@").strip().lower()
-    filename = f"x_known_ids_{clean_name}.json"
-    legacy_path = _PROJECT_ROOT / "biance" / filename
-    return get_runtime_file_path(filename, legacy_path=legacy_path)
+    return get_runtime_file_path(f"x_known_ids_{clean_name}.json")
 
 
 def _discover_tweet_ids_from_ssr(screen_name, proxies=PROXIES):
@@ -402,12 +707,17 @@ def _discover_tweet_ids_from_local_browsers(screen_name):
     clean_name = str(screen_name).lstrip("@").strip()
     found_ids = set()
 
-    local_app_data = os.environ.get("LOCALAPPDATA", r"C:\Users\zxh\AppData\Local")
-    roots = [
-        os.path.join(local_app_data, r"Google\Chrome\User Data"),
-        os.path.join(local_app_data, r"Microsoft\Edge\User Data"),
-    ]
-    if os.path.exists(r"W:\temp"):
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    roots = []
+    if local_app_data:
+        roots.extend([
+            os.path.join(local_app_data, r"Google\Chrome\User Data"),
+            os.path.join(local_app_data, r"Microsoft\Edge\User Data"),
+        ])
+    session_root = str(get_config("browser_session_root", default="") or "").strip()
+    if session_root and os.path.exists(session_root):
+        roots.extend(glob.glob(os.path.join(session_root, "*")))
+    elif os.path.exists(r"W:\temp"):
         roots.extend(glob.glob(r"W:\temp\*"))
 
     pattern = re.compile(rf"{re.escape(clean_name)}/status/(\d{{15,22}})", re.IGNORECASE)
@@ -499,11 +809,9 @@ def extract_domain_cookies_from_user_data_dir(
     2) 命中缓存时 `<1ms` 毫秒级返回，避免每次实例化 Harvester 反复拉起 Chrome 进程；
     3) 需要提取时统一复用 `_launch_persistent(..., debug=False)` 独占锁与无头模式，零弹窗闪烁、零并发锁冲突。
     """
-    if not user_data_dir or not os.path.isdir(user_data_dir) or not urls:
-        return ""
     # 【保留过滤原因说明】严禁采集代码读取主号浏览器目录 `x_myself` 的登录态 Cookie（主号物理隔离红线）。
-    if _is_forbidden_myself_dir(user_data_dir):
-        logger.warning(f"[凭证提取] 检测到尝试读取主号目录 <{user_data_dir}>，已物理拦截并返回空凭证")
+    assert_not_x_myself_dir(user_data_dir, context="platforms.x_api.extract_domain_cookies")
+    if not user_data_dir or not os.path.isdir(user_data_dir) or not urls:
         return ""
     cookie_mtime = _get_chromium_cookie_db_mtime(user_data_dir)
     if cookie_mtime <= 0.0:
@@ -532,23 +840,19 @@ def extract_domain_cookies_from_user_data_dir(
             pass
 
     try:
-        from playwright.sync_api import sync_playwright
-        from platforms.playwright_base import _launch_persistent
+        from platforms.playwright_base import persistent_browser_session
 
         proxy_server = PROXIES.get("http") if isinstance(PROXIES, dict) else None
-        with sync_playwright() as p:
-            context = _launch_persistent(
-                p,
-                user_data_dir=user_data_dir,
-                args=["--disable-blink-features=AutomationControlled"],
-                debug=False,
-                proxy=proxy_server,
-            )
-            try:
-                raw_cookies = context.cookies(list(urls))
-                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
-            finally:
-                context.close()
+        with persistent_browser_session(
+            user_data_dir=user_data_dir,
+            debug=False,
+            proxy=proxy_server,
+            args=["--disable-blink-features=AutomationControlled"],
+            reuse_existing_page=True,
+            install_guard=False,
+        ) as (context, _page):
+            raw_cookies = context.cookies(list(urls))
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies if c.get("name"))
 
         new_mtime = _get_chromium_cookie_db_mtime(user_data_dir) or cookie_mtime
         try:
@@ -1044,13 +1348,9 @@ def fetch_x_user_posts(
             p["media"]["local_mapping"] = mapping
 
     if save_json_path is None:
-        save_json_path = get_runtime_file_path(
-            f"x_posts_{clean_name}.json", legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.json"
-        )
+        save_json_path = get_runtime_file_path(f"x_posts_{clean_name}.json")
     if save_csv_path is None:
-        save_csv_path = get_runtime_file_path(
-            f"x_posts_{clean_name}.csv", legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.csv"
-        )
+        save_csv_path = get_runtime_file_path(f"x_posts_{clean_name}.csv")
 
     if save_json_path:
         save_json(save_json_path, cleaned_posts)
@@ -1084,10 +1384,7 @@ def load_cached_x_posts(accounts=None, sort_by="time"):
     for spec in specs:
         clean_name = spec["screen_name"]
         alias = spec["alias"]
-        json_path = get_runtime_file_path(
-            f"x_posts_{clean_name}.json",
-            legacy_path=_PROJECT_ROOT / "biance" / f"x_posts_{clean_name}.json",
-        )
+        json_path = get_runtime_file_path(f"x_posts_{clean_name}.json")
         posts = []
         if os.path.exists(json_path):
             try:
@@ -1445,7 +1742,7 @@ def build_x_selection_prompt(
             if use_cached_only:
                 posts_by_account = load_cached_x_posts(accounts=target_specs, sort_by="time")
             else:
-                fetch_cap = max(_safe_int(recent_count, 50), 100)
+                fetch_cap = max(safe_int(recent_count, 50), 100)
                 posts_by_account = fetch_multi_x_user_posts(
                     accounts=target_specs,
                     count=fetch_cap,
@@ -1489,17 +1786,11 @@ def build_x_selection_prompt(
     if save_prompt_path is None:
         if len(target_specs) == 1:
             prompt_tag = target_specs[0]["screen_name"]
-            legacy_path = _PROJECT_ROOT / "biance" / f"x_selection_prompt_{prompt_tag}.txt"
         elif 1 < len(target_specs) <= 3:
             prompt_tag = "_".join(s["alias"] for s in target_specs)
-            legacy_path = None
         else:
             prompt_tag = "merged"
-            legacy_path = None
-        save_prompt_path = get_runtime_file_path(
-            f"x_selection_prompt_{prompt_tag}.txt",
-            legacy_path=legacy_path,
-        )
+        save_prompt_path = get_runtime_file_path(f"x_selection_prompt_{prompt_tag}.txt")
 
     if save_prompt_path:
         with open(save_prompt_path, "w", encoding="utf-8") as f:

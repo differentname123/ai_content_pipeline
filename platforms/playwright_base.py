@@ -101,6 +101,10 @@ class BusinessErrorException(Exception):
     """发送请求被服务端业务规则拦截"""
 
 
+class ChallengeRequiredError(BusinessErrorException):
+    """触发站点 WAF / HTTP 405 / 人机安全验证拦截（严禁绕过，交由上层退避保护）"""
+
+
 class UserDataDirLockTimeoutError(TimeoutError):
     """等待 user_data_dir 独占锁超时"""
 
@@ -1005,16 +1009,32 @@ def _pick_trusted_send_button(cands, blacklist_re=RE_SEND_BLACKLIST):
 
 
 class _BaseApiWatcher:
-    """通用 POST 接口响应监听器，支持主接口与辅助接口正则匹配。"""
+    """通用 POST 接口请求/响应监听器，支持主接口与辅助接口正则匹配。"""
 
     def __init__(self, page, primary_re, secondary_re):
         self.page = page
         self.primary_re = primary_re
         self.secondary_re = secondary_re
+        self.primary_requests = []
         self.primary = []
         self.secondary = []
         self._closed = False
+        page.on("request", self._on_request)
         page.on("response", self._on_response)
+
+    @property
+    def primary_request_count(self):
+        return len(self.primary_requests)
+
+    def _on_request(self, req):
+        try:
+            if req.method != "POST":
+                return
+            url = req.url or ""
+            if self.primary_re and self.primary_re.search(url):
+                self.primary_requests.append(req)
+        except Exception:
+            pass
 
     def _on_response(self, resp):
         try:
@@ -1043,6 +1063,10 @@ class _BaseApiWatcher:
         if self._closed:
             return
         self._closed = True
+        try:
+            self.page.remove_listener("request", self._on_request)
+        except Exception:
+            pass
         try:
             self.page.remove_listener("response", self._on_response)
         except Exception:
@@ -1158,6 +1182,191 @@ def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=Tr
         logger.warning(f"[环境] 剪贴板权限授予失败: {e}")
 
     return context
+
+
+def build_real_chrome_launch_options(browser_visible=False, extra_args=None):
+    """
+    构造真实桌面 Chrome 启动参数：
+    - `browser_visible=False`（默认）：启用现代 Chrome `--headless=new` 原生无头引擎（不传 `--disable-gpu`，
+      保留本机真实物理显卡指纹，零桌面窗口、零焦点抢占）；
+    - `browser_visible=True`：显示正常最大化窗口便于人工观察。
+    """
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+        "--mute-audio",
+    ]
+    if extra_args:
+        args.extend(list(extra_args))
+    if browser_visible:
+        args.append("--start-maximized")
+        return args, None
+    args.extend(
+        [
+            "--headless=new",
+            "--window-size=1440,900",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+        ]
+    )
+    return args, {"width": 1440, "height": 900}
+
+
+def apply_stealth_headless_emulation(context, page, browser_visible=False):
+    """
+    在 `--headless=new` 模式下，于导航前通过 CDP 将默认 `HeadlessChrome/<ver>` 还原为本机真实 `Chrome/<ver>`，
+    同步对齐 HTTP `User-Agent`、`Sec-CH-UA*` 请求头与 `navigator.userAgentData`，返回需保持存活的 CDP 会话对象。
+    """
+    if browser_visible:
+        return None
+    try:
+        raw_ua = str(page.evaluate("() => navigator.userAgent") or "")
+        clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/")
+        m_ver = re.search(r"Chrome/([\d.]+)", clean_ua)
+        ver_full = m_ver.group(1) if m_ver else "135.0.0.0"
+        ver_major = ver_full.split(".", 1)[0]
+
+        if sys.platform == "darwin":
+            nav_platform, ch_platform, ch_platform_ver, arch = "MacIntel", "macOS", "14.5.0", "arm"
+        elif sys.platform.startswith("linux"):
+            nav_platform, ch_platform, ch_platform_ver, arch = "Linux x86_64", "Linux", "6.8.0", "x86"
+        else:
+            nav_platform, ch_platform, ch_platform_ver, arch = "Win32", "Windows", "15.0.0", "x86"
+
+        cdp = context.new_cdp_session(page)
+        cdp.send(
+            "Emulation.setUserAgentOverride",
+            {
+                "userAgent": clean_ua,
+                "platform": nav_platform,
+                "userAgentMetadata": {
+                    "brands": [
+                        {"brand": "Google Chrome", "version": ver_major},
+                        {"brand": "Not-A.Brand", "version": "8"},
+                        {"brand": "Chromium", "version": ver_major},
+                    ],
+                    "fullVersionList": [
+                        {"brand": "Google Chrome", "version": ver_full},
+                        {"brand": "Not-A.Brand", "version": "8.0.0.0"},
+                        {"brand": "Chromium", "version": ver_full},
+                    ],
+                    "fullVersion": ver_full,
+                    "platform": ch_platform,
+                    "platformVersion": ch_platform_ver,
+                    "architecture": arch,
+                    "model": "",
+                    "mobile": False,
+                    "bitness": "64",
+                    "wow64": False,
+                },
+            },
+        )
+        return cdp
+    except Exception:
+        return None
+
+
+@contextmanager
+def persistent_browser_session(
+    user_data_dir,
+    *,
+    debug=False,
+    proxy=None,
+    args=None,
+    viewport=None,
+    hide_automation=True,
+    lock_timeout=USER_DATA_LOCK_TIMEOUT_SEC,
+    default_timeout_ms=60000,
+    navigation_timeout_ms=60000,
+    use_stealth_chrome=False,
+    reuse_existing_page=False,
+    install_guard=True,
+    extra_init_script=None,
+):
+    """
+    跨模块统一的持久化浏览器生命周期上下文管理器：
+    - 统一接管 `_user_data_dir_lock` + `sync_playwright()` + `_launch_persistent`；
+    - 支持现代真实 Chrome `--headless=new` + CDP UA 伪装 (`use_stealth_chrome=True`)；
+    - 自动清理多余残留标签页、设置超时、挂载可选 init_script 与浮层看门狗，并在退出时保证关闭上下文。
+    """
+    stealth_cdp = None
+    with _user_data_dir_lock(user_data_dir, timeout=lock_timeout):
+        with sync_playwright() as p:
+            context = None
+            try:
+                if use_stealth_chrome:
+                    eff_args, eff_viewport = build_real_chrome_launch_options(
+                        browser_visible=bool(debug),
+                        extra_args=args,
+                    )
+                    if viewport is not None:
+                        eff_viewport = viewport
+                    launch_debug = True
+                else:
+                    eff_args = list(args or ["--disable-blink-features=AutomationControlled"])
+                    eff_viewport = viewport
+                    launch_debug = bool(debug)
+
+                context = _launch_persistent(
+                    p,
+                    user_data_dir,
+                    args=eff_args,
+                    viewport=eff_viewport,
+                    hide_automation=hide_automation,
+                    debug=launch_debug,
+                    proxy=proxy,
+                )
+                if default_timeout_ms:
+                    context.set_default_timeout(default_timeout_ms)
+                if navigation_timeout_ms:
+                    context.set_default_navigation_timeout(navigation_timeout_ms)
+                if extra_init_script:
+                    try:
+                        context.add_init_script(extra_init_script)
+                    except Exception:
+                        pass
+
+                if reuse_existing_page and context.pages:
+                    page = context.pages[0]
+                else:
+                    page = context.new_page()
+
+                for old_page in list(context.pages):
+                    if old_page != page:
+                        try:
+                            old_page.close()
+                        except Exception:
+                            pass
+
+                if debug:
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+
+                if use_stealth_chrome:
+                    stealth_cdp = apply_stealth_headless_emulation(
+                        context,
+                        page,
+                        browser_visible=bool(debug),
+                    )
+                    # 保存引用以防 CDP 会话被 GC 回收
+                    page._stealth_cdp_ref = stealth_cdp  # noqa: SLF001
+
+                if install_guard:
+                    install_overlay_guard(page)
+
+                yield context, page
+            finally:
+                stealth_cdp = None
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
 
 def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN", proxy=None, args=None, viewport=None):

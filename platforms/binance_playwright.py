@@ -33,7 +33,7 @@ from platforms.playwright_base import (
     TYPE_CHUNK_SIZE,
     USER_DATA_LOCK_TIMEOUT_SEC,
     BusinessErrorException,
-    PageCrashedException,
+    ChallengeRequiredError,
     UserDataDirLockTimeoutError,
     _alert_failure_scene,
     _BaseApiWatcher,
@@ -56,8 +56,8 @@ from platforms.playwright_base import (
     _user_data_dir_lock,
     check_for_crash,
     clean_browser_cache,
-    install_overlay_guard,
     open_browser_for_manual_use as _base_open_browser_for_manual_use,
+    persistent_browser_session,
     report_guard_hits,
 )
 
@@ -66,7 +66,7 @@ logger = setup_logger(app_name="binance_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = resolve_session_dir("ruru_browser_session_dir", "biance_ruru")
+USER_DATA_DIR = resolve_session_dir("qiqi_browser_session_dir", "biance_ruru")
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 RE_SUBMIT_API_PRIMARY = re.compile(r"pgc/content/add|pgc/comment/add", re.IGNORECASE)
@@ -767,8 +767,74 @@ def extract_binance_post_id(post_url):
         return None
 
 
+def _detect_binance_waf_or_challenge(page, response=None):
+    """快速探测币安 HTTP 405 / WAF 人机验证页；严禁尝试绕过，立即返回明确拦截说明。"""
+    if response is not None and response.status == 405:
+        return "[WAF/人机验证] 广场页面返回 HTTP 405 人机验证拦截，已立即停止等待，交由上层进入冷却"
+    try:
+        body_hint = page.evaluate(
+            "() => document.body ? (document.body.innerText || '').slice(0, 600) : ''"
+        )
+        low_hint = (body_hint or "").lower()
+        if (
+            "我们需要确认您是人类" in (body_hint or "")
+            or "请完成安全检查" in (body_hint or "")
+            or "confirm you are human" in low_hint
+            or "confirm that you are human" in low_hint
+        ):
+            return "[WAF/人机验证] 页面弹出人机安全验证，已立即停止等待，交由上层进入冷却"
+    except Exception:
+        pass
+    return None
+
+
+_LOGGED_OUT_TEXT_HINTS = (
+    "登录会话已超时",
+    "请完成安全验证以保持登录状态",
+    "执行安全验证",
+    "session has expired",
+    "complete security verification",
+)
+
+
+def _has_binance_logged_out_text(page):
+    try:
+        body_hint = page.evaluate(
+            "() => document.body ? (document.body.innerText || '').slice(0, 2500) : ''"
+        )
+        raw_hint = body_hint or ""
+        low_hint = raw_hint.lower()
+        return any(hint in raw_hint or hint in low_hint for hint in _LOGGED_OUT_TEXT_HINTS)
+    except Exception:
+        return False
+
+
+def _detect_binance_logged_out(page, wait_ms=3000):
+    """快速探测币安未登录侧边栏、Login 入口或会话超时弹窗，避免无效等待编辑器超时。"""
+    err_msg = "页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。"
+    if _has_binance_logged_out_text(page):
+        return err_msg
+
+    if wait_ms > 0:
+        try:
+            page.locator('[data-signup-widget="true"], a[href*="login"]').first.wait_for(
+                state="visible", timeout=wait_ms
+            )
+            return err_msg
+        except PlaywrightTimeoutError:
+            if _has_binance_logged_out_text(page):
+                return err_msg
+        except Exception:
+            pass
+    return None
+
+
 def _verify_page_ready(page, response, post_id):
-    """落地页四重体检，返回错误描述(str) 或 None(通过)。"""
+    """落地页五重体检（含 WAF/人机验证快速识别），返回错误描述(str) 或 None(通过)。"""
+    waf_err = _detect_binance_waf_or_challenge(page, response=response)
+    if waf_err:
+        return waf_err
+
     if response and response.status >= 400:
         return f"页面加载异常或帖子已被删除 (HTTP 状态码: {response.status})"
 
@@ -789,11 +855,9 @@ def _verify_page_ready(page, response, post_id):
                 return f"页面发生重定向，目标帖子已被删除或失效 | 原帖子ID: {post_id} | 现落地URL: {landed}"
             logger.info(f"[导航/Nav] URL 漂移但评论编辑器存在，判定为前端路由行为，放行 | 落地URL: <{landed}>")
 
-    try:
-        page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
-        return "页面探测到 Login 按钮，本地 Cookie 可能已过期失效。"
-    except PlaywrightTimeoutError:
-        pass
+    auth_err = _detect_binance_logged_out(page, wait_ms=3000)
+    if auth_err:
+        return auth_err
 
     try:
         page.locator("text=您无法查看此内容").wait_for(state="visible", timeout=2500)
@@ -866,6 +930,79 @@ def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url="https://w
     return _base_open_browser_for_manual_use(user_data_dir=user_data_dir, home_url=home_url)
 
 
+def _build_binance_launch_args(debug=False):
+    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
+    if debug:
+        return {
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--start-maximized",
+                "--window-position=0,0",
+            ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args,
+            "viewport": None,
+        }
+    return {
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--window-position=0,0",
+        ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args,
+        "viewport": {"width": 1920, "height": 1080},
+    }
+
+
+def _run_binance_browser_action(user_data_dir, *, debug=False, forensic_tag="error", forensic_url="", fn=None):
+    launch_cfg = _build_binance_launch_args(debug=debug)
+    try:
+        with persistent_browser_session(
+            user_data_dir,
+            debug=debug,
+            args=launch_cfg["args"],
+            viewport=launch_cfg["viewport"],
+            install_guard=True,
+        ) as (context, page):
+            try:
+                return fn(context, page)
+            except ChallengeRequiredError as waf_e:
+                raw_waf = str(waf_e)
+                error_info = raw_waf if raw_waf.startswith("[WAF/人机验证]") else f"[WAF/人机验证] {raw_waf}"
+                logger.warning(f"[任务/Main] 触发平台安全验证，立即停止等待并交由上层退避 | 原因: 【{error_info}】")
+                return error_info, False, None
+            except BusinessErrorException as biz_e:
+                error_info = f"[业务拦截] {biz_e}"
+                logger.error(f"[任务/Main] 发帖被服务端业务规则阻断，无需重试 | 原因: 【{error_info}】")
+                return error_info, False, None
+            except Exception as e:
+                is_timeout = isinstance(e, PlaywrightTimeoutError)
+                if is_timeout:
+                    error_info = f"[元素/网络超时] {e}"
+                    logger.error(f"[任务/Main] 元素等待或网络请求超时 | 详情: 【{error_info[:200]}】")
+                else:
+                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                    logger.error(f"[任务/Main] 执行中发生未预期异常 | 摘要: 【{str(e)[:200]}】")
+                try:
+                    report_guard_hits(page, "timeout" if is_timeout else "error")
+                    _forensics(
+                        page,
+                        f"{'timeout_' if is_timeout else ''}{forensic_tag}",
+                        {"url": forensic_url, "error": error_info[:2000]},
+                    )
+                except Exception as s_e:
+                    logger.warning(f"[任务/Debug] 故障现场保存失败: {s_e}")
+                _alert_failure_scene(error_info)
+                return error_info, False, None
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"[任务/Main] {error_info}")
+        return error_info, False, None
+    except Exception as core_e:
+        error_info = (
+            f"[CoreEngineCrash] Playwright 底层启动/运行发生系统级崩溃:\n{core_e}\n\n"
+            f"[Traceback]:\n{traceback.format_exc()}"
+        )
+        logger.error(f"[任务/Main] Playwright 核心框架崩溃 | 详情: 【{str(core_e)[:200]}】")
+        return error_info, False, None
+
+
 def create_binance_post(
     content="",
     image_path_list=None,
@@ -900,109 +1037,50 @@ def create_binance_post(
         f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    desktop_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--window-position=0,0",
-    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
+    def _do_post(_context, page):
+        response = page.goto(square_url, timeout=60000, wait_until="domcontentloaded")
+        _dismiss_overlays(page, aggressive=False, desc="square-nav")
+        report_guard_hits(page, "square-nav")
 
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
+        waf_err = _detect_binance_waf_or_challenge(page, response=response)
+        if waf_err:
+            raise ChallengeRequiredError(waf_err)
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=debug_args if debug else desktop_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
-                        debug=debug,
-                    )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
+        if response and response.status >= 400:
+            return f"广场主页加载异常 (HTTP {response.status})", False, None
 
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
+        auth_err = _detect_binance_logged_out(page, wait_ms=3000)
+        if auth_err:
+            return auth_err, False, None
 
-                    install_overlay_guard(page)
+        check_for_crash(page)
 
-                    response = page.goto(square_url, timeout=60000, wait_until="domcontentloaded")
-                    _dismiss_overlays(page, aggressive=False, desc="square-nav")
-                    report_guard_hits(page, "square-nav")
+        try:
+            editor_container = _locate_post_creator(page)
+        except Exception as e:
+            return f"无法定位发帖区: {e}", False, None
 
-                    if response and response.status >= 400:
-                        return f"广场主页加载异常 (HTTP {response.status})", False, None
+        post_id = _submit_comment(
+            page,
+            editor_container,
+            content,
+            image_path_list,
+            url_info_list,
+            chart_info,
+            sentiment,
+            text_list=text_list,
+        )
 
-                    try:
-                        page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
-                        return "页面探测到 Login 按钮，本地 Cookie 可能已过期失效。", False, None
-                    except PlaywrightTimeoutError:
-                        pass
+        logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
+        return None, True, post_id
 
-                    check_for_crash(page)
-
-                    try:
-                        editor_container = _locate_post_creator(page)
-                    except Exception as e:
-                        return f"无法定位发帖区: {e}", False, None
-
-                    post_id = _submit_comment(
-                        page,
-                        editor_container,
-                        content,
-                        image_path_list,
-                        url_info_list,
-                        chart_info,
-                        sentiment,
-                        text_list=text_list,
-                    )
-
-                    logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
-                    return None, True, post_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Main] 发帖被服务端业务规则阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}"
-                    if context and context.pages:
-                        try:
-                            _forensics(context.pages[0], "post_error", {"url": square_url, "error": error_info[:2000]})
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Main] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+    return _run_binance_browser_action(
+        user_data_dir,
+        debug=debug,
+        forensic_tag="post_error",
+        forensic_url=square_url,
+        fn=_do_post,
+    )
 
 
 def comment_on_binance_post(
@@ -1040,133 +1118,53 @@ def comment_on_binance_post(
         f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    desktop_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--window-position=0,0",
-    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
+    def _do_comment(_context, page):
+        response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
+        _dismiss_overlays(page, aggressive=False, desc="post-nav")
+        report_guard_hits(page, "post-nav")
 
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + list(STABLE_DESKTOP_FINGERPRINT_ARGS) + anti_freeze_args
+        page_err = _verify_page_ready(page, response, post_id)
+        if page_err:
+            logger.warning(
+                f"[导航/Nav] 落地页体检未通过，安全跳过本任务 | 帖子ID: 【{post_id}】 | 原因: 【{page_err}】"
+            )
+            return page_err, False, None
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=debug_args if debug else desktop_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
-                        debug=debug,
-                    )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
+        check_for_crash(page)
 
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
+        _dismiss_overlays(page, aggressive=False, desc="pre-scroll")
+        try:
+            editor_container = _smart_scroll_to_editor(page)
+        except PlaywrightTimeoutError:
+            logger.warning("[导航/Nav] 编辑器定位超时，疑似 scroll-lock 未解除，强制清障后重试一次")
+            _dismiss_overlays(page, aggressive=True, desc="scroll-lock-retry")
+            page.wait_for_timeout(500)
+            editor_container = _smart_scroll_to_editor(page)
 
-                    install_overlay_guard(page)
+        check_for_crash(page)
 
-                    response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
-                    _dismiss_overlays(page, aggressive=False, desc="post-nav")
-                    report_guard_hits(page, "post-nav")
-
-                    page_err = _verify_page_ready(page, response, post_id)
-                    if page_err:
-                        logger.warning(
-                            f"[导航/Nav] 落地页体检未通过，安全跳过本任务 | 帖子ID: 【{post_id}】 | 原因: 【{page_err}】"
-                        )
-                        return page_err, False, None
-
-                    check_for_crash(page)
-
-                    _dismiss_overlays(page, aggressive=False, desc="pre-scroll")
-                    try:
-                        editor_container = _smart_scroll_to_editor(page)
-                    except PlaywrightTimeoutError:
-                        logger.warning("[导航/Nav] 编辑器定位超时，疑似 scroll-lock 未解除，强制清障后重试一次")
-                        _dismiss_overlays(page, aggressive=True, desc="scroll-lock-retry")
-                        page.wait_for_timeout(500)
-                        editor_container = _smart_scroll_to_editor(page)
-
-                    check_for_crash(page)
-
-                    comment_id = _submit_comment(
-                        page,
-                        editor_container,
-                        comment,
-                        image_path_list,
-                        url_info_list,
-                        chart_info,
-                        sentiment,
-                        text_list=text_list,
-                    )
-                    logger.info(
-                        f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]"
-                    )
-                    return None, True, comment_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(
-                        f"[任务/Main] 发帖被服务端业务规则阻断，无需重试 | 帖子ID: 【{post_id}】 | 原因: 【{error_info}】"
-                    )
-                    return error_info, False, None
-
-                except Exception as e:
-                    is_timeout = isinstance(e, PlaywrightTimeoutError)
-                    if is_timeout:
-                        error_info = f"[元素/网络超时] {e}"
-                        logger.error(f"[任务/Main] 元素等待或网络请求超时 | 帖子ID: 【{post_id}】 | 详情: 【{error_info[:200]}】")
-                    else:
-                        error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                        logger.error(f"[任务/Main] 执行中发生未预期异常 | 帖子ID: 【{post_id}】 | 摘要: 【{str(e)[:200]}】")
-
-                    if context and context.pages:
-                        try:
-                            pg = context.pages[0]
-                            report_guard_hits(pg, "timeout" if is_timeout else "error")
-                            _forensics(
-                                pg,
-                                ("timeout" if is_timeout else "error") + f"_{post_id}",
-                                {"post_url": post_url, "error": error_info[:2000]},
-                            )
-                        except Exception as s_e:
-                            logger.warning(f"[任务/Debug] 故障现场保存失败: {s_e}")
-
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Main] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = (
-            f"[CoreEngineCrash] Playwright 底层启动/运行发生系统级崩溃:\n{core_e}\n\n"
-            f"[Traceback]:\n{traceback.format_exc()}"
+        comment_id = _submit_comment(
+            page,
+            editor_container,
+            comment,
+            image_path_list,
+            url_info_list,
+            chart_info,
+            sentiment,
+            text_list=text_list,
         )
-        logger.error(f"[任务/Main] Playwright 核心框架崩溃 | 详情: 【{str(core_e)[:200]}】")
-        return error_info, False, None
+        logger.info(
+            f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]"
+        )
+        return None, True, comment_id
+
+    return _run_binance_browser_action(
+        user_data_dir,
+        debug=debug,
+        forensic_tag=f"error_{post_id}",
+        forensic_url=post_url,
+        fn=_do_comment,
+    )
 
 
 def get_auth_tokens_robust(user_data_dir, debug=False):
@@ -1184,87 +1182,77 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
     )
 
     try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=["--disable-blink-features=AutomationControlled"],
-                        viewport={"width": 1280, "height": 720},
-                        hide_automation=False,
-                        debug=debug,
-                    )
-                    page = context.pages[0] if context.pages else context.new_page()
+        with persistent_browser_session(
+            user_data_dir,
+            debug=debug,
+            args=["--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 720},
+            hide_automation=False,
+            reuse_existing_page=True,
+            install_guard=False,
+        ) as (context, page):
+            try:
+                user_api_responses = []
 
-                    user_api_responses = []
+                def on_response(res):
+                    if user_api_keyword in res.url and res.request.method != "OPTIONS":
+                        user_api_responses.append(res)
 
-                    def on_response(res):
-                        if user_api_keyword in res.url and res.request.method != "OPTIONS":
-                            user_api_responses.append(res)
+                page.on("response", on_response)
 
-                    page.on("response", on_response)
+                with page.expect_request(
+                    lambda req: api_keyword in req.url and req.method != "OPTIONS", timeout=20000
+                ) as req_info:
+                    page.goto(visit_url, wait_until="networkidle")
 
-                    with page.expect_request(
-                        lambda req: api_keyword in req.url and req.method != "OPTIONS", timeout=20000
-                    ) as req_info:
-                        page.goto(visit_url, wait_until="networkidle")
+                req = req_info.value
+                headers = req.headers
+                csrf = (headers.get("csrftoken") or "").strip() or None
+                cookie = (headers.get("cookie") or "").strip()
+                source = "request-header"
 
-                    req = req_info.value
-                    headers = req.headers
-                    csrf = (headers.get("csrftoken") or "").strip() or None
-                    cookie = (headers.get("cookie") or "").strip()
-                    source = "request-header"
+                if not cookie:
+                    raw_cookies = context.cookies("https://www.binance.com")
+                    cookie = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies).strip()
+                    source = "context-cookies(binance域)"
 
-                    if not cookie:
-                        raw_cookies = context.cookies("https://www.binance.com")
-                        cookie = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies).strip()
-                        source = "context-cookies(binance域)"
-
-                    if not cookie:
-                        logger.warning(
-                            f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 目录: <{user_data_dir}> | 请求: 【{req.method} {req.url}】"
-                        )
-                        return None, None, None
-
-                    has_p20t = "p20t=" in cookie
-                    level = logger.info if (has_p20t and csrf) else logger.warning
-                    level(
-                        f"[凭证/Auth] 凭证提取完成 | 目录: <{user_data_dir}> | 来源: <{source}> | CSRF: 【{str(csrf)[:8]}...】 "
-                        f"| Cookie长度: 【{len(cookie)}】 | 含核心 p20t: 【{has_p20t}】"
-                    )
-
-                    user_data = None
-                    for res in user_api_responses:
-                        try:
-                            if res.ok:
-                                json_body = res.json()
-                                if json_body and json_body.get("success"):
-                                    user_data = json_body.get("data")
-                                    logger.info(
-                                        f"[凭证/Auth] 成功捕获用户信息 | 目录: <{user_data_dir}> | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】"
-                                    )
-                                    break
-                        except Exception as e:
-                            logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略): {e}")
-
-                    return cookie, csrf, user_data
-
-                except PlaywrightTimeoutError:
+                if not cookie:
                     logger.warning(
-                        f"[凭证/Auth] 提取失败：20s 内未捕获到目标接口 <{api_keyword}> | 目录: <{user_data_dir}>"
+                        f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 目录: <{user_data_dir}> | 请求: 【{req.method} {req.url}】"
                     )
                     return None, None, None
-                except Exception as e:
-                    logger.error(f"[凭证/Auth] 提取过程发生未预期异常 | 目录: <{user_data_dir}> | 详情: 【{e}】")
-                    return None, None, None
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
+
+                has_p20t = "p20t=" in cookie
+                level = logger.info if (has_p20t and csrf) else logger.warning
+                level(
+                    f"[凭证/Auth] 凭证提取完成 | 目录: <{user_data_dir}> | 来源: <{source}> | CSRF: 【{str(csrf)[:8]}...】 "
+                    f"| Cookie长度: 【{len(cookie)}】 | 含核心 p20t: 【{has_p20t}】"
+                )
+
+                user_data = None
+                for res in user_api_responses:
+                    try:
+                        if res.ok:
+                            json_body = res.json()
+                            if json_body and json_body.get("success"):
+                                user_data = json_body.get("data")
+                                logger.info(
+                                    f"[凭证/Auth] 成功捕获用户信息 | 目录: <{user_data_dir}> | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】"
+                                )
+                                break
+                    except Exception as e:
+                        logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略): {e}")
+
+                return cookie, csrf, user_data
+
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    f"[凭证/Auth] 提取失败：20s 内未捕获到目标接口 <{api_keyword}> | 目录: <{user_data_dir}>"
+                )
+                return None, None, None
+            except Exception as e:
+                logger.error(f"[凭证/Auth] 提取过程发生未预期异常 | 目录: <{user_data_dir}> | 详情: 【{e}】")
+                return None, None, None
     except UserDataDirLockTimeoutError as lock_e:
         logger.error(f"[凭证/Auth] 等待 user_data_dir 锁超时，放弃提取 | 目录: <{user_data_dir}> | 详情: 【{lock_e}】")
         return None, None, None
@@ -1274,32 +1262,4 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
 #                                   启动入口
 # ==============================================================================
 if __name__ == "__main__":
-    # 其他可选入口（按需取消注释）：
-    # login_and_save_session()
     open_browser_for_manual_use(USER_DATA_DIR)
-    # cookies, csrf, udata = get_auth_tokens_robust(USER_DATA_DIR)
-
-    test_content = (
-        "$BTC \n\n交易所的估值天花板，正在被真实的线下消费捅破。\n\n"
-        "何一确认：币安支付现已接入日本全国 PayPay 商户。这不是小圈子里的链上自嗨，而是把加密支付直接接进了主流线下商业网络。\n\n"
-        "多数人看 BNB，眼光始终停留在手续费折扣和打新挖矿。但当它跳出交易所围墙、切入真实世界的支付场景时，流动性就不再只是投机筹码，而是有了实体刚需做托底。\n\n"
-        "靠发预告撑不起长线，能在街头实体里跑通闭环的生态，基本盘只会越来越硬。"
-    )
-
-    target_chart = {"coin": "BTC", "bridge": "USDT", "type": "future"}
-    test_links = [{"text": "更多行情", "url": "https://www.binance.com"}]
-    test_images = [r"E:\chrome\1759239193.png"]
-
-    err, success, p_id = create_binance_post(
-        content=test_content,
-        image_path_list=test_images,
-        url_info_list=test_links,
-        chart_info=target_chart,
-        user_data_dir=USER_DATA_DIR,
-        debug=True,
-    )
-
-    if success:
-        logger.info(f"\n[结果/Final] 🎉 ======== 带图表发帖任务成功 ======== | 帖子ID: 【{p_id}】")
-    else:
-        logger.error(f"\n[结果/Final] ❌ ======== 带图表发帖任务失败 ======== | 错误原因:\n{err}")

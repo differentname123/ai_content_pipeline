@@ -19,7 +19,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import expect, sync_playwright
+from playwright.sync_api import expect
 
 from common.common_utils import get_config, resolve_session_dir, setup_logger
 from platforms.playwright_base import (
@@ -29,9 +29,7 @@ from platforms.playwright_base import (
     STABLE_DESKTOP_FINGERPRINT_ARGS,
     TYPE_CHUNK_SIZE,
     TYPE_DELAY_MS,
-    USER_DATA_LOCK_TIMEOUT_SEC,
     BusinessErrorException,
-    PageCrashedException,
     UserDataDirLockTimeoutError,
     _alert_failure_scene,
     _BaseApiWatcher,
@@ -41,18 +39,15 @@ from platforms.playwright_base import (
     _forensics,
     _hit_test,
     _interact_fallback_locators,
-    _launch_persistent,
     _normalize_text_list,
     _parse_api_json,
     _pick_trusted_send_button,
     _robust_click,
     _type_body,
     _type_text_list,
-    _user_data_dir_lock,
     check_for_crash,
-    clean_browser_cache,
-    install_overlay_guard,
     open_browser_for_manual_use as _base_open_browser_for_manual_use,
+    persistent_browser_session,
     report_guard_hits,
 )
 
@@ -225,47 +220,6 @@ def _detect_okx_auth_error(page, wait_ms=3000):
             pass
         return _check_url_or_notice()
     return None
-
-
-def _open_okx_page_and_check_auth(
-    context,
-    url,
-    nav_desc,
-    extra_init_script=None,
-    page_label="主页",
-    log_prefix="[任务]",
-):
-    """在持久化上下文中打开目标页面、安装守卫并校验登录态，返回 (page, err_msg_or_none)。"""
-    context.set_default_timeout(60000)
-    context.set_default_navigation_timeout(60000)
-
-    page = context.new_page()
-    for old_page in context.pages:
-        if old_page != page:
-            try:
-                old_page.close()
-            except Exception:
-                pass
-    page.bring_to_front()
-
-    install_overlay_guard(page)
-    if extra_init_script:
-        page.add_init_script(extra_init_script)
-
-    response = page.goto(url, timeout=60000, wait_until="domcontentloaded")
-    _dismiss_overlays(page, aggressive=False, desc=nav_desc)
-    report_guard_hits(page, nav_desc)
-
-    if response and response.status >= 400:
-        return page, f"OKX {page_label}加载异常 (HTTP {response.status})"
-
-    auth_err = _detect_okx_auth_error(page, wait_ms=3000)
-    if auth_err:
-        logger.error(f"{log_prefix} {auth_err}")
-        return page, auth_err
-
-    check_for_crash(page)
-    return page, None
 
 
 # ==============================================================================
@@ -1070,6 +1024,93 @@ def _submit_post(
     )
 
 
+def _navigate_okx_and_check_auth(
+    page,
+    url,
+    nav_desc,
+    page_label="主页",
+    log_prefix="[任务]",
+):
+    """在已初始化好的页面上导航至目标 OKX URL 并校验登录态，返回 err_msg_or_none。"""
+    response = page.goto(url, timeout=60000, wait_until="domcontentloaded")
+    _dismiss_overlays(page, aggressive=False, desc=nav_desc)
+    report_guard_hits(page, nav_desc)
+
+    if response and response.status >= 400:
+        return f"OKX {page_label}加载异常 (HTTP {response.status})"
+
+    auth_err = _detect_okx_auth_error(page, wait_ms=3000)
+    if auth_err:
+        logger.error(f"{log_prefix} {auth_err}")
+        return auth_err
+
+    check_for_crash(page)
+    return None
+
+
+def _run_okx_browser_action(
+    user_data_dir,
+    *,
+    debug=False,
+    url=OKX_ORBIT_URL,
+    nav_desc="orbit-nav",
+    page_label="星球主页",
+    log_prefix="[任务/Main]",
+    forensic_tag="post_error",
+    extra_init_script=None,
+    fn=None,
+    default_extra=None,
+):
+    """统一 OKX 持久化浏览器动作封装（对齐指纹 + 锁 + 导航登录校验 + 故障取证）。"""
+    launch_opts = _build_okx_launch_options(debug=debug)
+
+    def _err_ret(msg):
+        if default_extra is not None:
+            return msg, False, default_extra() if callable(default_extra) else default_extra
+        return msg, False, None
+
+    try:
+        with persistent_browser_session(
+            user_data_dir,
+            debug=debug,
+            args=launch_opts["args"],
+            viewport=launch_opts["viewport"],
+            install_guard=True,
+            extra_init_script=extra_init_script,
+        ) as (context, page):
+            try:
+                pre_err = _navigate_okx_and_check_auth(
+                    page,
+                    url,
+                    nav_desc=nav_desc,
+                    page_label=page_label,
+                    log_prefix=log_prefix,
+                )
+                if pre_err:
+                    return _err_ret(pre_err)
+                return fn(context, page)
+            except BusinessErrorException as biz_e:
+                error_info = f"[业务拦截] {biz_e}"
+                logger.error(f"{log_prefix} 操作被服务端业务规则阻断 | 原因: 【{error_info}】")
+                return _err_ret(error_info)
+            except Exception as e:
+                error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                try:
+                    _forensics(page, forensic_tag, {"url": url, "error": error_info[:2000]})
+                except Exception:
+                    pass
+                _alert_failure_scene(error_info)
+                return _err_ret(error_info)
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"{log_prefix} {error_info}")
+        return _err_ret(error_info)
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return _err_ret(error_info)
+
+
 # ==============================================================================
 #                              主控入口函数 (发帖 / 评论 / 人工接管)
 # ==============================================================================
@@ -1104,81 +1145,35 @@ def create_okx_post(
         f"| 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    launch_opts = _build_okx_launch_options(debug=debug)
+    def _do_post(_context, page):
+        try:
+            editor_container = _locate_post_creator(page)
+        except Exception as e:
+            return f"无法定位 OKX 星球发帖区: {e}", False, None
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=launch_opts["args"],
-                        viewport=launch_opts["viewport"],
-                        debug=debug,
-                    )
-                    page, pre_err = _open_okx_page_and_check_auth(
-                        context,
-                        OKX_ORBIT_URL,
-                        nav_desc="orbit-nav",
-                        page_label="星球主页",
-                        log_prefix="[任务/Main]",
-                    )
-                    if pre_err:
-                        return pre_err, False, None
+        post_id = _submit_post(
+            page,
+            editor_container,
+            content=content,
+            image_path_list=image_path_list,
+            text_list=text_list,
+            add_hot_tag=add_hot_tag,
+            add_position=add_position,
+        )
 
-                    try:
-                        editor_container = _locate_post_creator(page)
-                    except Exception as e:
-                        return f"无法定位 OKX 星球发帖区: {e}", False, None
+        logger.info(f"[任务/Main] OKX 星球帖子发布成功 | 帖子ID(contentId): 【{post_id}】 | 结果: [Success]")
+        return None, True, post_id
 
-                    post_id = _submit_post(
-                        page,
-                        editor_container,
-                        content=content,
-                        image_path_list=image_path_list,
-                        text_list=text_list,
-                        add_hot_tag=add_hot_tag,
-                        add_position=add_position,
-                    )
-
-                    logger.info(f"[任务/Main] OKX 星球帖子发布成功 | 帖子ID(contentId): 【{post_id}】 | 结果: [Success]")
-                    return None, True, post_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Main] 发帖被服务端业务规则阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
-                        try:
-                            _forensics(
-                                context.pages[0], "post_error", {"url": OKX_ORBIT_URL, "error": error_info[:2000]}
-                            )
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Main] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+    return _run_okx_browser_action(
+        user_data_dir,
+        debug=debug,
+        url=OKX_ORBIT_URL,
+        nav_desc="orbit-nav",
+        page_label="星球主页",
+        log_prefix="[任务/Main]",
+        forensic_tag="post_error",
+        fn=_do_post,
+    )
 
 
 def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=USER_DATA_DIR, debug=True):
@@ -1202,116 +1197,68 @@ def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=U
         f"| 评论字数: 【{len(content)}字】 | 是否点赞: 【{like}】 | 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    launch_opts = _build_okx_launch_options(debug=debug)
-
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=launch_opts["args"],
-                        viewport=launch_opts["viewport"],
-                        debug=debug,
-                    )
-                    page, pre_err = _open_okx_page_and_check_auth(
-                        context,
-                        target_post_url,
-                        nav_desc="comment-nav",
-                        page_label="帖子详情页",
-                        log_prefix="[任务/Comment]",
-                    )
-                    if pre_err:
-                        return pre_err, False, None
-
-                    if like:
+    def _do_comment(_context, page):
+        if like:
+            try:
+                already_liked = page.locator(
+                    'i[aria-label="取消点赞"], i.okx-trading-like-filled, i[class*="liked-"]'
+                ).first
+                if already_liked.count() > 0 and already_liked.is_visible(timeout=1500):
+                    logger.info("[点赞/Like] 目标帖子已处于点赞状态(检测到「取消点赞」图标)，无需重复点击")
+                else:
+                    like_icon_cands = [
+                        page.locator('i[aria-label="点赞"]').first,
+                        page.locator("i.okx-trading-like:not(.okx-trading-like-filled)").first,
+                        page.locator('button:has(i[aria-label="点赞"])').first,
+                        page.locator("button:has(i.okx-trading-like)").first,
+                    ]
+                    like_target = None
+                    for c in like_icon_cands:
                         try:
-                            already_liked = page.locator(
-                                'i[aria-label="取消点赞"], i.okx-trading-like-filled, i[class*="liked-"]'
-                            ).first
-                            if already_liked.count() > 0 and already_liked.is_visible(timeout=1500):
-                                logger.info("[点赞/Like] 目标帖子已处于点赞状态(检测到「取消点赞」图标)，无需重复点击")
-                            else:
-                                like_icon_cands = [
-                                    page.locator('i[aria-label="点赞"]').first,
-                                    page.locator("i.okx-trading-like:not(.okx-trading-like-filled)").first,
-                                    page.locator('button:has(i[aria-label="点赞"])').first,
-                                    page.locator("button:has(i.okx-trading-like)").first,
-                                ]
-                                like_target = None
-                                for c in like_icon_cands:
-                                    try:
-                                        if c.count() > 0 and c.is_visible(timeout=1000):
-                                            like_target = c
-                                            break
-                                    except Exception:
-                                        continue
+                            if c.count() > 0 and c.is_visible(timeout=1000):
+                                like_target = c
+                                break
+                        except Exception:
+                            continue
 
-                                if like_target:
-                                    try:
-                                        like_target.scroll_into_view_if_needed(timeout=2000)
-                                    except Exception:
-                                        pass
-                                    page.wait_for_timeout(200)
-                                    _robust_click(like_target)
-                                    page.wait_for_timeout(500)
-                                    logger.info("[点赞/Like] 帖子点赞操作执行完成 | 结果: [Success]")
-                                else:
-                                    logger.warning("[点赞/Like] 未能匹配到帖子点赞按钮，跳过点赞")
-                        except Exception as like_e:
-                            logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
-
-                    if not content:
-                        logger.info("[任务/Comment] 仅点赞模式执行完毕 | 结果: [Success]")
-                        return None, True, "LIKE_ONLY"
-
-                    try:
-                        comment_container = _locate_comment_box(page)
-                    except Exception as e:
-                        return f"无法定位 OKX 星球评论区: {e}", False, None
-
-                    comment_id = _submit_comment(page, comment_container, content=content)
-
-                    logger.info(f"[任务/Comment] OKX 星球评论发布成功 | 评论ID(commentId): 【{comment_id}】 | 结果: [Success]")
-                    return None, True, comment_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Comment] 评论被服务端业务规则阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
+                    if like_target:
                         try:
-                            _forensics(
-                                context.pages[0],
-                                "comment_error",
-                                {"url": target_post_url, "error": error_info[:2000]},
-                            )
+                            like_target.scroll_into_view_if_needed(timeout=2000)
                         except Exception:
                             pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
+                        page.wait_for_timeout(200)
+                        _robust_click(like_target)
+                        page.wait_for_timeout(500)
+                        logger.info("[点赞/Like] 帖子点赞操作执行完成 | 结果: [Success]")
+                    else:
+                        logger.warning("[点赞/Like] 未能匹配到帖子点赞按钮，跳过点赞")
+            except Exception as like_e:
+                logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
 
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
+        if not content:
+            logger.info("[任务/Comment] 仅点赞模式执行完毕 | 结果: [Success]")
+            return None, True, "LIKE_ONLY"
 
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Comment] {error_info}")
-        return error_info, False, None
+        try:
+            comment_container = _locate_comment_box(page)
+        except Exception as e:
+            return f"无法定位 OKX 星球评论区: {e}", False, None
 
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+        comment_id = _submit_comment(page, comment_container, content=content)
+
+        logger.info(f"[任务/Comment] OKX 星球评论发布成功 | 评论ID(commentId): 【{comment_id}】 | 结果: [Success]")
+        return None, True, comment_id
+
+    return _run_okx_browser_action(
+        user_data_dir,
+        debug=debug,
+        url=target_post_url,
+        nav_desc="comment-nav",
+        page_label="帖子详情页",
+        log_prefix="[任务/Comment]",
+        forensic_tag="comment_error",
+        fn=_do_comment,
+    )
 
 
 def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url=OKX_ORBIT_URL):
@@ -1682,100 +1629,57 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
         f"| 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    launch_opts = _build_okx_launch_options(debug=debug)
-
     success_ids = []
     failed_ids = {}
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=launch_opts["args"],
-                        viewport=launch_opts["viewport"],
-                        debug=debug,
-                    )
-                    page, pre_err = _open_okx_page_and_check_auth(
-                        context,
-                        OKX_ORBIT_URL,
-                        nav_desc="delete-nav",
-                        extra_init_script=_DELETE_SIGN_HOOK_INIT_JS,
-                        page_label="星球主页",
-                        log_prefix="[任务/Delete]",
-                    )
-                    if pre_err:
-                        return pre_err, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+    def _do_delete(_context, page):
+        for wait_round in range(12):
+            page.wait_for_timeout(500)
+            try:
+                ready = page.evaluate("() => Boolean(window.__okx_priv_key)")
+                if ready:
+                    break
+                if wait_round == 3:
+                    page.mouse.wheel(0, 300)
+            except Exception:
+                pass
 
-                    for wait_round in range(12):
-                        page.wait_for_timeout(500)
-                        try:
-                            ready = page.evaluate("() => Boolean(window.__okx_priv_key)")
-                            if ready:
-                                break
-                            if wait_round == 3:
-                                page.mouse.wheel(0, 300)
-                        except Exception:
-                            pass
+        total = len(clean_id_list)
+        for idx, post_id in enumerate(clean_id_list, start=1):
+            logger.info(f"[删除/Delete] 正在触发第 【{idx}/{total}】 条删帖请求 | contentId: 【{post_id}】")
+            ok, err_detail = _delete_single_post_by_api(page, post_id, seq=30 + idx)
+            if ok:
+                success_ids.append(post_id)
+            else:
+                failed_ids[post_id] = err_detail
 
-                    total = len(clean_id_list)
-                    for idx, post_id in enumerate(clean_id_list, start=1):
-                        logger.info(f"[删除/Delete] 正在触发第 【{idx}/{total}】 条删帖请求 | contentId: 【{post_id}】")
-                        ok, err_detail = _delete_single_post_by_api(page, post_id, seq=30 + idx)
-                        if ok:
-                            success_ids.append(post_id)
-                        else:
-                            failed_ids[post_id] = err_detail
+            if idx < total and interval_sec > 0:
+                page.wait_for_timeout(int(interval_sec * 1000))
 
-                        if idx < total and interval_sec > 0:
-                            page.wait_for_timeout(int(interval_sec * 1000))
+        all_success = len(failed_ids) == 0
+        summary = {"success_ids": success_ids, "failed_ids": failed_ids}
 
-                    all_success = len(failed_ids) == 0
-                    summary = {"success_ids": success_ids, "failed_ids": failed_ids}
+        if all_success:
+            logger.info(f"[任务/Delete] 批量删帖全部完成 | 成功: 【{len(success_ids)}/{total}】 | 结果: [Success]")
+            return None, True, summary
+        err_summary = (
+            f"部分或全部帖子删除失败（成功 {len(success_ids)} 条，失败 {len(failed_ids)} 条）: {failed_ids}"
+        )
+        logger.warning(f"[任务/Delete] {err_summary}")
+        return err_summary, False, summary
 
-                    if all_success:
-                        logger.info(f"[任务/Delete] 批量删帖全部完成 | 成功: 【{len(success_ids)}/{total}】 | 结果: [Success]")
-                        return None, True, summary
-                    else:
-                        err_summary = (
-                            f"部分或全部帖子删除失败（成功 {len(success_ids)} 条，失败 {len(failed_ids)} 条）: {failed_ids}"
-                        )
-                        logger.warning(f"[任务/Delete] {err_summary}")
-                        return err_summary, False, summary
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
-                        try:
-                            _forensics(
-                                context.pages[0],
-                                "delete_error",
-                                {"url": OKX_ORBIT_URL, "error": error_info[:2000], "failed_ids": failed_ids},
-                            )
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Delete] {error_info}")
-        return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+    return _run_okx_browser_action(
+        user_data_dir,
+        debug=debug,
+        url=OKX_ORBIT_URL,
+        nav_desc="delete-nav",
+        page_label="星球主页",
+        log_prefix="[任务/Delete]",
+        forensic_tag="delete_error",
+        extra_init_script=_DELETE_SIGN_HOOK_INIT_JS,
+        fn=_do_delete,
+        default_extra=lambda: {"success_ids": success_ids, "failed_ids": failed_ids},
+    )
 
 
 # ==============================================================================

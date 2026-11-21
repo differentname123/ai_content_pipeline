@@ -7,6 +7,7 @@
 - 生成评论并盲测打分归 `comment_generator.py`（纯查库按 **15 条/波** 循环处理直至库内待评合格帖 100% 清零，可单独运行）；
 - 本文件仅作为薄编排层，顺序调用「1A 拉取落库 -> 1B 循环清零生成」，方便日常直接右键一键常驻挂机。
 """
+import argparse
 import json
 import random
 import sys
@@ -19,6 +20,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from common.daemon import run_daemon_loop
 from x_growth.comment_generator import generate_all_pending_comments
 from x_growth.growth_config import (
     COLLECTOR_DEFAULTS,
@@ -108,8 +110,9 @@ def run_comment_pipeline_daemon(
     user_data_dir: str = PIPELINE_SCHEDULE_CONFIG["user_data_dir"],
     interval_seconds: Optional[int] = None,
     jitter_seconds: Optional[Tuple[int, int]] = None,
+    max_rounds: int = 0,
 ) -> None:
-    """常驻定时串联守护：每轮先拉帖入库，再按 15 条/波把库内合格待评帖 100% 清零生成完。"""
+    """常驻定时串联守护：每轮先拉帖入库，再按波次把库内合格待评帖 100% 清零生成完。"""
     logger = get_growth_logger()
     base_interval = max(60, int(interval_seconds or PIPELINE_SCHEDULE_CONFIG.get("interval_seconds", 3600)))
     raw_jitter = jitter_seconds if jitter_seconds is not None else PIPELINE_SCHEDULE_CONFIG.get("jitter_seconds", (120, 600))
@@ -129,67 +132,78 @@ def run_comment_pipeline_daemon(
 
     cooldown_sec = max(base_interval, int(PIPELINE_SCHEDULE_CONFIG.get("risk_cooldown_seconds", 21600)))
 
-    round_no = 0
-    while True:
-        round_no += 1
+    def _step(round_no: int) -> Dict[str, Any]:
         logger.info(f"========== [CommentPipeline/轮次 #{round_no}] 开始执行 ==========")
         sleep_base = base_interval
-        try:
-            res = run_comment_pipeline(session_path, force_rescore=False)
-            st = str(res.get("status") or "ok")
-            if st != "ok":
-                if st in ("locked_challenge", "suspended", "not_logged_in"):
-                    sleep_base = cooldown_sec
-                elif st == "empty_capture":
-                    sleep_base = min(base_interval, 600)
-                logger.error(
-                    f"⚠️ [CommentPipeline/轮次 #{round_no} 待处理(冷却{sleep_base}s)] status={st} | {res.get('account_warning')}"
-                )
-            else:
-                top_preview = [
-                    f"{it['author']}({it['language']}|{it['best_score']}分): {it['best_comment']}"
-                    for it in (res.get("items") or [])[:3]
-                ]
-                logger.info(
-                    f"✅ [CommentPipeline/轮次 #{round_no} 完成] 顺路入库={res.get('browsed_posts_saved', 0)}条"
-                    f"(新{res.get('browsed_new_in_db', 0)}) | 生成波次={res.get('waves_executed', 0)}波 | "
-                    f"清零合格帖={res.get('target_posts_selected', 0)}条 -> 新增可发评论={res.get('newly_scored_posts', 0)}条 | "
-                    f"耗时={res.get('elapsed_seconds', 0)}s"
-                    + (f" | 预览={top_preview}" if top_preview else "")
-                )
-        except KeyboardInterrupt:
-            logger.info("[CommentPipeline/常驻任务退出] 收到手动中断信号，安全停止。")
-            break
-        except Exception as exc:
-            logger.exception(f"❌ [CommentPipeline/轮次 #{round_no} 异常] 将在下轮重试: {exc}")
+        res = run_comment_pipeline(session_path, force_rescore=False)
+        st = str(res.get("status") or "ok")
+        if st != "ok":
+            if st in ("locked_challenge", "suspended", "not_logged_in"):
+                sleep_base = cooldown_sec
+            elif st == "empty_capture":
+                sleep_base = min(base_interval, 600)
+            logger.error(
+                f"⚠️ [CommentPipeline/轮次 #{round_no} 待处理(冷却{sleep_base}s)] status={st} | {res.get('account_warning')}"
+            )
+        else:
+            top_preview = [
+                f"{it['author']}({it['language']}|{it['best_score']}分): {it['best_comment']}"
+                for it in (res.get("items") or [])[:3]
+            ]
+            logger.info(
+                f"✅ [CommentPipeline/轮次 #{round_no} 完成] 顺路入库={res.get('browsed_posts_saved', 0)}条"
+                f"(新{res.get('browsed_new_in_db', 0)}) | 生成波次={res.get('waves_executed', 0)}波 | "
+                f"清零合格帖={res.get('target_posts_selected', 0)}条 -> 新增可发评论={res.get('newly_scored_posts', 0)}条 | "
+                f"耗时={res.get('elapsed_seconds', 0)}s"
+                + (f" | 预览={top_preview}" if top_preview else "")
+            )
 
         sleep_sec = sleep_base + (random.randint(j_low, j_high) if j_high > 0 else 0)
         next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"💤 [CommentPipeline/常驻休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
-        try:
-            time.sleep(sleep_sec)
-        except KeyboardInterrupt:
-            logger.info("[CommentPipeline/常驻任务退出] 休眠期间收到中断信号，安全停止。")
-            break
+        return {"next_sleep_seconds": sleep_sec}
+
+    run_daemon_loop(
+        _step,
+        interval_seconds=base_interval,
+        additive_jitter_range=(j_low, j_high),
+        name="CommentPipeline",
+        logger_obj=logger,
+        max_rounds=max_rounds,
+    )
 
 
-if __name__ == "__main__":
+def main(argv: Optional[Sequence[str]] = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
-    target_dir = str(PIPELINE_SCHEDULE_CONFIG["user_data_dir"])
-    if PIPELINE_SCHEDULE_CONFIG.get("continuous_loop", True):
-        run_comment_pipeline_daemon(
-            user_data_dir=target_dir,
-            interval_seconds=PIPELINE_SCHEDULE_CONFIG.get("interval_seconds", 3600),
-            jitter_seconds=PIPELINE_SCHEDULE_CONFIG.get("jitter_seconds", (120, 600)),
-        )
-    else:
+    parser = argparse.ArgumentParser(description="X 平台被动采集与神评生成串联流水线")
+    parser.add_argument("--once", action="store_true", help="仅执行单轮采集 + 生成后退出（不进入常驻循环）。")
+    parser.add_argument("--interval-seconds", type=int, default=None, help="自定义常驻轮询基础间隔秒数。")
+    parser.add_argument("--user-data-dir", default=None, help="采集账号浏览器会话目录（严禁传入 x_myself）。")
+    parser.add_argument("--force-rescore", action="store_true", help="单轮运行时强制重评已有分数的帖子。")
+    args = parser.parse_args(argv)
+
+    target_dir = str(args.user_data_dir or PIPELINE_SCHEDULE_CONFIG["user_data_dir"])
+    run_once = args.once or (not PIPELINE_SCHEDULE_CONFIG.get("continuous_loop", True))
+    if run_once:
         res = run_comment_pipeline(
             user_data_dir=target_dir,
-            force_rescore=bool(PIPELINE_SCHEDULE_CONFIG.get("force_rescore", False)),
+            force_rescore=bool(args.force_rescore or PIPELINE_SCHEDULE_CONFIG.get("force_rescore", False)),
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+
+    run_comment_pipeline_daemon(
+        user_data_dir=target_dir,
+        interval_seconds=args.interval_seconds or PIPELINE_SCHEDULE_CONFIG.get("interval_seconds", 3600),
+        jitter_seconds=PIPELINE_SCHEDULE_CONFIG.get("jitter_seconds", (120, 600)),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

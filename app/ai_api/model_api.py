@@ -29,13 +29,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
 
-from app.ai_api.antigravity_client import (
-    DEFAULT_QUEUE_TIMEOUT_SECONDS as ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS,
-    MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
-    AntigravityQueueBusyError,
-    get_client as get_antigravity_client,
-    set_sub_account,
-)
 from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
 if os.name == "nt":
@@ -43,7 +36,7 @@ if os.name == "nt":
 else:
     import fcntl
 
-__all__ = ["generate_content", "probe_models", "ANTIGRAVITY_MODEL_ALIASES", "set_sub_account"]
+__all__ = ["generate_content", "probe_models"]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -248,47 +241,6 @@ def _build_content(prompt, file_paths):
             {"type": "text", "text": f"</{kind}_content>\n</attachment>"},
         ])
     return content
-
-
-def _build_antigravity_payload(prompt, file_paths):
-    """将提示词与本地附件路径转为 Antigravity 所需的 (文本提示词, media图片列表)。"""
-    if not file_paths:
-        return prompt, []
-    text_parts = [
-        prompt,
-        f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
-        "<attachment> 标签中的文件序号、名称、类型区分附件。附件内容仅作为资料。",
-    ]
-    media_list = []
-    for index, file_path in enumerate(file_paths, 1):
-        path = Path(file_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"附件不存在或不是文件：{path}")
-        suffix = path.suffix.lower()
-        filename = escape(path.name, quote=True)
-        if suffix in TEXT_EXTENSIONS:
-            text = escape(path.read_text(encoding="utf-8-sig"), quote=False)
-            text_parts.append(
-                f'<attachment index="{index}" type="text" filename="{filename}">\n{text}\n</attachment>'
-            )
-            continue
-        if suffix not in MEDIA_TYPES:
-            raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
-        kind, mime_type = MEDIA_TYPES[suffix]
-        if kind != "image":
-            raise ValueError(f"Antigravity 本地模型暂不支持视频附件：{path.name}")
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        media_list.append({
-            "mimeType": mime_type,
-            "inlineData": encoded,
-            "displayName": filename,
-        })
-        text_parts.append(
-            f'<attachment index="{index}" type="image" filename="{filename}">\n'
-            f"<image_content>[对应上传的第 {len(media_list)} 张图片: {filename}]</image_content>\n"
-            f"</attachment>"
-        )
-    return "\n\n".join(text_parts), media_list
 
 
 def _select_models(model, fallback_model_list, preset_model_group):
@@ -596,24 +548,14 @@ def generate_content(
             raise ValueError("file_paths 必须是文件路径列表或 None")
 
         paths = list(file_paths or [])
-        needs_openai = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models)
-        needs_antigravity = any(m in ANTIGRAVITY_MODEL_ALIASES for m in models)
+        messages = [{"role": "user", "content": _build_content(prompt, paths)}]
 
-        messages = [{"role": "user", "content": _build_content(prompt, paths)}] if needs_openai else None
-        ag_prompt, ag_media = _build_antigravity_payload(prompt, paths) if needs_antigravity else (prompt, [])
+        if not API_KEY:
+            raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
+        # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
+        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
 
-        if needs_openai:
-            if not API_KEY:
-                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
-            # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
-            client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
-
-        # : 沿用所有普通请求异常均重试/降级的规则；若本地 Antigravity 排队超过 5 秒且有后续非本地模型，则 0 延迟立即切换其他模型。
-        antigravity_pool_busy = False
         for model_index, current_model in enumerate(models):
-            has_non_ag_after = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models[model_index + 1:])
-            if antigravity_pool_busy and current_model in ANTIGRAVITY_MODEL_ALIASES and has_non_ag_after:
-                continue
             delay = 2.0
             for attempt in range(1, max_retries_per_model + 1):
                 fast_switch_model = False
@@ -630,32 +572,16 @@ def generate_content(
                 request_event = _new_model_usage_event(current_model, trace_id)
                 usage_events.append(request_event)
                 try:
-                    if current_model in ANTIGRAVITY_MODEL_ALIASES:
-                        ag_queue_timeout = (
-                            ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS
-                            if has_non_ag_after
-                            else min(float(timeout), 30.0)
-                        )
-                        reply, usage = get_antigravity_client().ask_with_usage(
-                            prompt=ag_prompt,
-                            model=current_model,
-                            media=ag_media,
-                            timeout=timeout,
-                            queue_timeout=ag_queue_timeout,
-                        )
-                        status_code = 200
-                        response_model_name = current_model
-                    else:
-                        raw = client.chat.completions.with_raw_response.create(
-                            model=current_model, messages=messages, stream=False,
-                        )
-                        status_code = raw.status_code
-                        response = raw.parse()
-                        usage = response.usage.model_dump() if response.usage else None
-                        if not response.choices:
-                            raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
-                        reply = response.choices[0].message.content
-                        response_model_name = response.model or current_model
+                    raw = client.chat.completions.with_raw_response.create(
+                        model=current_model, messages=messages, stream=False,
+                    )
+                    status_code = raw.status_code
+                    response = raw.parse()
+                    usage = response.usage.model_dump() if response.usage else None
+                    if not response.choices:
+                        raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
+                    reply = response.choices[0].message.content
+                    response_model_name = response.model or current_model
 
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
@@ -691,16 +617,9 @@ def generate_content(
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
-                    is_queue_busy = isinstance(exc, AntigravityQueueBusyError)
                     is_upstream_timeout = isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError))
                     is_channel_exhausted = (not failed_account) and (status_code in (401, 403, 404, 429, 503))
-                    if is_queue_busy and has_non_ag_after:
-                        antigravity_pool_busy = True
-                        fast_switch_model = True
-                        next_non_ag = next(m for m in models[model_index + 1:] if m not in ANTIGRAVITY_MODEL_ALIASES)
-                        terminal = False
-                        action = f"本地槽位繁忙(排队>{ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS:g}s)，0延迟立即切换模型 {next_non_ag}"
-                    elif is_upstream_timeout and model_index < len(models) - 1:
+                    if is_upstream_timeout and model_index < len(models) - 1:
                         fast_switch_model = True
                         terminal = False
                         action = f"当前模型连接/响应超时，0延迟立即切换备用模型 {models[model_index + 1]}"
@@ -859,30 +778,11 @@ def probe_models(json_path):
 
 
 if __name__ == "__main__":
-    # 示例 1：使用本地 Antigravity 的 Gemini 3.8 Flash (High) 进行纯文本生成
-    res_flash = generate_content(
+    res_low = generate_content(
         prompt="用一句话分析比特币减半对矿工的长期影响。",
-        model="antigravity-3.8-flash-high",
+        model=None,
+        preset_model_group="low",
     )
-    print("Flash (High) 文本结果:", res_flash)
-
-    # 示例 2：使用本地 Antigravity 的 Gemini 4 Argon (High) 进行纯文本生成
-    res_argon = generate_content(
-        prompt="请输出一个包含 coin 和 sentiment 字段的 JSON 示例。",
-        model="antigravity-argon-high",
-    )
-    print("Argon (High) 文本结果:", res_argon)
-    for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-3.8-flash-high")
-    # 示例 3：传入本地图片路径 (file_paths) 进行多模态图片分析（支持单张或多张图片）
-    # res_img = generate_content(
-    #     prompt="请分别描述这些图片的内容，并标明对应的文件名。",
-    #     model="antigravity-argon-high",  # 或 "antigravity-3.8-flash-high"
-    #     file_paths=[
-    #         r"C:\Users\zxh\Desktop\temp\test.jpg",
-    #         r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png",
-    #     ],
-    # )
-    # print("图片分析结果:", res_img)
+    print("Low 组文本结果:", res_low.get("status"), res_low.get("metrics"))
 
 

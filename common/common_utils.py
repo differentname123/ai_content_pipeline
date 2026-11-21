@@ -622,7 +622,7 @@ ALL_POST_SOURCES = (
     PLATFORM_HACKERNEWS,
 )
 
-BINANCE_ACCOUNTS = ["myself", "qiqi", "ruru"]
+BINANCE_ACCOUNTS = ["myself", "qiqi"]
 # OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
 OKX_ACCOUNTS = ["myself", "nana"]
 
@@ -726,6 +726,64 @@ def is_self_okx_post(content_data: dict) -> bool:
         or ""
     ).strip()
     return (author_id in SELF_OKX_AUTHOR_IDS) or (nick_name in SELF_OKX_AUTHOR_NAMES)
+
+
+def get_self_x_handles() -> set:
+    """读取 config/config.json 中配置的己方 X 账号 handle 集合（小写、无 @ 前缀）。"""
+    handles = set()
+    try:
+        x_accounts = get_config("x_accounts", default={}) or {}
+        if isinstance(x_accounts, dict):
+            for info in x_accounts.values():
+                if isinstance(info, dict):
+                    sn = str(info.get("screen_name") or "").strip().lstrip("@").lower()
+                    if sn:
+                        handles.add(sn)
+        for cfg_key in ("x_myself_screen_name", "x_xiaohao_screen_name", "x_dahao_screen_name"):
+            val = str(get_config(cfg_key, default="") or "").strip().lstrip("@").lower()
+            if val:
+                handles.add(val)
+    except Exception:
+        pass
+    return handles
+
+
+def is_self_x_post(raw_item: dict, extra_handles: Optional[set] = None) -> bool:
+    """判断 X 原始或标准化帖子是否属于己方配置账号。"""
+    if not isinstance(raw_item, dict):
+        return False
+    author_obj = raw_item.get("author") or {}
+    handle = str(
+        raw_item.get("screen_name")
+        or raw_item.get("username")
+        or author_obj.get("username")
+        or author_obj.get("screen_name")
+        or ""
+    ).strip().lstrip("@").lower()
+    if not handle:
+        return False
+    handles = get_self_x_handles()
+    if extra_handles:
+        handles.update(str(h).strip().lstrip("@").lower() for h in extra_handles if h)
+    return handle in handles
+
+
+def is_self_post(raw_item: dict, source: Optional[str] = None, extra_x_handles: Optional[set] = None) -> bool:
+    """跨平台统一自营矩阵账号判定（覆盖 Binance / OKX / X）。"""
+    if not isinstance(raw_item, dict):
+        return False
+    src = str(source or raw_item.get("source") or "").strip().lower()
+    if src == PLATFORM_BINANCE:
+        return is_self_binance_post(raw_item)
+    if src == PLATFORM_OKX:
+        return is_self_okx_post(raw_item)
+    if src == PLATFORM_X:
+        return is_self_x_post(raw_item, extra_handles=extra_x_handles)
+    return (
+        is_self_binance_post(raw_item)
+        or is_self_okx_post(raw_item)
+        or is_self_x_post(raw_item, extra_handles=extra_x_handles)
+    )
 
 
 def create_standard_post_schema(

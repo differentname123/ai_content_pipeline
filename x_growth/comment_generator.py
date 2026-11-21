@@ -11,12 +11,10 @@
 4. **支持独立直接运行**：在 IDE 中直接右键运行本文件，无需打开浏览器即可一次性清空库内所有待评合格帖。
 """
 import json
-import random
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -26,18 +24,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from common.daemon import run_daemon_loop
+from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
-from content_pipeline.comment_creator import calc_x_weighted_length
-from content_pipeline.llm_gateway import call_llm_json, render_prompt_template
-from content_pipeline.pipeline_db import is_video_post
-from content_pipeline.step2_comprehension import get_unified_post_text
+from common.post_utils import get_unified_post_text, is_video_post
+from common.x_text import calc_x_weighted_length
 from x_growth.growth_config import (
     AUTO_COMMENT_FIELD,
     GENERATOR_DEFAULTS,
     POST_CATEGORIES,
     POSTS_COLLECTION_NAME,
     SUPPORTED_COMMENT_LANGUAGES,
-    TZ_CN,
     X_GROWTH_PROMPT_DIR,
     format_category_list_for_prompt,
     get_configured_self_handles,
@@ -738,6 +735,7 @@ def generate_all_pending_comments(
 def run_generator_daemon(
     interval_seconds: Optional[int] = None,
     jitter_seconds: Optional[Tuple[int, int]] = None,
+    max_rounds: int = 0,
 ) -> None:
     """独立常驻查库清零循环（不开浏览器，定期将数据库内新进的合格帖全部生成并打分清零）。"""
     logger = get_growth_logger()
@@ -754,26 +752,19 @@ def run_generator_daemon(
         f"⏰ [CommentGenerator/独立常驻生成启动] 周期={base_interval}s + 抖动({j_low}~{j_high}s) | "
         f"每波={GENERATOR_DEFAULTS['wave_size']}条循环清零"
     )
-    round_no = 0
-    while True:
-        round_no += 1
-        logger.info(f"========== [CommentGenerator/轮次 #{round_no}] 开始扫描待评合格帖 ==========")
-        try:
-            generate_all_pending_comments(force_rescore=False)
-        except KeyboardInterrupt:
-            logger.info("[CommentGenerator/常驻退出] 收到手动中断信号，安全停止。")
-            break
-        except Exception as exc:
-            logger.exception(f"❌ [CommentGenerator/轮次 #{round_no} 异常] {exc}")
 
-        sleep_sec = base_interval + (random.randint(j_low, j_high) if j_high > 0 else 0)
-        next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"💤 [CommentGenerator/休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
-        try:
-            time.sleep(sleep_sec)
-        except KeyboardInterrupt:
-            logger.info("[CommentGenerator/常驻退出] 休眠期间收到中断信号，安全停止。")
-            break
+    def _step(round_no: int) -> None:
+        logger.info(f"========== [CommentGenerator/轮次 #{round_no}] 开始扫描待评合格帖 ==========")
+        generate_all_pending_comments(force_rescore=False)
+
+    run_daemon_loop(
+        _step,
+        interval_seconds=base_interval,
+        additive_jitter_range=(j_low, j_high),
+        name="CommentGenerator",
+        logger_obj=logger,
+        max_rounds=max_rounds,
+    )
 
 
 if __name__ == "__main__":

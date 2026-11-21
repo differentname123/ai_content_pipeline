@@ -32,7 +32,6 @@ from platforms.playwright_base import (
     TYPE_CHUNK_SIZE,
     USER_DATA_LOCK_TIMEOUT_SEC,
     BusinessErrorException,
-    PageCrashedException,
     UserDataDirLockTimeoutError,
     _alert_failure_scene,
     _BaseApiWatcher,
@@ -51,8 +50,8 @@ from platforms.playwright_base import (
     _user_data_dir_lock,
     check_for_crash,
     clean_browser_cache,
-    install_overlay_guard,
     open_browser_for_manual_use as _base_open_browser_for_manual_use,
+    persistent_browser_session,
     report_guard_hits,
 )
 
@@ -596,93 +595,144 @@ def _type_x_text_list(page, real_editor, valid_text_list):
 def _upload_x_images(page, editor_container, valid_images):
     """
     X 平台图片上传：
-    1. 优先通过 input[data-testid='fileInput'] 直接批量注入文件；
-    2. 后备通过点击工具栏媒体按钮触发 FileChooser 上传；
-    3. 若多图一次性注入异常，自动降级为逐张上传；
-    4. 等待缩略图 [data-testid='attachments'] 渲染并确保上传进度条结束。
+    1. 挂载 `upload.x.com` / `media/upload` 请求与完成计数监听，确认图片上传链路真实完成；
+    2. 优先通过 input[data-testid='fileInput'] 直接批量注入文件；
+    3. 后备通过点击工具栏媒体按钮触发 FileChooser 上传；
+    4. 等待全部缩略图渲染及上传进度条与网络请求结束。
     """
     if not valid_images:
         return
 
-    uploaded = False
+    media_state = {"inflight": set(), "finalize_ok": 0}
 
-    # 通道 1：直接定位 input[data-testid="fileInput"] 注入
-    file_input = editor_container.locator('input[data-testid="fileInput"], input[type="file"]').first
-    if file_input.count() == 0:
-        file_input = page.locator('input[data-testid="fileInput"], input[type="file"]').first
+    def _is_media_upload_url(url_str):
+        u = (url_str or "").lower()
+        return "upload.x.com" in u or "media/upload" in u
 
-    if file_input.count() > 0:
+    def _on_media_req(req):
         try:
-            file_input.set_input_files(valid_images, timeout=15000)
-            uploaded = True
-            logger.info(f"[编辑器/图片] 通过【input[data-testid=fileInput]】批量挂载完毕 | 数量: 【{len(valid_images)}】张")
-        except Exception as e:
-            logger.warning(f"[编辑器/图片] 批量直注失败，尝试逐张注入 | 原因: 【{str(e)[:140]}】")
-            try:
-                for img_path in valid_images:
-                    file_input.set_input_files(img_path, timeout=10000)
-                    page.wait_for_timeout(1200)
-                uploaded = True
-                logger.info(f"[编辑器/图片] 通过【input[data-testid=fileInput]】逐张挂载完毕 | 数量: 【{len(valid_images)}】张")
-            except Exception as sub_e:
-                logger.warning(f"[编辑器/图片] input 直注通道未完成，转入 FileChooser 后备通道 | 原因: 【{str(sub_e)[:140]}】")
-
-    # 通道 2：点击图片图标通过 FileChooser 注入
-    if not uploaded:
-        img_btn_cands = [
-            editor_container.locator(
-                'button[aria-label*="添加照片或视频"], button[aria-label*="Add photos or video" i], '
-                'button[aria-label*="媒体"], button[aria-label*="Media" i]'
-            ).first,
-            page.locator(
-                'button[aria-label*="添加照片或视频"], button[aria-label*="Add photos or video" i]'
-            ).first,
-        ]
-        try:
-            img_btn = _interact_fallback_locators(img_btn_cands, action="wait", timeout=5000, desc="X 上传图片按钮")
-            with page.expect_file_chooser(timeout=5000) as fc_info:
-                _robust_click(img_btn)
-            fc = fc_info.value
-            if len(valid_images) > 1 and not fc.is_multiple():
-                fc.set_files(valid_images[0])
-                page.wait_for_timeout(1200)
-                for img_path in valid_images[1:]:
-                    with page.expect_file_chooser(timeout=5000) as next_fc_info:
-                        _robust_click(img_btn)
-                    next_fc_info.value.set_files(img_path)
-                    page.wait_for_timeout(1200)
-            else:
-                fc.set_files(valid_images)
-            uploaded = True
-            logger.info(f"[编辑器/图片] 通过【FileChooser】成功提交图片 | 数量: 【{len(valid_images)}】张")
-        except Exception as fc_err:
-            logger.warning(f"[编辑器/图片] 图片上传通道全部失败，降级为纯文本发送 | 原因: 【{str(fc_err)[:150]}】")
-            return
-
-    # 等待附件预览渲染完成
-    try:
-        expect(
-            editor_container.locator(
-                '[data-testid="attachments"] img, '
-                '[data-testid="tweetPhoto"] img, '
-                'img[src^="blob:"]'
-            ).first
-        ).to_be_visible(timeout=15000)
-    except Exception:
-        pass
-
-    # 等待图片上传进度条消失（若有）
-    end_wait = time.time() + 20.0
-    while time.time() < end_wait:
-        try:
-            progress = editor_container.locator('[data-testid="attachments"] [role="progressbar"]')
-            if progress.count() == 0 or not progress.first.is_visible():
-                break
+            if _is_media_upload_url(req.url) and req.method in ("POST", "PUT"):
+                media_state["inflight"].add(id(req))
         except Exception:
-            break
-        page.wait_for_timeout(400)
+            pass
 
-    page.wait_for_timeout(1500)
+    def _on_media_done(req):
+        try:
+            media_state["inflight"].discard(id(req))
+        except Exception:
+            pass
+
+    def _on_media_resp(resp):
+        try:
+            if _is_media_upload_url(resp.url):
+                media_state["inflight"].discard(id(resp.request))
+                u = (resp.url or "").lower()
+                if resp.status in (200, 201, 202) and ("command=finalize" in u or "media/upload" in u):
+                    media_state["finalize_ok"] += 1
+        except Exception:
+            pass
+
+    page.on("request", _on_media_req)
+    page.on("requestfinished", _on_media_done)
+    page.on("requestfailed", _on_media_done)
+    page.on("response", _on_media_resp)
+
+    uploaded = False
+    try:
+        # 通道 1：直接定位 input[data-testid="fileInput"] 注入
+        file_input = editor_container.locator('input[data-testid="fileInput"], input[type="file"]').first
+        if file_input.count() == 0:
+            file_input = page.locator('input[data-testid="fileInput"], input[type="file"]').first
+
+        if file_input.count() > 0:
+            try:
+                file_input.set_input_files(valid_images, timeout=15000)
+                uploaded = True
+                logger.info(f"[编辑器/图片] 通过【input[data-testid=fileInput]】批量挂载完毕 | 数量: 【{len(valid_images)}】张")
+            except Exception as e:
+                logger.warning(f"[编辑器/图片] 批量直注失败，尝试逐张注入 | 原因: 【{str(e)[:140]}】")
+                try:
+                    for img_path in valid_images:
+                        file_input.set_input_files(img_path, timeout=10000)
+                        page.wait_for_timeout(1200)
+                    uploaded = True
+                    logger.info(f"[编辑器/图片] 通过【input[data-testid=fileInput]】逐张挂载完毕 | 数量: 【{len(valid_images)}】张")
+                except Exception as sub_e:
+                    logger.warning(f"[编辑器/图片] input 直注通道未完成，转入 FileChooser 后备通道 | 原因: 【{str(sub_e)[:140]}】")
+
+        # 通道 2：点击图片图标通过 FileChooser 注入
+        if not uploaded:
+            img_btn_cands = [
+                editor_container.locator(
+                    'button[aria-label*="添加照片或视频"], button[aria-label*="Add photos or video" i], '
+                    'button[aria-label*="媒体"], button[aria-label*="Media" i]'
+                ).first,
+                page.locator(
+                    'button[aria-label*="添加照片或视频"], button[aria-label*="Add photos or video" i]'
+                ).first,
+            ]
+            try:
+                img_btn = _interact_fallback_locators(img_btn_cands, action="wait", timeout=5000, desc="X 上传图片按钮")
+                with page.expect_file_chooser(timeout=5000) as fc_info:
+                    _robust_click(img_btn)
+                fc = fc_info.value
+                if len(valid_images) > 1 and not fc.is_multiple():
+                    fc.set_files(valid_images[0])
+                    page.wait_for_timeout(1200)
+                    for img_path in valid_images[1:]:
+                        with page.expect_file_chooser(timeout=5000) as next_fc_info:
+                            _robust_click(img_btn)
+                        next_fc_info.value.set_files(img_path)
+                        page.wait_for_timeout(1200)
+                else:
+                    fc.set_files(valid_images)
+                uploaded = True
+                logger.info(f"[编辑器/图片] 通过【FileChooser】成功提交图片 | 数量: 【{len(valid_images)}】张")
+            except Exception as fc_err:
+                logger.warning(f"[编辑器/图片] 图片上传通道全部失败，降级为纯文本发送 | 原因: 【{str(fc_err)[:150]}】")
+                return
+
+        thumb_loc = editor_container.locator(
+            '[data-testid="attachments"] img, '
+            '[data-testid="tweetPhoto"] img, '
+            'img[src^="blob:"]'
+        )
+        # 等待全部目标图片预览节点渲染完成
+        try:
+            target_idx = max(0, min(len(valid_images), MAX_X_IMAGES) - 1)
+            expect(thumb_loc.nth(target_idx)).to_be_visible(timeout=15000)
+        except Exception:
+            try:
+                expect(thumb_loc.first).to_be_visible(timeout=5000)
+            except Exception:
+                pass
+
+        # 等待进度条消失且媒体上传网络请求落定（至多 18s）
+        end_wait = time.time() + 18.0
+        while time.time() < end_wait:
+            progress_busy = False
+            try:
+                progress = editor_container.locator('[data-testid="attachments"] [role="progressbar"]')
+                if progress.count() > 0 and progress.first.is_visible():
+                    progress_busy = True
+            except Exception:
+                pass
+            if not progress_busy and not media_state["inflight"]:
+                break
+            page.wait_for_timeout(350)
+
+        page.wait_for_timeout(1200)
+    finally:
+        for ev_name, handler in (
+            ("request", _on_media_req),
+            ("requestfinished", _on_media_done),
+            ("requestfailed", _on_media_done),
+            ("response", _on_media_resp),
+        ):
+            try:
+                page.remove_listener(ev_name, handler)
+            except Exception:
+                pass
 
 
 # ==============================================================================
@@ -717,13 +767,13 @@ def _extract_tweet_id_from_graphql_body(body):
     return None
 
 
-def _read_x_api_verdict(page, watcher):
+def _read_x_api_verdict(page, watcher, pre_captured_resp=None, wait_timeout_ms=API_WAIT_TIMEOUT_MS):
     """
     解读 X 发帖/回复接口响应结果：
     - 主判据：POST /i/api/graphql/.../CreateTweet (或 CreateNoteTweet) 返回 rest_id；
     - 若包含 errors 且无 rest_id，则抛出 BusinessErrorException。
     """
-    resp = watcher.wait_primary(API_WAIT_TIMEOUT_MS)
+    resp = pre_captured_resp if pre_captured_resp is not None else watcher.wait_primary(wait_timeout_ms)
     if resp is not None:
         body = _parse_api_json(resp)
         tweet_id = _extract_tweet_id_from_graphql_body(body)
@@ -759,7 +809,7 @@ def _read_x_api_verdict(page, watcher):
             return True, tweet_id
 
     if resp is None:
-        logger.warning(f"[发送/校验] 【{API_WAIT_TIMEOUT_MS}ms】 内未捕获到主接口响应，转入 DOM 兜底校验")
+        logger.warning(f"[发送/校验] 【{wait_timeout_ms}ms】 内未捕获到主接口响应，转入 DOM 兜底校验")
     return False, None
 
 
@@ -892,7 +942,42 @@ def _submit_x_post(
             _forensics(page, "x_send_click_fail", {"hit": _hit_test(page, send_button)})
             raise Exception("X 发帖按钮点击 3 级降级全部失败。")
 
-        api_success, post_id = _read_x_api_verdict(page, watcher)
+        first_resp = watcher.wait_primary(6000)
+        if first_resp is None and watcher.primary_request_count == 0:
+            cur_text, cur_media = _snapshot_x_editor(editor_container, real_editor)
+            content_intact = (text_before > 0 and cur_text > 0) or (media_before > 0 and cur_media > 0)
+            if content_intact:
+                try:
+                    btn_ready = (
+                        send_button.is_visible()
+                        and send_button.is_enabled()
+                        and send_button.get_attribute("aria-disabled") != "true"
+                    )
+                except Exception:
+                    btn_ready = False
+                if btn_ready:
+                    logger.warning(
+                        f"[发送/重试] 首次点击后未触发 CreateTweet 请求且编辑器内容完整"
+                        f"（文本={cur_text}, 媒体={cur_media}），安全补点一次发帖按钮"
+                    )
+                    _dismiss_x_typeahead_if_open(page)
+                    try:
+                        send_button.click(timeout=5000)
+                    except Exception:
+                        try:
+                            send_button.evaluate("el => el.click()")
+                        except Exception:
+                            pass
+                    first_resp = watcher.wait_primary(max(6000, API_WAIT_TIMEOUT_MS - 6000))
+        elif first_resp is None:
+            first_resp = watcher.wait_primary(max(6000, API_WAIT_TIMEOUT_MS - 6000))
+
+        api_success, post_id = _read_x_api_verdict(
+            page,
+            watcher,
+            pre_captured_resp=first_resp,
+            wait_timeout_ms=2000 if first_resp is None else 0,
+        )
     except PlaywrightTimeoutError as e:
         logger.warning(f"[发送/校验] 等待 X 接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
     finally:
@@ -997,6 +1082,51 @@ def _submit_x_post(
 # ==============================================================================
 #                     主控入口函数 (发帖 / 评论 / 登录与人工接管)
 # ==============================================================================
+def _run_x_browser_action(
+    user_data_dir,
+    *,
+    debug=True,
+    use_proxy=True,
+    task_tag="[任务/Main]",
+    forensic_tag="x_action_error",
+    forensic_url=X_HOME_URL,
+    fn=None,
+):
+    """统一 X 持久化浏览器动作封装（锁 + `--headless=new`/stealth + 异常取证归类）。"""
+    proxy_server = get_proxy_url() if use_proxy else None
+    try:
+        with persistent_browser_session(
+            user_data_dir,
+            debug=debug,
+            proxy=proxy_server,
+            args=["--disable-restore-session-state", "--no-default-browser-check"],
+            use_stealth_chrome=True,
+            install_guard=True,
+        ) as (context, page):
+            try:
+                return fn(context, page)
+            except BusinessErrorException as biz_e:
+                error_info = f"[业务拦截] {biz_e}"
+                logger.error(f"{task_tag} X 操作被服务端业务规则阻断 | 原因: 【{error_info}】")
+                return error_info, False, None
+            except Exception as e:
+                error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                try:
+                    _forensics(page, forensic_tag, {"url": forensic_url, "error": error_info[:2000]})
+                except Exception:
+                    pass
+                _alert_failure_scene(error_info)
+                return error_info, False, None
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"{task_tag} {error_info}")
+        return error_info, False, None
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return error_info, False, None
+
+
 def create_x_post(
     content="",
     image_path_list=None,
@@ -1007,14 +1137,6 @@ def create_x_post(
 ):
     """
     主控入口 1：调度浏览器打开 X (https://x.com/home) 并执行【图文/纯文本自动发帖】全流程。
-
-    参数:
-        content (str): 要发布的推文正文文本。
-        image_path_list (str | list[str] | None): 图片地址（支持本地绝对路径、media_downloads 文件名、或 http/https 网络图片链接，最多 4 张）。
-        user_data_dir (str): 浏览器持久化用户目录，默认读取配置中的 x_myself_browser_session_dir。
-        debug (bool): True 为可见窗口模式，False 为离屏后台模式。
-        text_list (list[dict] | None): 可选分段键入列表，形如 [{"text": "...", "delay": 1.0}]。
-        use_proxy (bool): 是否挂载 config.json 中配置的代理（默认 True）。
 
     返回:
         Tuple(错误信息(str|None), 是否成功(bool), 帖子ID(str|None))
@@ -1043,128 +1165,56 @@ def create_x_post(
     logger.info(
         f"\n{'=' * 70}\n[任务/Main] 启动 X (Twitter) 自动化发帖 | URL: <{X_HOME_URL}> "
         f"| 正文: 【{text_summary}】 | 有效图片: 【{len(valid_images)}】张 "
-        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
+    def _do_post(_context, page):
+        response = page.goto(X_HOME_URL, timeout=60000, wait_until="domcontentloaded")
+        _wait_x_home_ready(page)
+        _dismiss_overlays(page, aggressive=False, desc="x-home-nav")
+        report_guard_hits(page, "x-home-nav")
 
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+        if response and response.status >= 400:
+            return f"X 主页加载异常 (HTTP {response.status})", False, None
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
-                        debug=debug,
-                        proxy=proxy_server,
-                    )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
+        login_err = _check_x_login_state(page)
+        if login_err:
+            return login_err, False, None
 
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
+        check_for_crash(page)
 
-                    install_overlay_guard(page)
+        try:
+            editor_container = _locate_x_post_creator(page)
+        except Exception as e:
+            login_err = _check_x_login_state(page)
+            if login_err:
+                return login_err, False, None
+            return f"无法定位 X 发帖编辑器: {e}", False, None
 
-                    response = page.goto(X_HOME_URL, timeout=60000, wait_until="domcontentloaded")
-                    _wait_x_home_ready(page)
-                    _dismiss_overlays(page, aggressive=False, desc="x-home-nav")
-                    report_guard_hits(page, "x-home-nav")
+        post_id = _submit_x_post(
+            page,
+            editor_container,
+            content=content,
+            image_path_list=image_path_list,
+            text_list=text_list,
+            prepared_images=valid_images,
+        )
 
-                    if response and response.status >= 400:
-                        return f"X 主页加载异常 (HTTP {response.status})", False, None
+        post_url = f"https://x.com/i/status/{post_id}" if post_id else "未知"
+        logger.info(
+            f"[任务/Main] X 帖子发布成功 | 帖子ID(rest_id): 【{post_id}】 | 链接: <{post_url}> | 结果: [Success]"
+        )
+        return None, True, post_id
 
-                    login_err = _check_x_login_state(page)
-                    if login_err:
-                        return login_err, False, None
-
-                    check_for_crash(page)
-
-                    try:
-                        editor_container = _locate_x_post_creator(page)
-                    except Exception as e:
-                        login_err = _check_x_login_state(page)
-                        if login_err:
-                            return login_err, False, None
-                        return f"无法定位 X 发帖编辑器: {e}", False, None
-
-                    post_id = _submit_x_post(
-                        page,
-                        editor_container,
-                        content=content,
-                        image_path_list=image_path_list,
-                        text_list=text_list,
-                        prepared_images=valid_images,
-                    )
-
-                    post_url = f"https://x.com/i/status/{post_id}" if post_id else "未知"
-                    logger.info(
-                        f"[任务/Main] X 帖子发布成功 | 帖子ID(rest_id): 【{post_id}】 | 链接: <{post_url}> | 结果: [Success]"
-                    )
-                    return None, True, post_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Main] X 发帖被服务端业务规则阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
-                        try:
-                            _forensics(
-                                context.pages[0], "x_post_error", {"url": X_HOME_URL, "error": error_info[:2000]}
-                            )
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Main] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+    return _run_x_browser_action(
+        user_data_dir,
+        debug=debug,
+        use_proxy=use_proxy,
+        task_tag="[任务/Main]",
+        forensic_tag="x_post_error",
+        forensic_url=X_HOME_URL,
+        fn=_do_post,
+    )
 
 
 def comment_on_x_post(
@@ -1180,17 +1230,6 @@ def comment_on_x_post(
 ):
     """
     主控入口 2：打开指定 X 帖子详情页（支持完整 URL 或纯数字 tweet_id）并执行【点赞(可选) + 回复评论(支持文字与配图)】全流程。
-
-    参数:
-        target_post_url (str | int): 目标 X 帖子链接（如 "https://x.com/xxx/status/123456"）或纯数字帖子 ID。
-        content (str): 评论/回复正文文本（与 comment 参数等价，二者传其一即可）。
-        image_path_list (str | list[str] | None): 评论附带的图片路径或网络图片 URL（可选，最多 4 张）。
-        like (bool): 是否在评论前顺带对该帖子点赞（默认 False）。
-        user_data_dir (str): 浏览器持久化用户目录，默认 USER_DATA_DIR。
-        debug (bool): True 为可见窗口模式，False 为离屏后台模式。
-        text_list (list[dict] | None): 可选分段键入列表，形如 [{"text": "...", "delay": 1.0}]。
-        use_proxy (bool): 是否挂载 config.json 中配置的代理（默认 True）。
-        comment (str): content 的兼容别名参数。
 
     返回:
         Tuple(错误信息(str|None), 是否成功(bool), 评论ID(str|None))
@@ -1224,161 +1263,86 @@ def comment_on_x_post(
     logger.info(
         f"\n{'=' * 70}\n[任务/Comment] 启动 X 自动化评论/互动 | 目标帖子ID: 【{target_post_id}】 | URL: <{post_url}> "
         f"| 评论正文: 【{text_summary}】 | 评论配图: 【{len(valid_images)}】张 | 是否点赞: 【{like}】 "
-        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
+    def _do_comment(_context, page):
+        response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
+        _wait_x_post_detail_ready(page)
+        _dismiss_overlays(page, aggressive=False, desc="x-comment-nav")
+        report_guard_hits(page, "x-comment-nav")
 
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+        if response and response.status >= 400:
+            return f"X 帖子详情页加载异常 (HTTP {response.status})", False, None
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
-                        debug=debug,
-                        proxy=proxy_server,
-                    )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
+        login_err = _check_x_login_state(page)
+        if login_err:
+            return login_err, False, None
 
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
+        check_for_crash(page)
 
-                    install_overlay_guard(page)
+        for err_sel in ('div[data-testid="error-detail"]', 'div[data-testid="empty_state_header_text"]'):
+            try:
+                err_loc = page.locator(err_sel).first
+                if err_loc.count() > 0 and err_loc.is_visible():
+                    err_txt = (err_loc.inner_text() or "").strip()[:120]
+                    return f"目标 X 帖子不可用或已删除: {err_txt}", False, None
+            except Exception:
+                pass
 
-                    response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
-                    _wait_x_post_detail_ready(page)
-                    _dismiss_overlays(page, aggressive=False, desc="x-comment-nav")
-                    report_guard_hits(page, "x-comment-nav")
+        if like:
+            try:
+                focal_tweet = _locate_focal_tweet(page, post_id=target_post_id)
+                already_liked = focal_tweet.locator('button[data-testid="unlike"]').first
+                if already_liked.count() > 0 and already_liked.is_visible():
+                    logger.info("[点赞/Like] 目标 X 帖子已处于点赞状态(检测到 unlike 按钮)，无需重复点击")
+                else:
+                    like_btn = focal_tweet.locator('button[data-testid="like"]').first
+                    if like_btn.count() == 0:
+                        like_btn = page.locator('button[data-testid="like"]').first
+                    if like_btn.count() > 0 and like_btn.is_visible():
+                        _robust_click(like_btn)
+                        page.wait_for_timeout(500)
+                        logger.info("[点赞/Like] X 帖子点赞操作执行完成 | 结果: [Success]")
+                    else:
+                        logger.warning("[点赞/Like] 未找到 X 帖子点赞按钮，跳过点赞")
+            except Exception as like_e:
+                logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
 
-                    if response and response.status >= 400:
-                        return f"X 帖子详情页加载异常 (HTTP {response.status})", False, None
+        if not effective_content and not valid_text_list and not valid_images:
+            logger.info("[任务/Comment] 仅点赞模式执行完毕 | 结果: [Success]")
+            return None, True, "LIKE_ONLY"
 
-                    login_err = _check_x_login_state(page)
-                    if login_err:
-                        return login_err, False, None
+        try:
+            reply_container = _locate_x_reply_box(page, post_id=target_post_id)
+        except Exception as e:
+            return f"无法定位 X 回复输入区: {e}", False, None
 
-                    check_for_crash(page)
+        comment_id = _submit_x_post(
+            page,
+            reply_container,
+            content=effective_content,
+            image_path_list=image_path_list,
+            text_list=text_list,
+            prepared_images=valid_images,
+        )
 
-                    # 检查目标帖子是否已被删除或不存在
-                    for err_sel in ('div[data-testid="error-detail"]', 'div[data-testid="empty_state_header_text"]'):
-                        try:
-                            err_loc = page.locator(err_sel).first
-                            if err_loc.count() > 0 and err_loc.is_visible():
-                                err_txt = (err_loc.inner_text() or "").strip()[:120]
-                                return f"目标 X 帖子不可用或已删除: {err_txt}", False, None
-                        except Exception:
-                            pass
+        comment_url = f"https://x.com/i/status/{comment_id}" if comment_id else "未知"
+        logger.info(
+            f"[任务/Comment] X 评论回复发布成功 | 原帖ID: 【{target_post_id}】 "
+            f"| 评论ID(rest_id): 【{comment_id}】 | 链接: <{comment_url}> | 结果: [Success]"
+        )
+        return None, True, comment_id
 
-                    if like:
-                        try:
-                            focal_tweet = _locate_focal_tweet(page, post_id=target_post_id)
-                            already_liked = focal_tweet.locator('button[data-testid="unlike"]').first
-                            if already_liked.count() > 0 and already_liked.is_visible():
-                                logger.info("[点赞/Like] 目标 X 帖子已处于点赞状态(检测到 unlike 按钮)，无需重复点击")
-                            else:
-                                like_btn = focal_tweet.locator('button[data-testid="like"]').first
-                                if like_btn.count() == 0:
-                                    like_btn = page.locator('button[data-testid="like"]').first
-                                if like_btn.count() > 0 and like_btn.is_visible():
-                                    _robust_click(like_btn)
-                                    page.wait_for_timeout(500)
-                                    logger.info("[点赞/Like] X 帖子点赞操作执行完成 | 结果: [Success]")
-                                else:
-                                    logger.warning("[点赞/Like] 未找到 X 帖子点赞按钮，跳过点赞")
-                        except Exception as like_e:
-                            logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
-
-                    if not effective_content and not valid_text_list and not valid_images:
-                        logger.info("[任务/Comment] 仅点赞模式执行完毕 | 结果: [Success]")
-                        return None, True, "LIKE_ONLY"
-
-                    try:
-                        reply_container = _locate_x_reply_box(page, post_id=target_post_id)
-                    except Exception as e:
-                        return f"无法定位 X 回复输入区: {e}", False, None
-
-                    comment_id = _submit_x_post(
-                        page,
-                        reply_container,
-                        content=effective_content,
-                        image_path_list=image_path_list,
-                        text_list=text_list,
-                        prepared_images=valid_images,
-                    )
-
-                    comment_url = f"https://x.com/i/status/{comment_id}" if comment_id else "未知"
-                    logger.info(
-                        f"[任务/Comment] X 评论回复发布成功 | 原帖ID: 【{target_post_id}】 "
-                        f"| 评论ID(rest_id): 【{comment_id}】 | 链接: <{comment_url}> | 结果: [Success]"
-                    )
-                    return None, True, comment_id
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Comment] X 评论被服务端业务规则阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
-                        try:
-                            _forensics(
-                                context.pages[0],
-                                f"x_comment_error_{target_post_id}",
-                                {"url": post_url, "error": error_info[:2000]},
-                            )
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Comment] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+    return _run_x_browser_action(
+        user_data_dir,
+        debug=debug,
+        use_proxy=use_proxy,
+        task_tag="[任务/Comment]",
+        forensic_tag=f"x_comment_error_{target_post_id}",
+        forensic_url=post_url,
+        fn=_do_comment,
+    )
 
 
 def follow_x_user(
@@ -1389,8 +1353,6 @@ def follow_x_user(
 ):
     """
     主控入口 2.5：打开指定 X 用户个人主页（`https://x.com/{screen_name}`）并执行安全幂等关注操作。
-    - 严格限定在 `[data-testid="primaryColumn"]` 主资料卡区域内定位按钮，杜绝误点右侧推荐栏；
-    - 若检测到已处于关注状态（`data-testid$="-unfollow"`），直接幂等返回 `("ALREADY_FOLLOWING")`，绝不误触发取关。
 
     返回:
         Tuple(错误信息(str|None), 是否成功(bool), 状态标识(str|None: "FOLLOWED" | "ALREADY_FOLLOWING"))
@@ -1411,176 +1373,102 @@ def follow_x_user(
 
     logger.info(
         f"\n{'=' * 70}\n[任务/Follow] 启动 X 自动化关注 | 目标账号: 【@{clean_handle}】 | URL: <{profile_url}> "
-        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"| 代理: 【{proxy_server or '直连'}】 | 模式: 【{'debug可见' if debug else '一致指纹无头'}】\n{'=' * 70}"
     )
 
-    anti_freeze_args = ["--disable-restore-session-state", "--no-default-browser-check"]
-    offscreen_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-gpu",
-        "--window-position=-10000,-10000",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-breakpad",
-        "--force-device-scale-factor=1",
-        "--hide-scrollbars",
-    ] + anti_freeze_args
+    def _do_follow(_context, page):
+        response = page.goto(profile_url, timeout=60000, wait_until="domcontentloaded")
+        try:
+            page.locator(
+                'div[data-testid="UserName"], '
+                'div[data-testid="empty_state_header_text"], '
+                'input[autocomplete="username"], '
+                'a[data-testid="loginButton"]'
+            ).first.wait_for(state="visible", timeout=25000)
+        except Exception:
+            pass
 
-    debug_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--start-maximized",
-        "--window-position=0,0",
-    ] + anti_freeze_args
+        _dismiss_overlays(page, aggressive=False, desc="x-follow-nav")
+        report_guard_hits(page, "x-follow-nav")
 
-    try:
-        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-            with sync_playwright() as p:
-                context = None
-                try:
-                    context = _launch_persistent(
-                        p,
-                        user_data_dir,
-                        args=debug_args if debug else offscreen_args,
-                        viewport=None if debug else {"width": 1920, "height": 1080},
-                        debug=debug,
-                        proxy=proxy_server,
-                    )
-                    context.set_default_timeout(60000)
-                    context.set_default_navigation_timeout(60000)
+        if response and response.status >= 400:
+            return f"X 用户主页加载异常 (HTTP {response.status})", False, None
 
-                    page = context.new_page()
-                    for old_page in context.pages:
-                        if old_page != page:
-                            try:
-                                old_page.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
-                    install_overlay_guard(page)
+        login_err = _check_x_login_state(page)
+        if login_err:
+            return login_err, False, None
 
-                    response = page.goto(profile_url, timeout=60000, wait_until="domcontentloaded")
-                    try:
-                        page.locator(
-                            'div[data-testid="UserName"], '
-                            'div[data-testid="empty_state_header_text"], '
-                            'input[autocomplete="username"], '
-                            'a[data-testid="loginButton"]'
-                        ).first.wait_for(state="visible", timeout=25000)
-                    except Exception:
-                        pass
+        check_for_crash(page)
 
-                    _dismiss_overlays(page, aggressive=False, desc="x-follow-nav")
-                    report_guard_hits(page, "x-follow-nav")
+        empty_hdr = page.locator('div[data-testid="empty_state_header_text"]').first
+        if empty_hdr.count() > 0 and empty_hdr.is_visible():
+            err_txt = (empty_hdr.inner_text() or "").strip()[:120]
+            return f"目标 X 账号不可用或不存在 (@{clean_handle}): {err_txt}", False, None
 
-                    if response and response.status >= 400:
-                        return f"X 用户主页加载异常 (HTTP {response.status})", False, None
+        primary_col = page.locator('[data-testid="primaryColumn"]').first
+        header_Placement = primary_col.locator('div[data-testid="placementTracking"]')
 
-                    login_err = _check_x_login_state(page)
-                    if login_err:
-                        return login_err, False, None
+        already_btn = header_Placement.locator(
+            'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
+        ).first
+        if already_btn.count() > 0 and already_btn.is_visible():
+            logger.info(f"[关注/Follow] 账号 @{clean_handle} 已处于关注状态，幂等跳过点击")
+            return None, True, "ALREADY_FOLLOWING"
 
-                    check_for_crash(page)
+        follow_btn = header_Placement.locator('button[data-testid$="-follow"]').first
+        if follow_btn.count() == 0:
+            follow_btn = primary_col.locator('button[data-testid$="-follow"]').first
+        if follow_btn.count() == 0 or not follow_btn.is_visible():
+            return f"未能在 @{clean_handle} 主页定位到可点击的关注按钮", False, None
 
-                    empty_hdr = page.locator('div[data-testid="empty_state_header_text"]').first
-                    if empty_hdr.count() > 0 and empty_hdr.is_visible():
-                        err_txt = (empty_hdr.inner_text() or "").strip()[:120]
-                        return f"目标 X 账号不可用或不存在 (@{clean_handle}): {err_txt}", False, None
+        testid_val = follow_btn.get_attribute("data-testid") or ""
+        if testid_val.endswith("-unfollow"):
+            return None, True, "ALREADY_FOLLOWING"
 
-                    primary_col = page.locator('[data-testid="primaryColumn"]').first
-                    header_Placement = primary_col.locator('div[data-testid="placementTracking"]')
+        friendship_ok = {"hit": False}
 
-                    # 幂等保护：若已处于关注或待批准状态，直接返回成功，绝不点击取关按钮
-                    already_btn = header_Placement.locator(
-                        'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
-                    ).first
-                    if already_btn.count() > 0 and already_btn.is_visible():
-                        logger.info(f"[关注/Follow] 账号 @{clean_handle} 已处于关注状态，幂等跳过点击")
-                        return None, True, "ALREADY_FOLLOWING"
+        def _on_follow_resp(resp):
+            u = (resp.url or "").lower()
+            if ("friendships/create" in u or "createfriendship" in u) and resp.status == 200:
+                friendship_ok["hit"] = True
 
-                    follow_btn = header_Placement.locator('button[data-testid$="-follow"]').first
-                    if follow_btn.count() == 0:
-                        follow_btn = primary_col.locator('button[data-testid$="-follow"]').first
-                    if follow_btn.count() == 0 or not follow_btn.is_visible():
-                        return f"未能在 @{clean_handle} 主页定位到可点击的关注按钮", False, None
+        page.on("response", _on_follow_resp)
+        try:
+            _robust_click(follow_btn)
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if friendship_ok["hit"]:
+                    break
+                unfollow_now = header_Placement.locator(
+                    'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
+                ).first
+                if unfollow_now.count() > 0 and unfollow_now.is_visible():
+                    friendship_ok["hit"] = True
+                    break
+                page.wait_for_timeout(300)
+        finally:
+            try:
+                page.remove_listener("response", _on_follow_resp)
+            except Exception:
+                pass
 
-                    testid_val = follow_btn.get_attribute("data-testid") or ""
-                    if testid_val.endswith("-unfollow"):
-                        return None, True, "ALREADY_FOLLOWING"
+        if friendship_ok["hit"]:
+            page.wait_for_timeout(1200)
+            logger.info(f"[任务/Follow] X 关注成功 | 账号: 【@{clean_handle}】 | 结果: [Success]")
+            return None, True, "FOLLOWED"
 
-                    friendship_ok = {"hit": False}
+        _forensics(page, f"x_follow_unconfirmed_{clean_handle}", {"url": profile_url})
+        return f"点击关注按钮后未检测到关注状态切换 (@{clean_handle})", False, None
 
-                    def _on_follow_resp(resp):
-                        u = (resp.url or "").lower()
-                        if ("friendships/create" in u or "createfriendship" in u) and resp.status == 200:
-                            friendship_ok["hit"] = True
-
-                    page.on("response", _on_follow_resp)
-                    try:
-                        _robust_click(follow_btn)
-                        deadline = time.time() + 10.0
-                        while time.time() < deadline:
-                            if friendship_ok["hit"]:
-                                break
-                            unfollow_now = header_Placement.locator(
-                                'button[data-testid$="-unfollow"], button[data-testid$="-cancel"]'
-                            ).first
-                            if unfollow_now.count() > 0 and unfollow_now.is_visible():
-                                friendship_ok["hit"] = True
-                                break
-                            page.wait_for_timeout(300)
-                    finally:
-                        try:
-                            page.remove_listener("response", _on_follow_resp)
-                        except Exception:
-                            pass
-
-                    if friendship_ok["hit"]:
-                        page.wait_for_timeout(1200)
-                        logger.info(f"[任务/Follow] X 关注成功 | 账号: 【@{clean_handle}】 | 结果: [Success]")
-                        return None, True, "FOLLOWED"
-
-                    _forensics(page, f"x_follow_unconfirmed_{clean_handle}", {"url": profile_url})
-                    return f"点击关注按钮后未检测到关注状态切换 (@{clean_handle})", False, None
-
-                except BusinessErrorException as biz_e:
-                    error_info = f"[业务拦截] {biz_e}"
-                    logger.error(f"[任务/Follow] X 关注被阻断 | 原因: 【{error_info}】")
-                    return error_info, False, None
-
-                except Exception as e:
-                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
-                    if context and context.pages:
-                        try:
-                            _forensics(
-                                context.pages[0],
-                                f"x_follow_error_{clean_handle}",
-                                {"url": profile_url, "error": error_info[:2000]},
-                            )
-                        except Exception:
-                            pass
-                    _alert_failure_scene(error_info)
-                    return error_info, False, None
-
-                finally:
-                    if context:
-                        try:
-                            context.close()
-                        except Exception:
-                            pass
-
-    except UserDataDirLockTimeoutError as lock_e:
-        error_info = f"[UserDataDirLockTimeout] {lock_e}"
-        logger.error(f"[任务/Follow] {error_info}")
-        return error_info, False, None
-
-    except Exception as core_e:
-        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
-        logger.error(error_info)
-        return error_info, False, None
+    return _run_x_browser_action(
+        user_data_dir,
+        debug=debug,
+        use_proxy=use_proxy,
+        task_tag="[任务/Follow]",
+        forensic_tag=f"x_follow_error_{clean_handle}",
+        forensic_url=profile_url,
+        fn=_do_follow,
+    )
 
 
 def login_and_save_session(user_data_dir=USER_DATA_DIR, use_proxy=True):

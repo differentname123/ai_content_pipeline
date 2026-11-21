@@ -19,8 +19,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote
 
-from playwright.sync_api import sync_playwright
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -35,22 +33,24 @@ from common.common_utils import (
     normalize_comment_item,
     safe_int,
 )
+from common.daemon import run_daemon_loop
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import HarvestedPostManager
-from platforms.external_link_extractor import is_fetchable_external_article_url
+from common.post_utils import (
+    assert_not_x_myself_dir,
+    is_fetchable_external_article_url,
+)
 from platforms.playwright_base import (
-    USER_DATA_LOCK_TIMEOUT_SEC,
     _dismiss_overlays,
-    _launch_persistent,
-    _user_data_dir_lock,
+    apply_stealth_headless_emulation,
+    build_real_chrome_launch_options,
     check_for_crash,
-    install_overlay_guard,
+    persistent_browser_session,
 )
 from x_growth.growth_config import (
     COLLECTOR_DEFAULTS,
     POSTS_COLLECTION_NAME,
     SUPPORTED_COMMENT_LANGUAGES,
-    TZ_CN,
     get_configured_self_handles,
     get_growth_logger,
     normalize_language_code,
@@ -64,89 +64,6 @@ _RE_GQL_OP = re.compile(
 )
 _RE_FOCAL_ID = re.compile(r'"focalTweetId"\s*:\s*"(\d+)"')
 _X_UNDETERMINED_LANGS = {"", "unknown", "und", "qme", "qam", "zxx", "art"}
-
-
-def build_real_chrome_launch_options(browser_visible: bool = False) -> Tuple[List[str], Optional[Dict[str, int]]]:
-    """
-    构造真实桌面 Chrome 启动参数：
-    - `browser_visible=False`（默认）：启用现代 Chrome `--headless=new` 原生无头引擎（不传 `--disable-gpu`，
-      100% 保留本机真实物理显卡 D3D11 WebGL 指纹，同时不创建任何系统桌面窗口、零任务栏图标、100% 零焦点抢占）；
-    - `browser_visible=True`：显示正常最大化窗口便于人工观察。
-    """
-    args = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-infobars",
-        "--disable-dev-shm-usage",
-        "--mute-audio",
-    ]
-    if browser_visible:
-        args.append("--start-maximized")
-        return args, None
-    args.extend(
-        [
-            "--headless=new",
-            "--window-size=1440,900",
-            "--disable-renderer-backgrounding",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-        ]
-    )
-    return args, {"width": 1440, "height": 900}
-
-
-def apply_stealth_headless_emulation(context: Any, page: Any, browser_visible: bool = False) -> Optional[Any]:
-    """
-    在 `--headless=new` 模式下，于导航前通过 CDP 将默认 `HeadlessChrome/<ver>` 动态还原为本机真实 `Chrome/<ver>`，
-    同步对齐 HTTP `User-Agent`、`Sec-CH-UA*` 请求头与 `navigator.userAgentData`，返回需保持存活的 CDP 会话对象。
-    """
-    if browser_visible:
-        return None
-    try:
-        raw_ua = str(page.evaluate("() => navigator.userAgent") or "")
-        clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/")
-        m_ver = re.search(r"Chrome/([\d.]+)", clean_ua)
-        ver_full = m_ver.group(1) if m_ver else "135.0.0.0"
-        ver_major = ver_full.split(".", 1)[0]
-
-        if sys.platform == "darwin":
-            nav_platform, ch_platform, ch_platform_ver, arch = "MacIntel", "macOS", "14.5.0", "arm"
-        elif sys.platform.startswith("linux"):
-            nav_platform, ch_platform, ch_platform_ver, arch = "Linux x86_64", "Linux", "6.8.0", "x86"
-        else:
-            nav_platform, ch_platform, ch_platform_ver, arch = "Win32", "Windows", "15.0.0", "x86"
-
-        cdp = context.new_cdp_session(page)
-        cdp.send(
-            "Emulation.setUserAgentOverride",
-            {
-                "userAgent": clean_ua,
-                "platform": nav_platform,
-                "userAgentMetadata": {
-                    "brands": [
-                        {"brand": "Google Chrome", "version": ver_major},
-                        {"brand": "Not-A.Brand", "version": "8"},
-                        {"brand": "Chromium", "version": ver_major},
-                    ],
-                    "fullVersionList": [
-                        {"brand": "Google Chrome", "version": ver_full},
-                        {"brand": "Not-A.Brand", "version": "8.0.0.0"},
-                        {"brand": "Chromium", "version": ver_full},
-                    ],
-                    "fullVersion": ver_full,
-                    "platform": ch_platform,
-                    "platformVersion": ch_platform_ver,
-                    "architecture": arch,
-                    "model": "",
-                    "mobile": False,
-                    "bitness": "64",
-                    "wow64": False,
-                },
-            },
-        )
-        return cdp
-    except Exception:
-        return None
 
 
 def _clean_x_text_with_entities(raw_text: str, legacy: Dict[str, Any]) -> str:
@@ -970,6 +887,7 @@ def collect_posts_via_browser(
     3) 点进最多 `profile_visits` 个 24h 内未拉取过的 `100~3000` 粉蓝 V 主页，均匀收下他们自己发的最近原创主帖。
     """
     logger = get_growth_logger()
+    assert_not_x_myself_dir(user_data_dir, context="x_growth.x_browser_collector")
     session_path = str(Path(user_data_dir).expanduser().resolve())
     seen_detail_pids: Set[str] = set(skip_detailed_pids or set())
     skip_authors: Set[str] = {str(x).strip().lstrip("@").lower() for x in (skip_recent_authors or set()) if x}
@@ -986,200 +904,176 @@ def collect_posts_via_browser(
         }
 
     proxy_server = get_proxy_url()
-    chrome_args, viewport_cfg = build_real_chrome_launch_options(browser_visible=browser_visible)
     sniffer = XPassiveGraphQLSniffer()
     self_handles: Set[str] = set(get_configured_self_handles())
 
-    with _user_data_dir_lock(session_path, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-        with sync_playwright() as p:
-            context = None
-            page = None
-            try:
-                context = _launch_persistent(
-                    p,
-                    session_path,
-                    args=chrome_args,
-                    viewport=viewport_cfg,
-                    hide_automation=True,
-                    debug=True,
-                    proxy=proxy_server,
-                )
-                context.set_default_timeout(45000)
-                context.set_default_navigation_timeout(45000)
+    with persistent_browser_session(
+        session_path,
+        debug=bool(browser_visible),
+        proxy=proxy_server,
+        use_stealth_chrome=True,
+        reuse_existing_page=True,
+        default_timeout_ms=45000,
+        navigation_timeout_ms=45000,
+        install_guard=True,
+    ) as (context, page):
+        page.on("response", sniffer.on_response)
+        try:
+            # ── 第 1 步：刷首页推荐流（若首次加载无 GraphQL 响应则轻量刷新重试 1 次） ──
+            for attempt in range(2):
+                prev_home_ops = sniffer.op_counts.get("HomeTimeline", 0) + sniffer.op_counts.get("HomeLatestTimeline", 0)
+                if attempt == 0:
+                    page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
+                else:
+                    logger.warning("[PostCollector/首页重载] 首次加载未监听到 GraphQL 响应，尝试刷新重试 1 次...")
+                    page.reload(timeout=45000, wait_until="domcontentloaded")
+                sniffer.wait_for_op_increment(page, ("HomeTimeline", "HomeLatestTimeline"), prev_home_ops, timeout_ms=15000)
+                page.wait_for_timeout(random.randint(1800, 3200))
+                _dismiss_overlays(page, aggressive=False, desc="x-growth-home")
+                check_for_crash(page)
 
-                page = context.pages[0] if context.pages else context.new_page()
-                for extra_p in list(context.pages):
-                    if extra_p != page:
-                        try:
-                            extra_p.close()
-                        except Exception:
-                            pass
-
-                _stealth_cdp = apply_stealth_headless_emulation(context, page, browser_visible=browser_visible)
-                page.on("response", sniffer.on_response)
-                install_overlay_guard(page)
-
-                # ── 第 1 步：刷首页推荐流（若首次加载无 GraphQL 响应则轻量刷新重试 1 次） ──
-                for attempt in range(2):
-                    prev_home_ops = sniffer.op_counts.get("HomeTimeline", 0) + sniffer.op_counts.get("HomeLatestTimeline", 0)
-                    if attempt == 0:
-                        page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
-                    else:
-                        logger.warning("[PostCollector/首页重载] 首次加载未监听到 GraphQL 响应，尝试刷新重试 1 次...")
-                        page.reload(timeout=45000, wait_until="domcontentloaded")
-                    sniffer.wait_for_op_increment(page, ("HomeTimeline", "HomeLatestTimeline"), prev_home_ops, timeout_ms=15000)
-                    page.wait_for_timeout(random.randint(1800, 3200))
-                    _dismiss_overlays(page, aggressive=False, desc="x-growth-home")
-                    check_for_crash(page)
-
-                    acc_status, acc_msg = inspect_x_page_account_status(page)
-                    if acc_status != "ok":
-                        return {
-                            "account_status": acc_status,
-                            "account_message": acc_msg,
-                            "self_handle": "",
-                            "all_captured_posts": [],
-                            "peer_users_discovered": 0,
-                            "threads_clicked": 0,
-                            "profiles_visited": 0,
-                        }
-                    if sum(sniffer.op_counts.values()) > 0:
-                        break
-
-                self_uid, self_handle = extract_logged_in_identity(context, page)
-                if self_handle:
-                    self_handles.add(self_handle.lower())
-
-                _ensure_for_you_tab(page)
-                try:
-                    page.mouse.move(720, 450)
-                except Exception:
-                    pass
-                for _ in range(max(1, int(home_scroll_rounds))):
-                    page.mouse.wheel(0, random.randint(2000, 3200))
-                    page.wait_for_timeout(random.randint(2000, 3500))
-
-                # ── 第 2 步：顺路随机点开几条有讨论的英/日帖子（不按最高评论数排序，避开千评骂战帖） ──
-                eligible_threads = [
-                    fp
-                    for fp in sniffer.feed_posts_by_id.values()
-                    if str(fp.get("post_id") or "") not in seen_detail_pids
-                    and (
-                        not allowed_langs_set
-                        or normalize_language_code(str(((fp.get("metadata") or {}).get("lang")) or "")) in allowed_langs_set
-                    )
-                    and safe_int((fp.get("engagement") or {}).get("comment_count"), 0) >= 4
-                ]
-                # 【保留过滤原因说明】优先从 <=500 评的常规讨论帖中随机点开看评论（若无则退回 >=4 评），避免一头扎进几千评的极端引战帖；不影响主帖全量入库
-                active_threads = [
-                    fp for fp in eligible_threads
-                    if safe_int((fp.get("engagement") or {}).get("comment_count"), 0) <= 500
-                ] or eligible_threads
-                random.shuffle(active_threads)
-                clicked_threads = 0
-                for t_post in active_threads[: max(0, int(thread_clicks))]:
-                    t_url = str((t_post.get("metadata") or {}).get("url") or "").strip()
-                    if not t_url:
-                        continue
-                    prev_det = sniffer.op_counts.get("TweetDetail", 0)
-                    try:
-                        page.goto(t_url, timeout=35000, wait_until="domcontentloaded")
-                        sniffer.wait_for_op_increment(page, ("TweetDetail",), prev_det, timeout_ms=10000)
-                        page.wait_for_timeout(random.randint(1500, 2600))
-                        page.mouse.wheel(0, random.randint(350, 650))
-                        page.wait_for_timeout(random.randint(1200, 2000))
-                        clicked_threads += 1
-                    except Exception as nav_e:
-                        logger.debug(f"[PostCollector] 打开热帖详情略过 ({t_url}): {nav_e}")
-
-                # ── 第 3 步：点进客观符合 100~3000 粉的英/日蓝 V 主页，收集他们自己发的原创主帖 ──
-                def _is_objective_peer_user(u: Dict[str, Any]) -> bool:
-                    if not bool(u.get("is_blue_verified") or u.get("is_verified")):
-                        return False
-                    uid = str(u.get("user_id") or "").strip()
-                    h_low = str(u.get("screen_name") or "").strip().lstrip("@").lower()
-                    if not h_low or h_low == "unknown":
-                        return False
-                    # 【保留过滤原因说明】排除采集号自身与主号，以及 24h 内已拉取过帖子或访问过主页的作者，保证拉取作者均匀不重复
-                    if (self_uid and uid == self_uid) or (h_low in self_handles) or (h_low in skip_authors):
-                        return False
-                    # 【保留过滤原因说明】避让已关注/已关注当前号的熟人，将有限主页访问配额全部留给未触达新作者
-                    if avoid_connected_authors and (bool(u.get("is_following")) or bool(u.get("is_followed_by"))):
-                        return False
-                    fc = safe_int(u.get("followers_count"), 0)
-                    if fc < min_followers or fc > max_followers:
-                        return False
-                    obs_langs: Set[str] = set(u.get("observed_langs") or set())
-                    if obs_langs and allowed_langs_set and not (obs_langs & allowed_langs_set):
-                        return False
-                    return True
-
-                peer_users = [u for u in sniffer.users_by_handle.values() if _is_objective_peer_user(u)]
-                random.shuffle(peer_users)
-
-                visited_profiles = 0
-                visited_handles: List[str] = []
-                user_timeline_ops = ("UserOriginalsTimeline", "UserTweets", "UserTweetsAndReplies")
-                for u_prof in peer_users[: max(0, int(profile_visits))]:
-                    handle = str(u_prof.get("screen_name") or "").strip().lstrip("@")
-                    if not handle:
-                        continue
-                    visited_profiles += 1
-                    visited_handles.append(handle.lower())
-                    prev_ut = sum(sniffer.op_counts.get(op_k, 0) for op_k in user_timeline_ops)
-                    try:
-                        page.goto(f"https://x.com/{handle}", timeout=35000, wait_until="domcontentloaded")
-                        sniffer.wait_for_op_increment(page, user_timeline_ops, prev_ut, timeout_ms=11000)
-                        page.wait_for_timeout(random.randint(1800, 3000))
-                    except Exception as prof_e:
-                        logger.debug(f"[PostCollector] 访问用户主页略过 (@{handle}): {prof_e}")
-
-                if visited_handles and author_avoid_seconds > 0:
-                    _record_visited_authors(visited_handles, author_avoid_seconds)
-
-                all_captured_posts = sniffer.export_all_captured_root_posts(
-                    skip_peer_authors=skip_authors,
-                    max_posts_per_author=max_posts_per_author,
-                    peer_follower_range=(min_followers, max_followers),
-                )
-                if not all_captured_posts and sum(sniffer.op_counts.values()) == 0:
-                    msg = "首页浏览未监听到任何 GraphQL 响应 (gql_ops={})，疑似页面加载异常或网络抖动，拒绝静默伪装为正常 0 条。"
-                    logger.warning(f"⚠️ [PostCollector/空采告警] 采集号=@{self_handle or self_uid or '未知'} | {msg}")
+                acc_status, acc_msg = inspect_x_page_account_status(page)
+                if acc_status != "ok":
                     return {
-                        "account_status": "empty_capture",
-                        "account_message": msg,
-                        "self_handle": self_handle,
+                        "account_status": acc_status,
+                        "account_message": acc_msg,
+                        "self_handle": "",
                         "all_captured_posts": [],
-                        "peer_users_discovered": len(peer_users),
-                        "threads_clicked": clicked_threads,
-                        "profiles_visited": visited_profiles,
+                        "peer_users_discovered": 0,
+                        "threads_clicked": 0,
+                        "profiles_visited": 0,
                     }
-                logger.info(
-                    f"[PostCollector/浏览完成] 采集号=@{self_handle or self_uid or '已登录'} | "
-                    f"gql_ops={sniffer.op_counts} | 24h避让作者={len(skip_authors)}人 | 点热帖={clicked_threads}条 | "
-                    f"发现新100~3000粉蓝V={len(peer_users)}人(进主页={visited_profiles}人) | "
-                    f"共捕获原创主帖={len(all_captured_posts)}条(单作者上限={max_posts_per_author}条)"
+                if sum(sniffer.op_counts.values()) > 0:
+                    break
+
+            self_uid, self_handle = extract_logged_in_identity(context, page)
+            if self_handle:
+                self_handles.add(self_handle.lower())
+
+            _ensure_for_you_tab(page)
+            try:
+                page.mouse.move(720, 450)
+            except Exception:
+                pass
+            for _ in range(max(1, int(home_scroll_rounds))):
+                page.mouse.wheel(0, random.randint(2000, 3200))
+                page.wait_for_timeout(random.randint(2000, 3500))
+
+            # ── 第 2 步：顺路随机点开几条有讨论的英/日帖子（不按最高评论数排序，避开千评骂战帖） ──
+            eligible_threads = [
+                fp
+                for fp in sniffer.feed_posts_by_id.values()
+                if str(fp.get("post_id") or "") not in seen_detail_pids
+                and (
+                    not allowed_langs_set
+                    or normalize_language_code(str(((fp.get("metadata") or {}).get("lang")) or "")) in allowed_langs_set
                 )
+                and safe_int((fp.get("engagement") or {}).get("comment_count"), 0) >= 4
+            ]
+            # 【保留过滤原因说明】优先从 <=500 评的常规讨论帖中随机点开看评论（若无则退回 >=4 评），避免一头扎进几千评的极端引战帖；不影响主帖全量入库
+            active_threads = [
+                fp for fp in eligible_threads
+                if safe_int((fp.get("engagement") or {}).get("comment_count"), 0) <= 500
+            ] or eligible_threads
+            random.shuffle(active_threads)
+            clicked_threads = 0
+            for t_post in active_threads[: max(0, int(thread_clicks))]:
+                t_url = str((t_post.get("metadata") or {}).get("url") or "").strip()
+                if not t_url:
+                    continue
+                prev_det = sniffer.op_counts.get("TweetDetail", 0)
+                try:
+                    page.goto(t_url, timeout=35000, wait_until="domcontentloaded")
+                    sniffer.wait_for_op_increment(page, ("TweetDetail",), prev_det, timeout_ms=10000)
+                    page.wait_for_timeout(random.randint(1500, 2600))
+                    page.mouse.wheel(0, random.randint(350, 650))
+                    page.wait_for_timeout(random.randint(1200, 2000))
+                    clicked_threads += 1
+                except Exception as nav_e:
+                    logger.debug(f"[PostCollector] 打开热帖详情略过 ({t_url}): {nav_e}")
+
+            # ── 第 3 步：点进客观符合 100~3000 粉的英/日蓝 V 主页，收集他们自己发的原创主帖 ──
+            def _is_objective_peer_user(u: Dict[str, Any]) -> bool:
+                if not bool(u.get("is_blue_verified") or u.get("is_verified")):
+                    return False
+                uid = str(u.get("user_id") or "").strip()
+                h_low = str(u.get("screen_name") or "").strip().lstrip("@").lower()
+                if not h_low or h_low == "unknown":
+                    return False
+                # 【保留过滤原因说明】排除采集号自身与主号，以及 24h 内已拉取过帖子或访问过主页的作者，保证拉取作者均匀不重复
+                if (self_uid and uid == self_uid) or (h_low in self_handles) or (h_low in skip_authors):
+                    return False
+                # 【保留过滤原因说明】避让已关注/已关注当前号的熟人，将有限主页访问配额全部留给未触达新作者
+                if avoid_connected_authors and (bool(u.get("is_following")) or bool(u.get("is_followed_by"))):
+                    return False
+                fc = safe_int(u.get("followers_count"), 0)
+                if fc < min_followers or fc > max_followers:
+                    return False
+                obs_langs: Set[str] = set(u.get("observed_langs") or set())
+                if obs_langs and allowed_langs_set and not (obs_langs & allowed_langs_set):
+                    return False
+                return True
+
+            peer_users = [u for u in sniffer.users_by_handle.values() if _is_objective_peer_user(u)]
+            random.shuffle(peer_users)
+
+            visited_profiles = 0
+            visited_handles: List[str] = []
+            user_timeline_ops = ("UserOriginalsTimeline", "UserTweets", "UserTweetsAndReplies")
+            for u_prof in peer_users[: max(0, int(profile_visits))]:
+                handle = str(u_prof.get("screen_name") or "").strip().lstrip("@")
+                if not handle:
+                    continue
+                visited_profiles += 1
+                visited_handles.append(handle.lower())
+                prev_ut = sum(sniffer.op_counts.get(op_k, 0) for op_k in user_timeline_ops)
+                try:
+                    page.goto(f"https://x.com/{handle}", timeout=35000, wait_until="domcontentloaded")
+                    sniffer.wait_for_op_increment(page, user_timeline_ops, prev_ut, timeout_ms=11000)
+                    page.wait_for_timeout(random.randint(1800, 3000))
+                except Exception as prof_e:
+                    logger.debug(f"[PostCollector] 访问用户主页略过 (@{handle}): {prof_e}")
+
+            if visited_handles and author_avoid_seconds > 0:
+                _record_visited_authors(visited_handles, author_avoid_seconds)
+
+            all_captured_posts = sniffer.export_all_captured_root_posts(
+                skip_peer_authors=skip_authors,
+                max_posts_per_author=max_posts_per_author,
+                peer_follower_range=(min_followers, max_followers),
+            )
+            if not all_captured_posts and sum(sniffer.op_counts.values()) == 0:
+                msg = "首页浏览未监听到任何 GraphQL 响应 (gql_ops={})，疑似页面加载异常或网络抖动，拒绝静默伪装为正常 0 条。"
+                logger.warning(f"⚠️ [PostCollector/空采告警] 采集号=@{self_handle or self_uid or '未知'} | {msg}")
                 return {
-                    "account_status": "ok",
-                    "account_message": None,
+                    "account_status": "empty_capture",
+                    "account_message": msg,
                     "self_handle": self_handle,
-                    "all_captured_posts": all_captured_posts,
+                    "all_captured_posts": [],
                     "peer_users_discovered": len(peer_users),
                     "threads_clicked": clicked_threads,
                     "profiles_visited": visited_profiles,
                 }
-            finally:
-                if page is not None:
-                    try:
-                        page.remove_listener("response", sniffer.on_response)
-                    except Exception:
-                        pass
-                if context is not None:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
+            logger.info(
+                f"[PostCollector/浏览完成] 采集号=@{self_handle or self_uid or '已登录'} | "
+                f"gql_ops={sniffer.op_counts} | 24h避让作者={len(skip_authors)}人 | 点热帖={clicked_threads}条 | "
+                f"发现新100~3000粉蓝V={len(peer_users)}人(进主页={visited_profiles}人) | "
+                f"共捕获原创主帖={len(all_captured_posts)}条(单作者上限={max_posts_per_author}条)"
+            )
+            return {
+                "account_status": "ok",
+                "account_message": None,
+                "self_handle": self_handle,
+                "all_captured_posts": all_captured_posts,
+                "peer_users_discovered": len(peer_users),
+                "threads_clicked": clicked_threads,
+                "profiles_visited": visited_profiles,
+            }
+        finally:
+            try:
+                page.remove_listener("response", sniffer.on_response)
+            except Exception:
+                pass
 
 
 def collect_and_save_posts(
@@ -1201,6 +1095,7 @@ def collect_and_save_posts(
     高内聚独立拉取入口：启动真实桌面 Chrome 完成浏览并将捕获主帖与热评落库，24h 内已拉取作者自动避让，不触发任何大模型。
     """
     logger = get_growth_logger()
+    assert_not_x_myself_dir(user_data_dir, context="x_growth.x_browser_collector")
     t0 = time.perf_counter()
     session_path = str(Path(user_data_dir).expanduser().resolve())
     allowed_langs_set = {
@@ -1285,6 +1180,7 @@ def run_collector_daemon(
     user_data_dir: str = COLLECTOR_DEFAULTS["user_data_dir"],
     interval_seconds: Optional[int] = None,
     jitter_seconds: Optional[Tuple[int, int]] = None,
+    max_rounds: int = 0,
 ) -> None:
     """独立常驻定时拉取循环（只拉取落库，不调大模型）。"""
     logger = get_growth_logger()
@@ -1298,31 +1194,25 @@ def run_collector_daemon(
         j_low, j_high = 0, 0
 
     session_path = str(Path(user_data_dir).expanduser().resolve())
+    assert_not_x_myself_dir(session_path, context="x_growth.x_browser_collector.daemon")
     logger.info(
         f"⏰ [PostCollector/独立常驻拉取启动] 目录={session_path} | 周期={base_interval}s + 抖动({j_low}~{j_high}s)"
     )
-    round_no = 0
-    while True:
-        round_no += 1
-        logger.info(f"========== [PostCollector/拉取轮次 #{round_no}] 开始 ==========")
-        try:
-            res = collect_and_save_posts(user_data_dir=session_path)
-            if res.get("status") != "ok":
-                logger.error(f"⚠️ [PostCollector/轮次 #{round_no} 待处理] {res.get('account_warning')}")
-        except KeyboardInterrupt:
-            logger.info("[PostCollector/常驻退出] 收到手动中断信号，安全停止。")
-            break
-        except Exception as exc:
-            logger.exception(f"❌ [PostCollector/轮次 #{round_no} 异常] {exc}")
 
-        sleep_sec = base_interval + (random.randint(j_low, j_high) if j_high > 0 else 0)
-        next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"💤 [PostCollector/休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
-        try:
-            time.sleep(sleep_sec)
-        except KeyboardInterrupt:
-            logger.info("[PostCollector/常驻退出] 休眠期间收到中断信号，安全停止。")
-            break
+    def _step(round_no: int) -> None:
+        logger.info(f"========== [PostCollector/拉取轮次 #{round_no}] 开始 ==========")
+        res = collect_and_save_posts(user_data_dir=session_path)
+        if res.get("status") != "ok":
+            logger.error(f"⚠️ [PostCollector/轮次 #{round_no} 待处理] {res.get('account_warning')}")
+
+    run_daemon_loop(
+        _step,
+        interval_seconds=base_interval,
+        additive_jitter_range=(j_low, j_high),
+        name="PostCollector",
+        logger_obj=logger,
+        max_rounds=max_rounds,
+    )
 
 
 if __name__ == "__main__":

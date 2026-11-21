@@ -10,6 +10,7 @@
    - 若仅当前发评账号自己已与该作者互关/关注（当 `avoid_connected_authors=True`），仅本号当次跳过，绝不锁死该帖，其他未关注账号依然可以消费；
 4. 发送评论成功后，立即回写 `consumed=True`、`consumed_by`（发评账号）、`consumed_at`（发评时间）及 `published_comment_id`，确保其他账号后续不再重复消费同一帖子。
 """
+import argparse
 import json
 import os
 import random
@@ -19,25 +20,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from playwright.sync_api import sync_playwright
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from common.common_utils import get_proxy_url, get_requests_proxies, safe_int
+from common.daemon import run_daemon_loop
 from common.mongo_db.mongo_base import gen_db_object
-from content_pipeline.pipeline_db import is_video_post
+from common.post_utils import is_video_post
 from platforms.playwright_base import (
-    USER_DATA_LOCK_TIMEOUT_SEC,
     BusinessErrorException,
     _dismiss_overlays,
-    _launch_persistent,
     _robust_click,
-    _user_data_dir_lock,
     check_for_crash,
-    install_overlay_guard,
+    persistent_browser_session,
 )
+from platforms.x_api import fetch_x_tweet_zero_auth
 from platforms.x_playwright import (
     _locate_focal_tweet,
     _locate_x_reply_box,
@@ -59,8 +57,6 @@ from x_growth.growth_config import (
 from x_growth.x_browser_collector import (
     X_HOME_URL,
     XPassiveGraphQLSniffer,
-    apply_stealth_headless_emulation,
-    build_real_chrome_launch_options,
     extract_logged_in_identity,
     inspect_x_page_account_status,
 )
@@ -537,314 +533,290 @@ def publish_comments_from_db(
         }
 
     proxy_server = get_proxy_url()
-    chrome_args, viewport_cfg = build_real_chrome_launch_options(browser_visible=browser_visible)
     sniffer = XPassiveGraphQLSniffer()
 
-    with _user_data_dir_lock(session_path, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
-        with sync_playwright() as p:
-            context = None
-            page = None
-            try:
-                context = _launch_persistent(
-                    p,
-                    session_path,
-                    args=chrome_args,
-                    viewport=viewport_cfg,
-                    hide_automation=True,
-                    debug=True,
-                    proxy=proxy_server,
+    with persistent_browser_session(
+        session_path,
+        debug=bool(browser_visible),
+        proxy=proxy_server,
+        use_stealth_chrome=True,
+        reuse_existing_page=True,
+        default_timeout_ms=45000,
+        navigation_timeout_ms=45000,
+        install_guard=True,
+    ) as (context, page):
+        page.on("response", sniffer.on_response)
+        try:
+            page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
+            _wait_x_home_ready(page, timeout_ms=18000)
+            page.wait_for_timeout(random.randint(1500, 2800))
+            _dismiss_overlays(page, aggressive=False, desc="x-pub-home")
+            check_for_crash(page)
+
+            acc_status, acc_msg = inspect_x_page_account_status(page)
+            if acc_status != "ok":
+                logger.error(f"🚨 [Module2/账号状态阻断] status={acc_status} | {acc_msg}")
+                return {
+                    "status": acc_status,
+                    "dry_run": False,
+                    "user_data_dir": session_path,
+                    "account_warning": acc_msg,
+                    "categories_filter": clean_cats or "ALL",
+                    "languages_filter": clean_langs or "ALL",
+                    "min_score": min_score,
+                    "db_candidates_found": len(candidates),
+                    "published_count": 0,
+                    "published_items": [],
+                    "skipped_items": [],
+                }
+
+            self_uid, self_handle = extract_logged_in_identity(context, page)
+            if self_handle:
+                self_handles.add(self_handle.lower())
+            consumer_label = f"@{self_handle}" if self_handle else (f"uid:{self_uid}" if self_uid else Path(session_path).name)
+
+            live_sent_count = 0
+            halt_status: Optional[str] = None
+            halt_warning: Optional[str] = None
+            candidate_pool_size = len(candidates)
+            fresh_2h_pool_size = sum(
+                1 for c in candidates if max(0, now_ts - safe_int(c.get("publish_time"), 0)) <= 7200
+            )
+            for cand_rank, doc in enumerate(candidates, start=1):
+                if len(published_items) >= target_limit:
+                    break
+
+                pid = str(doc.get("post_id") or "").strip()
+                pub_ts = safe_int(doc.get("publish_time"), 0)
+                if not pid or pub_ts <= 0 or (int(time.time()) - pub_ts) > max_age_sec:
+                    _mark_objective_post_invalid(col, pid, "expired_over_24h")
+                    skipped_items.append({"post_id": pid, "reason": "expired_over_24h"})
+                    continue
+
+                # 并发安全二次校验：防止多账号几乎同时运行时消费到同一条刚被锁定的帖子
+                fresh_state = col.find_one(
+                    {"source": "x", "post_id": pid},
+                    {f"{AUTO_COMMENT_FIELD}.consumed": 1, f"{AUTO_COMMENT_FIELD}.skip": 1, "_id": 0},
                 )
-                context.set_default_timeout(45000)
-                context.set_default_navigation_timeout(45000)
+                fresh_auto = (fresh_state or {}).get(AUTO_COMMENT_FIELD) or {}
+                if fresh_auto.get("consumed") or fresh_auto.get("skip"):
+                    skipped_items.append({"post_id": pid, "reason": "already_consumed_by_other_account"})
+                    continue
 
-                page = context.pages[0] if context.pages else context.new_page()
-                for extra_p in list(context.pages):
-                    if extra_p != page:
-                        try:
-                            extra_p.close()
-                        except Exception:
-                            pass
+                author_obj = doc.get("author") or {}
+                handle = str(author_obj.get("username") or "").strip().lstrip("@")
+                h_low = handle.lower()
+                author_uid = str(doc.get("author_id") or "").strip()
 
-                _stealth_cdp = apply_stealth_headless_emulation(context, page, browser_visible=browser_visible)
-                page.on("response", sniffer.on_response)
-                install_overlay_guard(page)
-
-                page.goto(X_HOME_URL, timeout=45000, wait_until="domcontentloaded")
-                _wait_x_home_ready(page, timeout_ms=18000)
-                page.wait_for_timeout(random.randint(1500, 2800))
-                _dismiss_overlays(page, aggressive=False, desc="x-pub-home")
-                check_for_crash(page)
-
-                acc_status, acc_msg = inspect_x_page_account_status(page)
-                if acc_status != "ok":
-                    logger.error(f"🚨 [Module2/账号状态阻断] status={acc_status} | {acc_msg}")
-                    return {
-                        "status": acc_status,
-                        "dry_run": False,
-                        "user_data_dir": session_path,
-                        "account_warning": acc_msg,
-                        "categories_filter": clean_cats or "ALL",
-                        "languages_filter": clean_langs or "ALL",
-                        "min_score": min_score,
-                        "db_candidates_found": len(candidates),
-                        "published_count": 0,
-                        "published_items": [],
-                        "skipped_items": [],
-                    }
-
-                self_uid, self_handle = extract_logged_in_identity(context, page)
-                if self_handle:
-                    self_handles.add(self_handle.lower())
-                consumer_label = f"@{self_handle}" if self_handle else (f"uid:{self_uid}" if self_uid else Path(session_path).name)
-
-                live_sent_count = 0
-                halt_status: Optional[str] = None
-                halt_warning: Optional[str] = None
-                candidate_pool_size = len(candidates)
-                fresh_2h_pool_size = sum(
-                    1 for c in candidates if max(0, now_ts - safe_int(c.get("publish_time"), 0)) <= 7200
-                )
-                for cand_rank, doc in enumerate(candidates, start=1):
-                    if len(published_items) >= target_limit:
-                        break
-
-                    pid = str(doc.get("post_id") or "").strip()
-                    pub_ts = safe_int(doc.get("publish_time"), 0)
-                    if not pid or pub_ts <= 0 or (int(time.time()) - pub_ts) > max_age_sec:
-                        _mark_objective_post_invalid(col, pid, "expired_over_24h")
-                        skipped_items.append({"post_id": pid, "reason": "expired_over_24h"})
-                        continue
-
-                    # 并发安全二次校验：防止多账号几乎同时运行时消费到同一条刚被锁定的帖子
-                    fresh_state = col.find_one(
-                        {"source": "x", "post_id": pid},
-                        {f"{AUTO_COMMENT_FIELD}.consumed": 1, f"{AUTO_COMMENT_FIELD}.skip": 1, "_id": 0},
+                if not handle or h_low in self_handles or (self_uid and author_uid == self_uid):
+                    continue
+                if h_low in commented_authors:
+                    skipped_items.append(
+                        {"post_id": pid, "author": f"@{handle}", "reason": "recently_commented_by_this_account"}
                     )
-                    fresh_auto = (fresh_state or {}).get(AUTO_COMMENT_FIELD) or {}
-                    if fresh_auto.get("consumed") or fresh_auto.get("skip"):
-                        skipped_items.append({"post_id": pid, "reason": "already_consumed_by_other_account"})
-                        continue
+                    continue
 
-                    author_obj = doc.get("author") or {}
-                    handle = str(author_obj.get("username") or "").strip().lstrip("@")
-                    h_low = handle.lower()
-                    author_uid = str(doc.get("author_id") or "").strip()
+                auto_meta = doc.get(AUTO_COMMENT_FIELD) or {}
+                comment_text = str(auto_meta.get("best_comment") or "").strip()
+                score = auto_meta.get("best_score")
+                category = auto_meta.get("category")
+                language = auto_meta.get("language") or "unknown"
+                post_url = str((doc.get("metadata") or {}).get("url") or f"https://x.com/{handle}/status/{pid}")
 
-                    if not handle or h_low in self_handles or (self_uid and author_uid == self_uid):
-                        continue
-                    if h_low in commented_authors:
-                        skipped_items.append(
-                            {"post_id": pid, "author": f"@{handle}", "reason": "recently_commented_by_this_account"}
-                        )
-                        continue
+                if live_sent_count > 0:
+                    _sleep_jitter(action_delay_range)
 
-                    auto_meta = doc.get(AUTO_COMMENT_FIELD) or {}
-                    comment_text = str(auto_meta.get("best_comment") or "").strip()
-                    score = auto_meta.get("best_score")
-                    category = auto_meta.get("category")
-                    language = auto_meta.get("language") or "unknown"
-                    post_url = str((doc.get("metadata") or {}).get("url") or f"https://x.com/{handle}/status/{pid}")
+                prev_det = sniffer.op_counts.get("TweetDetail", 0)
+                resp = page.goto(post_url, timeout=45000, wait_until="domcontentloaded")
+                sniffer.wait_for_op_increment(page, ("TweetDetail",), prev_det, timeout_ms=12000)
+                _wait_x_post_detail_ready(page, timeout_ms=15000)
+                page.wait_for_timeout(random.randint(1800, 3400))
+                _dismiss_overlays(page, aggressive=False, desc="x-pub-detail")
 
-                    if live_sent_count > 0:
-                        _sleep_jitter(action_delay_range)
+                step_status, step_msg = inspect_x_page_account_status(page)
+                if step_status != "ok":
+                    halt_status = step_status
+                    halt_warning = step_msg
+                    logger.error(f"🚨 [Module2/发评途中触发安全验证] {step_msg}")
+                    break
 
-                    prev_det = sniffer.op_counts.get("TweetDetail", 0)
-                    resp = page.goto(post_url, timeout=45000, wait_until="domcontentloaded")
-                    sniffer.wait_for_op_increment(page, ("TweetDetail",), prev_det, timeout_ms=12000)
-                    _wait_x_post_detail_ready(page, timeout_ms=15000)
-                    page.wait_for_timeout(random.randint(1800, 3400))
-                    _dismiss_overlays(page, aggressive=False, desc="x-pub-detail")
+                if resp and resp.status >= 400:
+                    skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": f"http_{resp.status}"})
+                    continue
 
-                    step_status, step_msg = inspect_x_page_account_status(page)
-                    if step_status != "ok":
-                        halt_status = step_status
-                        halt_warning = step_msg
-                        logger.error(f"🚨 [Module2/发评途中触发安全验证] {step_msg}")
-                        break
-
-                    if resp and resp.status >= 400:
-                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": f"http_{resp.status}"})
-                        continue
-
-                    post_unavailable = False
-                    for err_sel in ('div[data-testid="error-detail"]', 'div[data-testid="empty_state_header_text"]'):
-                        try:
-                            err_loc = page.locator(err_sel).first
-                            if err_loc.count() > 0 and err_loc.is_visible():
-                                post_unavailable = True
-                                break
-                        except Exception:
-                            pass
-                    if post_unavailable:
-                        _mark_objective_post_invalid(col, pid, "post_deleted_or_unavailable")
-                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "post_deleted_or_unavailable"})
-                        continue
-
-                    live_post = sniffer.detailed_posts_by_id.get(pid)
-                    live_prof = (
-                        (((live_post or {}).get("metadata") or {}).get("platform_extra") or {}).get("author_profile")
-                        or sniffer.users_by_handle.get(h_low)
-                    )
-
-                    live_pub_ts = safe_int((live_post or {}).get("publish_time"), pub_ts)
-                    if live_pub_ts <= 0 or (int(time.time()) - live_pub_ts) > max_age_sec:
-                        _mark_objective_post_invalid(col, pid, "expired_over_24h_live")
-                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "expired_over_24h_live"})
-                        continue
-
-                    if isinstance(live_prof, dict):
-                        is_blue = bool(live_prof.get("is_blue_verified") or live_prof.get("is_verified"))
-                        if not is_blue:
-                            _mark_objective_post_invalid(col, pid, "not_verified")
-                            skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "not_verified"})
-                            continue
-                        # 仅针对当前发评账号自己的关注关系判断：跳过但不污染公共帖子，其他未关注账号依然可用！
-                        if avoid_connected_authors and (
-                            bool(live_prof.get("is_following")) or bool(live_prof.get("is_followed_by"))
-                        ):
-                            skipped_items.append(
-                                {"post_id": pid, "author": f"@{handle}", "reason": "connected_with_current_account_only"}
-                            )
-                            continue
-
-                    if isinstance(live_post, dict):
-                        live_activity_reason = _check_post_activity_eligible(
-                            live_post,
-                            now_ts=int(time.time()),
-                            max_post_comments=max_comments_cap,
-                            stale_zero_engagement_seconds=stale_age_sec,
-                            stale_min_likes=min_stale_likes,
-                            pub_ts_override=live_pub_ts,
-                        )
-                        if live_activity_reason:
-                            logger.info(f"⏭️ [Module2/实时复核跳过] @{handle} post_id={pid} | reason={live_activity_reason}")
-                            skipped_items.append(
-                                {"post_id": pid, "author": f"@{handle}", "reason": f"live_{live_activity_reason}"}
-                            )
-                            continue
-
-                    # 先检查是否允许当前账号回复，再执行点赞，避免给限评帖先点赞后失败重试
-                    inline_box = page.locator('div[data-testid="tweetTextarea_0"], div[data-testid="tweetTextarea_0_label"]').first
-                    if inline_box.count() == 0 or not inline_box.is_visible():
-                        focal_tweet = _locate_focal_tweet(page, post_id=pid)
-                        reply_btn = focal_tweet.locator('button[data-testid="reply"]').first
-                        if reply_btn.count() > 0 and (
-                            reply_btn.is_disabled()
-                            or str(reply_btn.get_attribute("aria-disabled") or "").lower() == "true"
-                        ):
-                            _mark_objective_post_invalid(col, pid, "reply_restricted")
-                            skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "reply_restricted"})
-                            continue
-
+                post_unavailable = False
+                for err_sel in ('div[data-testid="error-detail"]', 'div[data-testid="empty_state_header_text"]'):
                     try:
-                        if like_when_commenting:
-                            _like_focal_tweet_on_page(page, pid, logger)
+                        err_loc = page.locator(err_sel).first
+                        if err_loc.count() > 0 and err_loc.is_visible():
+                            post_unavailable = True
+                            break
+                    except Exception:
+                        pass
+                if post_unavailable:
+                    _mark_objective_post_invalid(col, pid, "post_deleted_or_unavailable")
+                    skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "post_deleted_or_unavailable"})
+                    continue
 
-                        reply_container = _locate_x_reply_box(page, post_id=pid)
-                        comment_id = _submit_x_post(
-                            page,
-                            reply_container,
-                            content=comment_text,
-                            image_path_list=None,
-                            text_list=None,
-                            prepared_images=[],
+                live_post = sniffer.detailed_posts_by_id.get(pid)
+                live_prof = (
+                    (((live_post or {}).get("metadata") or {}).get("platform_extra") or {}).get("author_profile")
+                    or sniffer.users_by_handle.get(h_low)
+                )
+
+                live_pub_ts = safe_int((live_post or {}).get("publish_time"), pub_ts)
+                if live_pub_ts <= 0 or (int(time.time()) - live_pub_ts) > max_age_sec:
+                    _mark_objective_post_invalid(col, pid, "expired_over_24h_live")
+                    skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "expired_over_24h_live"})
+                    continue
+
+                if isinstance(live_prof, dict):
+                    is_blue = bool(live_prof.get("is_blue_verified") or live_prof.get("is_verified"))
+                    if not is_blue:
+                        _mark_objective_post_invalid(col, pid, "not_verified")
+                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "not_verified"})
+                        continue
+                    # 仅针对当前发评账号自己的关注关系判断：跳过但不污染公共帖子，其他未关注账号依然可用！
+                    if avoid_connected_authors and (
+                        bool(live_prof.get("is_following")) or bool(live_prof.get("is_followed_by"))
+                    ):
+                        skipped_items.append(
+                            {"post_id": pid, "author": f"@{handle}", "reason": "connected_with_current_account_only"}
                         )
-                        live_sent_count += 1
-                    except BusinessErrorException as biz_e:
-                        err_str = f"business_blocked:{biz_e}"
-                        halt_status = "cooldown_required"
-                        halt_warning = err_str
-                        logger.error(f"[Module2/业务阻断] @{handle} <{post_url}> | {err_str}")
-                        col.update_one(
-                            {"source": "x", "post_id": pid},
-                            {"$set": {f"{AUTO_COMMENT_FIELD}.last_publish_error": err_str, f"{AUTO_COMMENT_FIELD}.updated_at": now_iso_cn()}},
-                        )
-                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": err_str})
-                        break
-                    except Exception as send_e:
-                        err_str = str(send_e)[:240]
-                        logger.warning(f"[Module2/发送失败] @{handle} <{post_url}> | error={err_str}")
-                        col.update_one(
-                            {"source": "x", "post_id": pid},
-                            {"$set": {f"{AUTO_COMMENT_FIELD}.last_publish_error": err_str, f"{AUTO_COMMENT_FIELD}.updated_at": now_iso_cn()}},
-                        )
-                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": f"send_failed:{err_str}"})
                         continue
 
-                    follow_state = None
-                    if also_follow:
-                        page.wait_for_timeout(random.randint(2500, 4500))
-                        follow_state = _follow_author_in_same_session(page, handle, logger)
+                if isinstance(live_post, dict):
+                    live_activity_reason = _check_post_activity_eligible(
+                        live_post,
+                        now_ts=int(time.time()),
+                        max_post_comments=max_comments_cap,
+                        stale_zero_engagement_seconds=stale_age_sec,
+                        stale_min_likes=min_stale_likes,
+                        pub_ts_override=live_pub_ts,
+                    )
+                    if live_activity_reason:
+                        logger.info(f"⏭️ [Module2/实时复核跳过] @{handle} post_id={pid} | reason={live_activity_reason}")
+                        skipped_items.append(
+                            {"post_id": pid, "author": f"@{handle}", "reason": f"live_{live_activity_reason}"}
+                        )
+                        continue
 
-                    done_ts = int(time.time())
-                    done_iso = now_iso_cn()
-                    parent_source = (
-                        live_post
-                        if (isinstance(live_post, dict) and isinstance(live_post.get("engagement"), dict) and live_post.get("engagement"))
-                        else doc
+                # 先检查是否允许当前账号回复，再执行点赞，避免给限评帖先点赞后失败重试
+                inline_box = page.locator('div[data-testid="tweetTextarea_0"], div[data-testid="tweetTextarea_0_label"]').first
+                if inline_box.count() == 0 or not inline_box.is_visible():
+                    focal_tweet = _locate_focal_tweet(page, post_id=pid)
+                    reply_btn = focal_tweet.locator('button[data-testid="reply"]').first
+                    if reply_btn.count() > 0 and (
+                        reply_btn.is_disabled()
+                        or str(reply_btn.get_attribute("aria-disabled") or "").lower() == "true"
+                    ):
+                        _mark_objective_post_invalid(col, pid, "reply_restricted")
+                        skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": "reply_restricted"})
+                        continue
+
+                try:
+                    if like_when_commenting:
+                        _like_focal_tweet_on_page(page, pid, logger)
+
+                    reply_container = _locate_x_reply_box(page, post_id=pid)
+                    comment_id = _submit_x_post(
+                        page,
+                        reply_container,
+                        content=comment_text,
+                        image_path_list=None,
+                        text_list=None,
+                        prepared_images=[],
                     )
-                    parent_snap = _build_engagement_snapshot(parent_source, ts=done_ts, time_str=done_iso)
-                    publish_telemetry = _build_publish_telemetry(
-                        doc,
-                        parent_snap=parent_snap,
-                        live_pub_ts=live_pub_ts,
-                        select_ts=now_ts,
-                        done_ts=done_ts,
-                        candidate_rank=cand_rank,
-                        candidate_pool_size=candidate_pool_size,
-                        fresh_2h_pool_size=fresh_2h_pool_size,
-                        max_post_comments_cap=max_comments_cap,
-                    )
+                    live_sent_count += 1
+                except BusinessErrorException as biz_e:
+                    err_str = f"business_blocked:{biz_e}"
+                    halt_status = "cooldown_required"
+                    halt_warning = err_str
+                    logger.error(f"[Module2/业务阻断] @{handle} <{post_url}> | {err_str}")
                     col.update_one(
                         {"source": "x", "post_id": pid},
-                        {
-                            "$set": {
-                                f"{AUTO_COMMENT_FIELD}.consumed": True,
-                                f"{AUTO_COMMENT_FIELD}.consumed_by": consumer_label,
-                                f"{AUTO_COMMENT_FIELD}.consumed_dir": session_path,
-                                f"{AUTO_COMMENT_FIELD}.consumed_at": done_iso,
-                                f"{AUTO_COMMENT_FIELD}.consumed_at_ts": done_ts,
-                                f"{AUTO_COMMENT_FIELD}.published_comment_id": comment_id,
-                                f"{AUTO_COMMENT_FIELD}.published_comment_text": comment_text,
-                                f"{AUTO_COMMENT_FIELD}.parent_engagement_at_publish": parent_snap,
-                                f"{AUTO_COMMENT_FIELD}.publish_telemetry": publish_telemetry,
-                                f"{AUTO_COMMENT_FIELD}.follow_state": follow_state,
-                                f"{AUTO_COMMENT_FIELD}.last_publish_error": None,
-                                f"{AUTO_COMMENT_FIELD}.updated_at": done_iso,
-                            }
-                        },
+                        {"$set": {f"{AUTO_COMMENT_FIELD}.last_publish_error": err_str, f"{AUTO_COMMENT_FIELD}.updated_at": now_iso_cn()}},
                     )
-                    commented_authors.add(h_low)
-                    published_items.append(
-                        {
-                            "post_id": pid,
-                            "post_url": post_url,
-                            "author": f"@{handle}",
-                            "category": category,
-                            "language": language,
-                            "score": score,
-                            "comment_text": comment_text,
-                            "consumed_by": consumer_label,
-                            "consumed_at": done_iso,
-                            "status": "CONSUMED_AND_PUBLISHED",
-                            "comment_id": comment_id,
-                            "follow_state": follow_state,
+                    skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": err_str})
+                    break
+                except Exception as send_e:
+                    err_str = str(send_e)[:240]
+                    logger.warning(f"[Module2/发送失败] @{handle} <{post_url}> | error={err_str}")
+                    col.update_one(
+                        {"source": "x", "post_id": pid},
+                        {"$set": {f"{AUTO_COMMENT_FIELD}.last_publish_error": err_str, f"{AUTO_COMMENT_FIELD}.updated_at": now_iso_cn()}},
+                    )
+                    skipped_items.append({"post_id": pid, "author": f"@{handle}", "reason": f"send_failed:{err_str}"})
+                    continue
+
+                follow_state = None
+                if also_follow:
+                    page.wait_for_timeout(random.randint(2500, 4500))
+                    follow_state = _follow_author_in_same_session(page, handle, logger)
+
+                done_ts = int(time.time())
+                done_iso = now_iso_cn()
+                parent_source = (
+                    live_post
+                    if (isinstance(live_post, dict) and isinstance(live_post.get("engagement"), dict) and live_post.get("engagement"))
+                    else doc
+                )
+                parent_snap = _build_engagement_snapshot(parent_source, ts=done_ts, time_str=done_iso)
+                publish_telemetry = _build_publish_telemetry(
+                    doc,
+                    parent_snap=parent_snap,
+                    live_pub_ts=live_pub_ts,
+                    select_ts=now_ts,
+                    done_ts=done_ts,
+                    candidate_rank=cand_rank,
+                    candidate_pool_size=candidate_pool_size,
+                    fresh_2h_pool_size=fresh_2h_pool_size,
+                    max_post_comments_cap=max_comments_cap,
+                )
+                col.update_one(
+                    {"source": "x", "post_id": pid},
+                    {
+                        "$set": {
+                            f"{AUTO_COMMENT_FIELD}.consumed": True,
+                            f"{AUTO_COMMENT_FIELD}.consumed_by": consumer_label,
+                            f"{AUTO_COMMENT_FIELD}.consumed_dir": session_path,
+                            f"{AUTO_COMMENT_FIELD}.consumed_at": done_iso,
+                            f"{AUTO_COMMENT_FIELD}.consumed_at_ts": done_ts,
+                            f"{AUTO_COMMENT_FIELD}.published_comment_id": comment_id,
+                            f"{AUTO_COMMENT_FIELD}.published_comment_text": comment_text,
+                            f"{AUTO_COMMENT_FIELD}.parent_engagement_at_publish": parent_snap,
+                            f"{AUTO_COMMENT_FIELD}.publish_telemetry": publish_telemetry,
+                            f"{AUTO_COMMENT_FIELD}.follow_state": follow_state,
+                            f"{AUTO_COMMENT_FIELD}.last_publish_error": None,
+                            f"{AUTO_COMMENT_FIELD}.updated_at": done_iso,
                         }
-                    )
-                    logger.info(
-                        f"[Module2/消费成功] 账号={consumer_label} | [{category} | {language} | {score}分] @{handle} <{post_url}> | comment_id={comment_id}"
-                    )
-            finally:
-                if page is not None:
-                    try:
-                        page.remove_listener("response", sniffer.on_response)
-                    except Exception:
-                        pass
-                if context is not None:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
+                    },
+                )
+                commented_authors.add(h_low)
+                published_items.append(
+                    {
+                        "post_id": pid,
+                        "post_url": post_url,
+                        "author": f"@{handle}",
+                        "category": category,
+                        "language": language,
+                        "score": score,
+                        "comment_text": comment_text,
+                        "consumed_by": consumer_label,
+                        "consumed_at": done_iso,
+                        "status": "CONSUMED_AND_PUBLISHED",
+                        "comment_id": comment_id,
+                        "follow_state": follow_state,
+                    }
+                )
+                logger.info(
+                    f"[Module2/消费成功] 账号={consumer_label} | [{category} | {language} | {score}分] @{handle} <{post_url}> | comment_id={comment_id}"
+                )
+        finally:
+            try:
+                page.remove_listener("response", sniffer.on_response)
+            except Exception:
+                pass
 
     return {
         "status": halt_status or "ok",
@@ -875,8 +847,6 @@ def sync_recent_comment_metrics(
     - 历次采样追加到 `auto_comment.comment_engagement_history`（最多保留最近 72 个点）
     字段口径与顶层 `engagement` / `engagement_history` 完全一致，零 Cookie / 浏览器风控风险。
     """
-    from platforms.harvesters.x_harvester import XHarvester
-
     logger = get_growth_logger("x_growth_publisher")
     db = gen_db_object()
     col = db.get_collection(POSTS_COLLECTION_NAME)
@@ -936,12 +906,7 @@ def sync_recent_comment_metrics(
             "items": [],
         }
 
-    # 显式传入空字符串禁用账号 Cookie 抽取，确保 100% 走免登公开接口
-    harvester = XHarvester(
-        burner_cookies="",
-        burner_user_data_dir="",
-        proxies=get_requests_proxies(),
-    )
+    proxies = get_requests_proxies() or {}
 
     synced_ok = 0
     unavailable_count = 0
@@ -953,7 +918,7 @@ def sync_recent_comment_metrics(
         commenter = str(meta.get("consumed_by") or "").strip().lstrip("@")
         target_author = str((doc.get("author") or {}).get("username") or "").strip().lstrip("@")
         try:
-            parsed = harvester._fetch_tweet_zero_auth(comment_id, screen_name=commenter)
+            parsed = fetch_x_tweet_zero_auth(comment_id, screen_name=commenter, proxies=proxies)
             poll_count = int(prev_engagement.get("poll_count") or 0) + 1
             fetched_at = now_iso_cn()
             fetched_at_ts = int(time.time())
@@ -1136,6 +1101,8 @@ def run_comment_publisher_daemon(
     interval_seconds: Optional[int] = None,
     jitter_seconds: Optional[Tuple[int, int]] = None,
     account_pool: Optional[Sequence[Any]] = None,
+    max_rounds: int = 0,
+    dry_run: bool = False,
 ) -> None:
     """常驻定时多账号轮换消费发评循环（各账号独立去重、独立日限、独立风控冷却）。"""
     logger = get_growth_logger("x_growth_publisher")
@@ -1154,6 +1121,11 @@ def run_comment_publisher_daemon(
         j_low, j_high = 0, 0
 
     accounts = _resolve_publisher_pool(account_pool=account_pool, user_data_dir=user_data_dir)
+    if dry_run:
+        accounts = [
+            {**acc, "overrides": {**(acc.get("overrides") or {}), "dry_run": True}}
+            for acc in accounts
+        ]
     pool_desc = ", ".join(f"{a['name']}({a['user_data_dir']})" for a in accounts)
     logger.info(
         f"⏰ [Module2/常驻发评任务启动] 账号池({len(accounts)}个)=[{pool_desc}] | 周期={base_interval}s + 抖动({j_low}~{j_high}s) | "
@@ -1161,46 +1133,38 @@ def run_comment_publisher_daemon(
     )
 
     cooldown_until: Dict[str, float] = {}
-    round_no = 0
-    while True:
-        round_no += 1
+
+    def _step(round_no: int) -> Dict[str, Any]:
         logger.info(f"========== [Module2/发评轮次 #{round_no}] 开始执行 ==========")
         any_non_dry = False
-        try:
-            # 轮换账号先后顺序，保证 A/B 对比都能公平抢到前排候选帖
-            start_idx = (round_no - 1) % max(1, len(accounts))
-            ordered_accounts = accounts[start_idx:] + accounts[:start_idx]
+        start_idx = (round_no - 1) % max(1, len(accounts))
+        ordered_accounts = accounts[start_idx:] + accounts[:start_idx]
 
-            prev_did_live = False
-            for acc_cfg in ordered_accounts:
-                if prev_did_live and cooldown_until.get(acc_cfg["user_data_dir"], 0.0) <= time.time():
-                    _sleep_jitter((10, 20))
-                res, did_work = _run_single_account_publish(
-                    acc_cfg,
-                    round_no=round_no,
-                    cooldown_sec=cooldown_sec,
-                    cooldown_until=cooldown_until,
-                    logger=logger,
-                )
-                prev_did_live = did_work
-                if res is not None and not res.get("dry_run", False):
-                    any_non_dry = True
+        prev_did_live = False
+        for acc_cfg in ordered_accounts:
+            if prev_did_live and cooldown_until.get(acc_cfg["user_data_dir"], 0.0) <= time.time():
+                _sleep_jitter((10, 20))
+            res, did_work = _run_single_account_publish(
+                acc_cfg,
+                round_no=round_no,
+                cooldown_sec=cooldown_sec,
+                cooldown_until=cooldown_until,
+                logger=logger,
+            )
+            prev_did_live = did_work
+            if res is not None and not res.get("dry_run", False):
+                any_non_dry = True
 
-            if any_non_dry and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
-                try:
-                    sync_res = sync_recent_comment_metrics()
-                    if sync_res.get("synced_count", 0) or sync_res.get("unavailable_count", 0):
-                        logger.info(
-                            f"📊 [Module2/指标同步] 成功={sync_res.get('synced_count', 0)}条 | "
-                            f"不可用={sync_res.get('unavailable_count', 0)}条 | 跳过未到期={sync_res.get('skipped_recent', 0)}条"
-                        )
-                except Exception as metric_exc:
-                    logger.warning(f"[Module2/指标同步跳过] {metric_exc}")
-        except KeyboardInterrupt:
-            logger.info("[Module2/常驻发评退出] 收到手动中断信号，安全停止。")
-            break
-        except Exception as exc:
-            logger.exception(f"❌ [Module2/发评轮次 #{round_no} 异常] {exc}")
+        if any_non_dry and PUBLISHER_DEFAULTS.get("sync_metrics_after_publish", True):
+            try:
+                sync_res = sync_recent_comment_metrics()
+                if sync_res.get("synced_count", 0) or sync_res.get("unavailable_count", 0):
+                    logger.info(
+                        f"📊 [Module2/指标同步] 成功={sync_res.get('synced_count', 0)}条 | "
+                        f"不可用={sync_res.get('unavailable_count', 0)}条 | 跳过未到期={sync_res.get('skipped_recent', 0)}条"
+                    )
+            except Exception as metric_exc:
+                logger.warning(f"[Module2/指标同步跳过] {metric_exc}")
 
         now_ts = time.time()
         active_rem = [max(0.0, cooldown_until.get(a["user_data_dir"], 0.0) - now_ts) for a in accounts]
@@ -1212,30 +1176,57 @@ def run_comment_publisher_daemon(
         sleep_sec = sleep_base + (random.randint(j_low, j_high) if j_high > 0 else 0)
         next_run_time = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"💤 [Module2/常驻休眠] 休眠 {sleep_sec} 秒，下一轮将于 [{next_run_time}] 执行...")
-        try:
-            time.sleep(sleep_sec)
-        except KeyboardInterrupt:
-            logger.info("[Module2/常驻发评退出] 休眠期间收到中断信号，安全停止。")
-            break
+        return {"next_sleep_seconds": sleep_sec}
+
+    run_daemon_loop(
+        _step,
+        interval_seconds=base_interval,
+        additive_jitter_range=(j_low, j_high),
+        name="Module2",
+        logger_obj=logger,
+        max_rounds=max_rounds,
+    )
 
 
-if __name__ == "__main__":
+def main(argv: Optional[Sequence[str]] = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
-    if "--sync-metrics" in sys.argv[1:]:
-        print(json.dumps(sync_recent_comment_metrics(min_refresh_interval_sec=0), ensure_ascii=False, indent=2))
-        raise SystemExit(0)
+    parser = argparse.ArgumentParser(description="X 平台神评池消费发评与免登指标同步任务")
+    parser.add_argument("--once", action="store_true", help="仅运行单轮后立即退出（不进入常驻轮询）。")
+    parser.add_argument("--dry-run", action="store_true", help="只读预检候选评论，严禁启动浏览器或写入数据库。")
+    parser.add_argument("--sync-metrics", action="store_true", help="通过免登公开接口同步近期已发评论互动指标后退出。")
+    parser.add_argument("--interval-seconds", type=int, default=None, help="自定义常驻轮询基础间隔秒数。")
+    parser.add_argument("--user-data-dir", default=None, help="显式指定单账号 Chrome 会话目录。")
+    args = parser.parse_args(argv)
 
-    if PUBLISHER_DEFAULTS.get("continuous_loop", False):
-        run_comment_publisher_daemon(
-            interval_seconds=PUBLISHER_DEFAULTS.get("publish_interval_seconds", 3600),
-            jitter_seconds=PUBLISHER_DEFAULTS.get("publish_jitter_seconds", (180, 600)),
-        )
-    else:
-        pool = _resolve_publisher_pool()
-        results = [publish_comments_from_db(user_data_dir=a["user_data_dir"], **(a.get("overrides") or {})) for a in pool]
+    if args.sync_metrics:
+        print(json.dumps(sync_recent_comment_metrics(min_refresh_interval_sec=0), ensure_ascii=False, indent=2))
+        return 0
+
+    run_once = args.once or (not PUBLISHER_DEFAULTS.get("continuous_loop", False))
+    if run_once or args.dry_run:
+        pool = _resolve_publisher_pool(user_data_dir=args.user_data_dir)
+        results = []
+        for acc in pool:
+            overrides = dict(acc.get("overrides") or {})
+            if args.dry_run:
+                overrides["dry_run"] = True
+            results.append(publish_comments_from_db(user_data_dir=acc["user_data_dir"], **overrides))
         print(json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2))
+        return 0
+
+    run_comment_publisher_daemon(
+        user_data_dir=args.user_data_dir,
+        interval_seconds=args.interval_seconds or PUBLISHER_DEFAULTS.get("publish_interval_seconds", 3600),
+        jitter_seconds=PUBLISHER_DEFAULTS.get("publish_jitter_seconds", (180, 600)),
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

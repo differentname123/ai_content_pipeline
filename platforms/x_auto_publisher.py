@@ -11,10 +11,8 @@ X (Twitter) 自动化应用层调度脚本 (x_auto_publisher.py)
 - 显式故障报警：发帖或模型调用异常时，在控制台打印醒目的报错 Banner；
 - 状态持久化：发布成功/失败结果幂等回写至 MongoDB publish_records.x 与本地运行时状态文件。
 """
-import json
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -25,22 +23,21 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from app.ai_api.model_api import generate_content
 from common.common_utils import (
     PLATFORM_X,
     PROMPT_DIR,
-    clean_post_text,
     get_config,
     get_runtime_file_path,
-    read_file_to_str,
     read_json,
     resolve_session_dir,
     save_json,
     setup_logger,
-    string_to_object,
 )
+from common.daemon import run_daemon_loop
+from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager
+from common.x_text import calc_x_weighted_length
 from platforms.x_api import (
     _format_candidate_posts_literal,
     fetch_multi_x_user_posts,
@@ -109,23 +106,7 @@ STATE_FILE_PATH: str = str(get_runtime_file_path("x_publisher_state.json"))
 # 二、字符计算与工具函数
 # ==============================================================================
 
-def calculate_x_character_units(text: str) -> int:
-    """
-    计算推文在 X (Twitter) 规则下的长度计数单位：
-    - ASCII 半角字符（英文、数字、空格、英文字符）：计 1
-    - CJK 汉字、全角标点、Emoji 表情：计 2
-    - URL 链接（http:// 或 https:// 开头）：统一按 23 单位折算
-    """
-    if not text:
-        return 0
-    url_pattern = re.compile(r"https?://\S+")
-    urls = url_pattern.findall(text)
-    clean_text = url_pattern.sub("", text)
-
-    units = len(urls) * 23
-    for ch in clean_text:
-        units += 1 if ord(ch) <= 127 else 2
-    return units
+calculate_x_character_units = calc_x_weighted_length
 
 
 def load_publisher_state() -> Dict[str, Any]:
@@ -148,7 +129,11 @@ def save_publisher_state(state: Dict[str, Any]) -> None:
         logger.warning(f"[状态/保存] 持久化本地状态文件异常: {e}")
 
 
-def is_account_in_cooldown(account: Dict[str, Any], state: Dict[str, Any]) -> Tuple[bool, float]:
+def is_account_in_cooldown(
+    account: Dict[str, Any],
+    state: Dict[str, Any],
+    cooldown_seconds: float = ACCOUNT_POST_COOLDOWN_SECONDS,
+) -> Tuple[bool, float]:
     """
     检查账号当前是否处于发帖冷却中。
     返回: (是否在冷却中, 剩余冷却秒数)
@@ -156,10 +141,9 @@ def is_account_in_cooldown(account: Dict[str, Any], state: Dict[str, Any]) -> Tu
     alias = account["alias"]
     acc_state = state.get(alias) or {}
     last_pub_time = float(acc_state.get("last_publish_time") or 0.0)
-    now = time.time()
-    elapsed = now - last_pub_time
-    if elapsed < ACCOUNT_POST_COOLDOWN_SECONDS:
-        remaining = ACCOUNT_POST_COOLDOWN_SECONDS - elapsed
+    elapsed = time.time() - last_pub_time
+    if elapsed < float(cooldown_seconds):
+        remaining = float(cooldown_seconds) - elapsed
         return True, remaining
     return False, 0.0
 
@@ -285,58 +269,68 @@ def build_account_historical_posts_block(account: Dict[str, Any], count: int = H
 # 四、强模型决策与双重门禁校验
 # ==============================================================================
 
-def safe_parse_llm_json(raw_content: str) -> Dict[str, Any]:
+def _validate_x_selection_payload(data: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return "返回内容不是合法 JSON 对象"
+    if "selected_posts" not in data and "rejected_posts" not in data:
+        return "缺少必填字段 selected_posts / rejected_posts"
+    selected = data.get("selected_posts")
+    if selected is not None and not isinstance(selected, (list, dict)):
+        return "selected_posts 必须是数组或对象"
+    return None
+
+
+def select_x_posts_via_llm(
+    account: Dict[str, Any],
+    historical_block: str,
+    candidate_prompt_list: List[Dict[str, Any]],
+    max_retries: int = AI_MAX_RETRIES,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    鲁棒解析 LLM 返回的 JSON 字典：
-    1. 剥离 Markdown 代码块（```json ... ```）；
-    2. 剥离变量赋值前缀（如 `texts = ` 或 `result = `）；
-    3. 提取最外层匹配的 { ... }；
-    4. 采用 strict=False 允许字符串内存在未转义换行/制表符；
-    5. 兜底回退 string_to_object 双引擎解析。
+    通过统一 LLM 网关 (`model=None` + `preset_model_group="medium"`) 执行结构化选帖与改写，
+    返回 `(parsed_obj, llm_meta)`，忠实保留 `model_used`。
     """
-    if not isinstance(raw_content, str) or not raw_content.strip():
-        return {}
+    prompt_path = Path(PROMPT_TEMPLATE_PATH)
+    if not prompt_path.is_file():
+        raise FileNotFoundError(f"未找到提示词模板文件: {PROMPT_TEMPLATE_PATH}")
 
-    cleaned = raw_content.strip()
-    if "```" in cleaned:
-        cleaned = re.sub(r"^```(?:json|python)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        cleaned = cleaned.strip()
+    candidate_block = "以下是我待筛选的候选帖子列表：\n" + _format_candidate_posts_literal(candidate_prompt_list)
+    full_prompt, prompt_meta = render_prompt_template(
+        prompt_path,
+        {
+            "HISTORICAL_X_POSTS": historical_block.strip(),
+            "CANDIDATE_POSTS": candidate_block.strip(),
+        },
+    )
 
-    assign_match = re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*", cleaned)
-    if assign_match:
-        cleaned = cleaned[assign_match.end():].strip()
+    logger.info(
+        f"🤖 [AI决策/启动] 正在调度模型组 [{MODEL_PRESET_GROUP}] 审查候选池 | "
+        f"发帖账号: [@{account['screen_name']}] | 候选帖数: [{len(candidate_prompt_list)}] 篇"
+    )
 
-    start_idx = cleaned.find("{")
-    end_idx = cleaned.rfind("}")
-    if start_idx != -1 and end_idx > start_idx:
-        json_candidate = cleaned[start_idx : end_idx + 1]
-    else:
-        json_candidate = cleaned
+    parsed_obj, llm_meta = call_llm_json(
+        prompt=full_prompt,
+        prompt_meta=prompt_meta,
+        model=None,
+        preset_model_group=MODEL_PRESET_GROUP,
+        timeout=AI_TIMEOUT_SECONDS,
+        validator=_validate_x_selection_payload,
+        schema_retries=max(1, int(max_retries)),
+        retry_times=2,
+        task_label="X选帖",
+        logger_obj=logger,
+    )
+    if parsed_obj:
+        logger.info(
+            f"✅ [AI决策/完成] 结构化决策成功 | 模型: [{llm_meta.get('model_used')}] "
+            f"| 耗时: {llm_meta.get('duration_seconds', 0):.2f}s"
+        )
+        return parsed_obj, llm_meta
 
-    try:
-        obj = json.loads(json_candidate, strict=False)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    try:
-        obj = string_to_object(json_candidate)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    try:
-        repaired = re.sub(r",\s*([}\]])", r"\1", json_candidate)
-        obj = json.loads(repaired, strict=False)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    return {}
+    logger.error(
+        f"❌ [AI决策/失败] 模型组 [{MODEL_PRESET_GROUP}] 未返回有效决策: {llm_meta.get('error') or llm_meta.get('error_history')}"
+    )
+    return {}, llm_meta
 
 
 def query_ai_for_structured_selection(
@@ -345,51 +339,14 @@ def query_ai_for_structured_selection(
     candidate_prompt_list: List[Dict[str, Any]],
     max_retries: int = AI_MAX_RETRIES,
 ) -> Dict[str, Any]:
-    """
-    将客观历史数据与候选帖子装填入结构化提示词，请求强模型输出决策 JSON（失败自动重试机制）。
-    """
-    if not os.path.exists(PROMPT_TEMPLATE_PATH):
-        raise FileNotFoundError(f"未找到提示词模板文件: {PROMPT_TEMPLATE_PATH}")
-
-    template_str = read_file_to_str(PROMPT_TEMPLATE_PATH)
-    candidate_block = "以下是我待筛选的候选帖子列表：\n" + _format_candidate_posts_literal(candidate_prompt_list)
-
-    full_prompt = template_str.replace("{HISTORICAL_X_POSTS}", historical_block.strip()).replace(
-        "{CANDIDATE_POSTS}", candidate_block.strip()
+    """兼容封装：仅返回决策 JSON 字典。"""
+    parsed_obj, _ = select_x_posts_via_llm(
+        account=account,
+        historical_block=historical_block,
+        candidate_prompt_list=candidate_prompt_list,
+        max_retries=max_retries,
     )
-
-    logger.info(
-        f"🤖 [AI决策/启动] 正在调度强模型组 [{MODEL_PRESET_GROUP}] 审查候选池 | "
-        f"发帖账号: [@{account['screen_name']}] | 候选帖数: [{len(candidate_prompt_list)}] 篇 | 最大重试: [{max_retries}] 次"
-    )
-
-    for attempt in range(1, max_retries + 1):
-        t0 = time.time()
-        res = generate_content(
-            prompt=full_prompt,
-            preset_model_group=MODEL_PRESET_GROUP,
-            timeout=AI_TIMEOUT_SECONDS,
-        )
-        elapsed = time.time() - t0
-
-        # 极简结果导向：完全不依赖外部状态字段，直接拿结果说话——只要能解析出需要的选帖 JSON，即判定成功
-        raw_content = res.get("content", "") if isinstance(res, dict) else str(res or "")
-        parsed_obj = safe_parse_llm_json(raw_content)
-
-        if isinstance(parsed_obj, dict) and ("selected_posts" in parsed_obj or "rejected_posts" in parsed_obj):
-            logger.info(f"✅ [AI决策/完成] 结构化决策返回成功 | 尝试: [第{attempt}次] | 耗时: {elapsed:.2f}s")
-            return parsed_obj
-
-        err_detail = res.get("error_history") if isinstance(res, dict) and res.get("error_history") else "未能解析出符合规范的选帖JSON"
-        logger.warning(f"⚠️ [AI决策/重试] 强模型组 [{MODEL_PRESET_GROUP}] 第 {attempt}/{max_retries} 次未获得有效决策: {err_detail}")
-
-        if attempt < max_retries:
-            wait_sec = AI_RETRY_DELAY_SECONDS * attempt
-            logger.info(f"⏳ [AI重试等待] 将在 {wait_sec} 秒后自动发起第 {attempt + 1} 次重试...")
-            time.sleep(wait_sec)
-
-    logger.error(f"❌ [AI决策/耗尽] 连续 {max_retries} 次调用强模型组 [{MODEL_PRESET_GROUP}] 均未确认成功，本轮放弃")
-    return {}
+    return parsed_obj
 
 
 def validate_double_gates(selected_item: Dict[str, Any]) -> Tuple[bool, str, int, int]:
@@ -478,6 +435,8 @@ def execute_publish_and_update_state(
     x_units: int,
     state: Dict[str, Any],
     dry_run: bool = False,
+    model_used: str = "",
+    browser_visible: bool = BROWSER_VISIBLE,
 ) -> bool:
     """
     调用 Playwright 发帖，检查返回状态，显式打印 Banner 日志，并幂等回写至数据库与本地状态。
@@ -528,7 +487,7 @@ def execute_publish_and_update_state(
         content=final_text,
         image_path_list=image_paths,
         user_data_dir=session_dir,
-        debug=BROWSER_VISIBLE,
+        debug=browser_visible,
     )
 
     now_ts = time.time()
@@ -569,6 +528,7 @@ def execute_publish_and_update_state(
             "publish_text": final_text,
             "grade": grade,
             "selection_reason": reason,
+            "model_used": str(model_used or ""),
             "raw_chars": raw_chars,
             "x_units": x_units,
             "bait_comments": bait_comments,
@@ -591,6 +551,8 @@ def execute_publish_and_update_state(
 
     # 3. 本地账号状态文件更新
     acc_state = state.setdefault(alias, {})
+    if model_used:
+        acc_state["last_model_used"] = str(model_used)
     if success:
         acc_state["last_publish_time"] = now_ts
         acc_state["last_publish_time_str"] = now_str
@@ -610,27 +572,39 @@ def execute_publish_and_update_state(
 # 六、单轮巡检与主循环总控
 # ==============================================================================
 
-def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None:
+def run_single_check_cycle(
+    state: Dict[str, Any],
+    dry_run: bool = False,
+    *,
+    force: bool = False,
+    cooldown_seconds: float = ACCOUNT_POST_COOLDOWN_SECONDS,
+    candidate_hours: int = CANDIDATE_LOOKBACK_HOURS,
+    browser_visible: bool = BROWSER_VISIBLE,
+) -> Dict[str, Any]:
     """
     单轮巡检：依次遍历配置的目标账号，判定冷却与候选发布。
+    若全部账号均在冷却中，返回精确 `next_sleep_seconds` 避免轮询空转刷屏日志。
     """
+    cooldown_waits: List[Tuple[str, float]] = []
+    ready_count = 0
+    published_any = False
+
     for account in TARGET_ACCOUNTS:
-        alias = account["alias"]
         screen_name = account["screen_name"]
 
         # 1. 冷却门禁校验（强制执行账号发帖冷却，规避同号短时密集连发触发 AuthorDiversityScorer 降权）
-        in_cooldown, remaining_sec = is_account_in_cooldown(account, state)
-        if in_cooldown and not dry_run:
-            rem_min = max(1, int(remaining_sec // 60))
-            logger.info(f"⏳ [冷却跳过] 账号 [@{screen_name}] 处于发帖冷却中（还需等待约 {rem_min} 分钟）")
+        in_cooldown, remaining_sec = is_account_in_cooldown(account, state, cooldown_seconds=cooldown_seconds)
+        if in_cooldown and not dry_run and not force:
+            cooldown_waits.append((screen_name, remaining_sec))
             continue
 
+        ready_count += 1
         logger.info(f"🎯 [账号就绪] 账号 [@{screen_name}] 冷却完毕，开始执行选帖与发布检查")
 
         # 2. 拉取未发布的精品候选帖
-        candidates = fetch_unposted_viral_candidates(hours=CANDIDATE_LOOKBACK_HOURS, limit=CANDIDATE_QUERY_LIMIT)
+        candidates = fetch_unposted_viral_candidates(hours=candidate_hours, limit=CANDIDATE_QUERY_LIMIT)
         if not candidates:
-            logger.info(f"ℹ️ [候选池为空] 近 {CANDIDATE_LOOKBACK_HOURS}h 暂无待发布的可用候选文章，跳过本轮")
+            logger.info(f"ℹ️ [候选池为空] 近 {candidate_hours}h 暂无待发布的可用候选文章，跳过本轮")
             continue
 
         prompt_candidates, candidates_map = build_candidate_prompt_data(candidates)
@@ -641,12 +615,13 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
         # 3. 获取客观历史战报
         historical_block = build_account_historical_posts_block(account, count=HISTORICAL_REF_COUNT)
 
-        # 4. 强模型结构化决策
-        ai_res = query_ai_for_structured_selection(account, historical_block, prompt_candidates)
+        # 4. 结构化选帖决策
+        ai_res, llm_meta = select_x_posts_via_llm(account, historical_block, prompt_candidates)
         if not ai_res:
-            logger.warning(f"⚠️ [决策跳过] 强模型未返回有效决策，账号 [@{screen_name}] 等待下轮巡检")
+            logger.warning(f"⚠️ [决策跳过] 模型组未返回有效决策，账号 [@{screen_name}] 等待下轮巡检")
             continue
 
+        model_used = str(llm_meta.get("model_used") or "")
         selected_posts = ai_res.get("selected_posts") or []
         if isinstance(selected_posts, dict):
             selected_posts = [selected_posts]
@@ -659,17 +634,16 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
             )
             continue
 
-        # 5. 逐一应用双重门禁（严格确保 S 级优先于 A 级，再按模型排位审核）
+        # 5. 逐一应用双重门禁（仅限 ALLOW_GRADES 且 140 原字 / 280 X单位）
         selected_posts = sorted(
             selected_posts,
             key=lambda item: 0 if isinstance(item, dict) and str(item.get("grade") or "").strip().upper() == "S" else 1,
         )
         published_this_round = False
-        for rank_idx, sel_item in enumerate(selected_posts, 1):
+        for sel_item in selected_posts:
             cand_id = str(sel_item.get("id") or "").strip()
             grade = str(sel_item.get("grade") or "").strip().upper()
 
-            # 双重门禁校验
             is_valid, gate_reason, raw_chars, x_units = validate_double_gates(sel_item)
             if not is_valid:
                 logger.info(
@@ -678,16 +652,13 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
                 )
                 continue
 
-            # 匹配真实数据库文档
             matched_doc = candidates_map.get(cand_id)
             if not matched_doc:
                 logger.warning(f"⚠️ [素材匹配] 未能在候选池映射中找到 ID [{cand_id}] 的原始文档，尝试下一篇")
                 continue
 
-            # 解析本地真实配图
             image_paths = resolve_candidate_images(matched_doc, sel_item.get("selected_images") or [])
 
-            # 6. 执行正式发布
             pub_ok = execute_publish_and_update_state(
                 account=account,
                 candidate_doc=matched_doc,
@@ -697,53 +668,83 @@ def run_single_check_cycle(state: Dict[str, Any], dry_run: bool = False) -> None
                 x_units=x_units,
                 state=state,
                 dry_run=dry_run,
+                model_used=model_used,
+                browser_visible=browser_visible,
             )
             if pub_ok:
                 published_this_round = True
-                break  # 账号单轮仅发布 1 篇最高评级精品帖，随后进入半小时冷却
+                published_any = True
+                break
 
         if not published_this_round:
             logger.info(f"ℹ️ [本轮结束] 账号 [@{screen_name}] 本轮候选均未通过最终发帖门禁，静默等待下轮")
 
+    if ready_count == 0 and cooldown_waits:
+        min_sn, min_rem = min(cooldown_waits, key=lambda item: item[1])
+        next_bj = (datetime.now(timezone(timedelta(hours=8))) + timedelta(seconds=min_rem + 2.0)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        rem_min = max(1, int((min_rem + 59) // 60))
+        logger.info(
+            f"⏳ [冷却休眠] 全部账号处于发帖冷却中（最早就绪 @{min_sn}，约 {rem_min} 分钟后 [{next_bj}] 唤醒）"
+        )
+        return {"status": "cooldown", "next_sleep_seconds": max(1.0, float(min_rem) + 2.0)}
+
+    if cooldown_waits:
+        skipped_desc = ", ".join(f"@{sn}({int(sec // 60)}m)" for sn, sec in cooldown_waits)
+        logger.info(f"⏳ [冷却跳过] 以下账号仍在冷却期已跳过: {skipped_desc}")
+
+    return {"status": "published" if published_any else "idle"}
+
 
 def main() -> None:
-    """应用层总控主入口（在 IDE 中直接点击绿色三角运行即可常驻无尽循环；亦支持命令行参数）"""
+    """应用层总控主入口（直接运行进入常驻守护循环；支持命令行参数配置）。"""
     import argparse
+
     parser = argparse.ArgumentParser(description="X (Twitter) 自动化精选图文发帖总控")
     parser.add_argument("--dry-run", action="store_true", help="模拟测试：执行完整选帖与双重门禁校验，但不实际调用浏览器发帖")
-    parser.add_argument("--once", action="store_true", help="单次执行：仅执行单轮巡检后立即退出（不进入循环休眠）")
+    parser.add_argument("--once", action="store_true", help="单次执行：仅执行单轮巡检后立即退出")
+    parser.add_argument("--force", action="store_true", help="忽略账号发布冷却检查强制执行一轮")
+    parser.add_argument("--poll-seconds", type=int, default=CHECK_INTERVAL_SECONDS, help="候选为空/未发帖时的巡检休眠间隔(秒)")
+    parser.add_argument("--cooldown-hours", type=float, default=ACCOUNT_POST_COOLDOWN_SECONDS / 3600.0, help="同账号成功发帖后的冷却小时数")
+    parser.add_argument("--candidate-hours", type=int, default=CANDIDATE_LOOKBACK_HOURS, help="候选文章回溯小时数")
+    parser.add_argument("--debug", action="store_true", help="强制开启可见浏览器窗口")
     args, _ = parser.parse_known_args()
+
+    poll_seconds = max(30, int(args.poll_seconds))
+    cooldown_seconds = max(0.0, float(args.cooldown_hours) * 3600.0)
+    browser_visible = True if args.debug else BROWSER_VISIBLE
 
     print("\n" + "=" * 90)
     print("🚀 X (Twitter) 全自动精选图文发帖总控启动")
     print(f"- 目标账号清单: {len(TARGET_ACCOUNTS)} 个 {[a['alias'] + '(@' + a['screen_name'] + ')' for a in TARGET_ACCOUNTS]}")
-    print(f"- 巡检休眠周期: 每 {CHECK_INTERVAL_SECONDS} 秒 (约 {int(CHECK_INTERVAL_SECONDS // 60)} 分钟) 检查一轮")
-    print(f"- 账号发帖冷却: 每篇发布后强制冷却 {ACCOUNT_POST_COOLDOWN_SECONDS} 秒 (约 {int(ACCOUNT_POST_COOLDOWN_SECONDS // 60)} 分钟)")
-    print(f"- 精品等级门禁: 仅发送评级为 {ALLOWED_GRADES} 的内容（非精品坚决不发）")
-    print(f"- 字符限制门禁: 纯汉字上限 {MAX_X_RAW_CHARS} 字，标准计算单位上限 {MAX_X_UNITS} 单位")
-    print(f"- 运行模式: {'【模拟测试 DRY-RUN】' if args.dry_run else '【正式实盘发帖】'} | 浏览器模式: {'可见窗口 (Debug)' if BROWSER_VISIBLE else '后台无头 (Headless)'}")
+    print(f"- 巡检休眠周期: {poll_seconds} 秒 | 账号冷却: {cooldown_seconds / 3600.0:.2f} 小时 | 回溯窗口: {args.candidate_hours}h")
+    print(f"- 精品等级门禁: 仅发送 {ALLOWED_GRADES} 级 | 字数门禁: <={MAX_X_RAW_CHARS} 字 / <={MAX_X_UNITS} X单位")
+    print(f"- 运行模式: {'【模拟测试 DRY-RUN】' if args.dry_run else '【正式实盘发帖】'} | 浏览器模式: {'可见窗口' if browser_visible else '后台无头'}")
     print("=" * 90 + "\n")
 
     state = load_publisher_state()
 
+    def _step(round_idx: int) -> Dict[str, Any]:
+        logger.info(f"========== [x_auto_publisher] 开始第 #{round_idx} 轮巡检 ==========")
+        return run_single_check_cycle(
+            state,
+            dry_run=args.dry_run,
+            force=args.force,
+            cooldown_seconds=cooldown_seconds,
+            candidate_hours=args.candidate_hours,
+            browser_visible=browser_visible,
+        )
+
     try:
-        cycle_count = 1
-        while True:
-            logger.info(f"\n{'#' * 40} 开始第 【{cycle_count}】 轮巡检 {'#' * 40}")
-            try:
-                run_single_check_cycle(state, dry_run=args.dry_run)
-            except Exception as e:
-                logger.exception(f"❌ [主循环/异常] 本轮巡检发生未捕获异常: {e}，将在下次循环中自动自愈重试")
-
-            if args.once:
-                logger.info("🏁 已开启 --once 参数，单轮巡检执行完毕，正常退出。")
-                break
-
-            logger.info(f"💤 第 【{cycle_count}】 轮巡检结束，进入休眠，将在 {CHECK_INTERVAL_SECONDS} 秒后启动下一轮...")
-            cycle_count += 1
-            time.sleep(CHECK_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        logger.info("\n🛑 收到人工中断信号 (Ctrl+C)，X 发帖总控已安全退出。")
+        run_daemon_loop(
+            _step,
+            interval_seconds=poll_seconds,
+            name="x_auto_publisher",
+            logger_obj=logger,
+            max_rounds=1 if args.once else 0,
+        )
+    finally:
         save_publisher_state(state)
 
 

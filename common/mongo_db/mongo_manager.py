@@ -18,6 +18,10 @@ from common.mongo_db.mongo_base import gen_db_object
 setup_logger()
 logger = logging.getLogger(__name__)
 
+# 全新独立的多平台帖子采集集合名称（与历史 social_media_posts 物理隔离）
+HARVESTED_POSTS_COLLECTION = "harvested_social_posts"
+NEW_HARVESTED_COLLECTION_NAME = HARVESTED_POSTS_COLLECTION
+
 _INDEXED_COLLECTIONS = set()
 _INDEX_LOCK = threading.Lock()
 
@@ -166,7 +170,7 @@ class HarvestedPostManager(UniversalPostManager):
     3. 非破坏性合并：复抓时保留首次发现时间 `first_seen_at`，并智能合并已下载的本地图片映射 (`media.local_mapping`) 与热评列表 (`comments`)。
     """
 
-    COLLECTION_NAME = "harvested_social_posts"
+    COLLECTION_NAME = HARVESTED_POSTS_COLLECTION
     UNIQUE_KEYS = ["source", "post_id"]
     MAX_HISTORY_SNAPSHOTS = 48
 
