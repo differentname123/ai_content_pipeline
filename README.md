@@ -55,8 +55,7 @@ ai_content_pipeline/
 │   ├── comment_generator.py          # `low` 批量生成与分类 + `medium` 独立盲测打分（20 条/波清零）
 │   ├── comment_pipeline.py           # 【生产守护进程 3】采集 + 生成一键串联守护进程
 │   ├── comment_publisher.py          # 【生产守护进程 4】主号神评消费、防爆楼（<=15 评 / >=75 分）与免登指标回流
-│   ├── follow_selector.py            # 高互关概率账号筛选评分（S/A/B）、暖线索识别与回关核验台账
-│   └── auto_follower.py              # 每小时自动补采+双号关注守护进程（含 `--dry-run` / `--status` / `--login`）
+│   └── auto_follower.py              # 极简每小时自动互关守护进程（含 `--dry-run` / `--status` / `--once`）
 │
 ├── prompt/                           # 当前活跃的 11 个生产/人工复盘提示词模板
 └── tests/                            # 确定性离线单元测试套件（零真实网络/数据库/浏览器副作用）
@@ -97,13 +96,12 @@ playwright install chromium
   python x_growth/comment_publisher.py --once --dry-run
   python x_growth/comment_publisher.py --sync-metrics
   ```
-- **X 高互关账号筛选与每小时自动关注**：
+- **X 极简每小时自动互关**：
   ```bash
-  python x_growth/auto_follower.py                   # 默认每小时巡检一次，为 x_myself 与 x_dahao 执行互关
-  python x_growth/auto_follower.py --dry-run         # 零浏览器预览当前 S/A/B 级候选名单
-  python x_growth/auto_follower.py --status          # 只读查看候选池、24h 配额与各档真实回关率
+  python x_growth/auto_follower.py                   # 默认每小时巡检一次，为 x_myself (@peterzhu1003) 执行互关（8/时, 80/天）
+  python x_growth/auto_follower.py --dry-run         # 零浏览器预览下一批待关注候选名单
+  python x_growth/auto_follower.py --status          # 只读查看当前合格池、24h 配额与真实回关率
   python x_growth/auto_follower.py --once --check-followbacks
-  python x_growth/auto_follower.py --login x_dahao   # 首次为 x_dahao 扫码登录固化浏览器目录
   ```
 - **人工扫码/登录浏览器会话接管**：直接运行 `platforms/binance_playwright.py`、`platforms/okx_playwright.py` 或 `platforms/x_playwright.py`。
 

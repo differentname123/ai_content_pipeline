@@ -29,8 +29,6 @@ X_GROWTH_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
 # 唯一复用的帖子集合名，绝不新建额外数据表；所有评论生产与消费状态统一收纳在文档内 `auto_comment` 字段下
 POSTS_COLLECTION_NAME: str = HARVESTED_POSTS_COLLECTION  # "harvested_social_posts"
 AUTO_COMMENT_FIELD: str = "auto_comment"
-FOLLOW_CANDIDATES_COLLECTION_NAME: str = "x_follow_candidates"
-FOLLOW_RECORDS_COLLECTION_NAME: str = "x_follow_records"
 
 # 仅针对经过验证的高收益语种区（英语 en、日语 ja）生成与发布同语种评论
 SUPPORTED_COMMENT_LANGUAGES: Tuple[str, ...] = ("en", "ja")
@@ -190,59 +188,4 @@ PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "risk_cooldown_seconds": 21600,     # 遇安全验证或服务端限流拒收时自动静默冷却秒数（6 小时）
     "sync_metrics_after_publish": True, # 每轮发评完成后通过免登接口同步近期已发评论的阅读/点赞等公开指标
     "metrics_lookback_hours": 72,       # 每次自动同步回溯最近多少小时内已消费发布的评论（默认 72 小时）
-}
-
-# ==============================================================================
-# 五、模块 3：高互关概率筛选与每小时自动关注配置（直接右键运行 auto_follower.py 即生效）
-# 默认仅启用主号矩阵 `x_myself` 与 `x_dahao`；采集小号 `x_xiaohao` 严禁参与关注，仅用于被动补采
-# ==============================================================================
-FOLLOWER_DEFAULTS: Dict[str, Any] = {
-    "collector_user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_xiaohao"),
-    "account_pool": [
-        {
-            "name": "x_myself",
-            "screen_name": str(get_config("x_myself_screen_name", "peterzhu1003") or "peterzhu1003").strip().lstrip("@"),
-            "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
-            "enabled": True,
-            "max_follow_per_run": 2,
-            "max_follow_per_day": 15,
-        },
-        {
-            "name": "x_dahao",
-            "screen_name": str(get_config("x_dahao_screen_name", "2434954452qqc") or "2434954452qqc").strip().lstrip("@"),
-            "user_data_dir": resolve_session_dir("x_dahao_browser_session_dir", "x_dahao"),
-            "enabled": True,
-            "max_follow_per_run": 2,
-            "max_follow_per_day": 25,
-        },
-    ],
-    "continuous_loop": True,
-    "interval_seconds": 3600,                   # 每小时巡检拉取与执行关注一次（3600 秒）
-    "jitter_seconds": (180, 480),               # 3~8 分钟随机正抖动，避免固定整点指纹
-    "collector_reuse_window_seconds": 3000,     # 若 50 分钟内已有浏览器新抓数据且库内合格池充足，直接复用免开小号
-    "min_candidate_pool_trigger": 30,           # 活跃合格候选低于该阈值时触发小号被动补采
-    "sync_posts_lookback_days": 7,              # 从 harvested_social_posts 同步近 7 天活跃作者画像
-    "warm_interaction_lookback_days": 30,       # 统计近 30 天与当前账号有过正向互动的暖线索作者
-    "follow_back_sync_interval_seconds": 14400, # 每 4 小时顺路核验一次粉丝列表，统计真实回关率
-    # 【保留过滤原因说明】6 条高概率确定性硬门槛：剔除无蓝V小号、私密锁推号、大V/僵尸号、X 5000 关注上限卡死号、单向不回关号与拒互关号
-    "require_verified": True,                   # 同体量蓝V创作者更有互关与冲曝光动机
-    "min_followers": 100,                       # 过滤极早期死号/新注册空壳号
-    "max_followers": 3000,                      # 同体量小号回关意愿远高于万粉大V
-    "min_following": 50,                        # 过滤从不主动关注他人的低活跃号
-    "max_following_cap": 4500,                  # 避开接近 X 5000 关注上限无法再回关的账号
-    "min_ff_ratio": 0.80,                       # following/followers >= 0.80 表明对方有真实回关习惯
-    "warm_min_ff_ratio": 0.50,                  # 仅对已赞过/回复过本号评论的暖线索适度放宽至 0.50
-    "max_ff_ratio": 3.00,                       # 过滤无差别狂扫垃圾号与低质量水号
-    "min_statuses_count": 20,                   # 过滤几乎不发推的僵尸/假号
-    "active_within_days": 7,                    # 仅保留近 7 天仍有公开发推的活人账号
-    "allowed_languages": None,                  # None=不限语种（跨语种互关均收，可按账号单独覆盖）
-    "min_score": 50,                            # 最低综合互关潜力分（0~100）
-    "browser_visible": False,
-    "dry_run": False,
-    "max_follow_per_run": 2,                    # 单轮单号默认最多关注 2 人（动作分散、安全优先）
-    "max_follow_per_day": 20,                   # 默认单号 24h 滚动关注上限
-    "action_delay_range": (15, 30),             # 同轮连续关注多人时的随机拟人间隔秒数
-    "risk_cooldown_seconds": 21600,             # 遇限流/验证码/登录失效时独立静默冷却 6 小时
-    "self_following_safety_cap": 4800,          # 己方账号接近 X 5000 关注上限且未够高粉时自动停关保护
-    "failed_retry_cooldown_seconds": 86400,     # 单次网络/页面偶发失败的候选 24h 后才允许重试
 }

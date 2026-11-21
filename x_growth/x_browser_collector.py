@@ -607,17 +607,6 @@ class XPassiveGraphQLSniffer:
         out.sort(key=lambda x: safe_int(x.get("publish_time"), 0), reverse=True)
         return out
 
-    def export_discovered_users(self) -> List[Dict[str, Any]]:
-        """导出本轮顺路被动嗅探到的全部去重作者画像快照（供互关候选池无损同步）。"""
-        exported: List[Dict[str, Any]] = []
-        for u in self.users_by_handle.values():
-            if not isinstance(u, dict) or not u.get("screen_name"):
-                continue
-            item = dict(u)
-            item["observed_langs"] = sorted(str(x) for x in (u.get("observed_langs") or set()) if x)
-            exported.append(item)
-        return exported
-
     def wait_for_op_increment(self, page: Any, ops: Sequence[str], prev_total: int, timeout_ms: int = 12000) -> bool:
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
@@ -911,7 +900,6 @@ def collect_posts_via_browser(
             "account_message": f"浏览器会话目录不存在: {session_path}",
             "self_handle": "",
             "all_captured_posts": [],
-            "discovered_users": [],
             "peer_users_discovered": 0,
             "threads_clicked": 0,
             "profiles_visited": 0,
@@ -953,7 +941,6 @@ def collect_posts_via_browser(
                         "account_message": acc_msg,
                         "self_handle": "",
                         "all_captured_posts": [],
-                        "discovered_users": [],
                         "peer_users_discovered": 0,
                         "threads_clicked": 0,
                         "profiles_visited": 0,
@@ -1057,7 +1044,6 @@ def collect_posts_via_browser(
                 max_posts_per_author=max_posts_per_author,
                 peer_follower_range=(min_followers, max_followers),
             )
-            discovered_users = sniffer.export_discovered_users()
             if not all_captured_posts and sum(sniffer.op_counts.values()) == 0:
                 msg = "首页浏览未监听到任何 GraphQL 响应 (gql_ops={})，疑似页面加载异常或网络抖动，拒绝静默伪装为正常 0 条。"
                 logger.warning(f"⚠️ [PostCollector/空采告警] 采集号=@{self_handle or self_uid or '未知'} | {msg}")
@@ -1066,7 +1052,6 @@ def collect_posts_via_browser(
                     "account_message": msg,
                     "self_handle": self_handle,
                     "all_captured_posts": [],
-                    "discovered_users": [],
                     "peer_users_discovered": len(peer_users),
                     "threads_clicked": clicked_threads,
                     "profiles_visited": visited_profiles,
@@ -1082,7 +1067,6 @@ def collect_posts_via_browser(
                 "account_message": None,
                 "self_handle": self_handle,
                 "all_captured_posts": all_captured_posts,
-                "discovered_users": discovered_users,
                 "peer_users_discovered": len(peer_users),
                 "threads_clicked": clicked_threads,
                 "profiles_visited": visited_profiles,
@@ -1163,7 +1147,6 @@ def collect_and_save_posts(
             "browsed_posts_saved": 0,
             "browsed_new_in_db": 0,
             "browsed_updated_in_db": 0,
-            "follow_candidates_synced": 0,
             "peer_users_discovered": 0,
             "threads_clicked": 0,
             "profiles_visited": 0,
@@ -1175,22 +1158,10 @@ def collect_and_save_posts(
         col=col,
         all_posts=browser_res.get("all_captured_posts") or [],
     )
-    follow_candidates_synced = 0
-    discovered_users = browser_res.get("discovered_users") or []
-    if discovered_users:
-        try:
-            from x_growth.follow_selector import upsert_discovered_users
-
-            cand_sync_res = upsert_discovered_users(db, discovered_users)
-            follow_candidates_synced = int(cand_sync_res.get("upserted", 0))
-        except Exception as sync_exc:
-            logger.warning(f"[PostCollector/互关候选池同步跳过] {sync_exc}")
-
     elapsed = round(time.perf_counter() - t0, 2)
     logger.info(
         f"[PostCollector/入库完成] 耗时={elapsed}s | 顺路沉淀主帖={upsert_stats.get('total', 0)}条 "
-        f"(新增={upsert_stats.get('new_count', 0)}条, 刷新={upsert_stats.get('updated_count', 0)}条) | "
-        f"同步作者画像={follow_candidates_synced}人"
+        f"(新增={upsert_stats.get('new_count', 0)}条, 刷新={upsert_stats.get('updated_count', 0)}条)"
     )
     return {
         "status": "ok",
@@ -1200,7 +1171,6 @@ def collect_and_save_posts(
         "browsed_posts_saved": int(upsert_stats.get("total", 0)),
         "browsed_new_in_db": int(upsert_stats.get("new_count", 0)),
         "browsed_updated_in_db": int(upsert_stats.get("updated_count", 0)),
-        "follow_candidates_synced": follow_candidates_synced,
         "peer_users_discovered": int(browser_res.get("peer_users_discovered", 0)),
         "threads_clicked": int(browser_res.get("threads_clicked", 0)),
         "profiles_visited": int(browser_res.get("profiles_visited", 0)),

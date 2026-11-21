@@ -1,32 +1,29 @@
 # -*- coding: utf-8 -*-
-"""Offline unit tests for X mutual-follow selection, safety isolation, follow-back tracking, and daemon behavior."""
+"""Offline unit tests for simplified X auto-follower (`x_growth/auto_follower.py`)."""
+import re
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from common.mongo_db.mongo_manager import HARVESTED_POSTS_COLLECTION
 from common.post_utils import AccountIsolationError
 from x_growth.auto_follower import (
-    _assert_safe_collector_dir,
-    _resolve_follower_pool,
-    run_follow_round,
-)
-from x_growth.follow_selector import (
-    FOLLOW_CANDIDATES_COLLECTION_NAME,
-    FOLLOW_RECORDS_COLLECTION_NAME,
-    build_follow_ops_summary,
-    evaluate_follow_candidate,
+    FOLLOW_RECORDS_COLLECTION,
+    STRATEGY_VERSION,
+    TARGET_ACCOUNTS,
+    assert_safe_collector_dir,
+    build_status_report,
+    find_follow_candidates,
+    format_status_text,
+    is_worth_following,
     mark_follow_backs,
     record_follow_outcome,
-    select_follow_candidates_for_account,
-    upsert_discovered_users,
+    resolve_target_accounts,
+    run_follow_round,
 )
-from x_growth.growth_config import AUTO_COMMENT_FIELD, POSTS_COLLECTION_NAME
-from x_growth.x_browser_collector import (
-    XPassiveGraphQLSniffer,
-    extract_user_profile_from_gql_result,
-)
+from x_growth.x_browser_collector import extract_user_profile_from_gql_result
 
 
 def _get_dotted(doc, key):
@@ -56,34 +53,23 @@ def _match_query(doc, query):
             if not any(_match_query(doc, sub) for sub in cond):
                 return False
             continue
-        if k == "$and":
-            if not all(_match_query(doc, sub) for sub in cond):
-                return False
-            continue
         val = _get_dotted(doc, k)
         if isinstance(cond, dict):
             for op, target in cond.items():
                 if op == "$gte" and (val is None or val < target):
                     return False
-                if op == "$gt" and (val is None or val <= target):
-                    return False
                 if op == "$in" and val not in target:
                     return False
                 if op == "$ne" and val == target:
                     return False
-                if op == "$exists":
-                    exists = val is not None
-                    if bool(target) != exists:
-                        return False
+                if op == "$exists" and (bool(target) != (val is not None)):
+                    return False
                 if op == "$regex":
-                    import re
-
                     flags = re.IGNORECASE if "i" in str(cond.get("$options") or "") else 0
                     if not re.search(target, str(val or ""), flags):
                         return False
-        else:
-            if val != cond:
-                return False
+        elif val != cond:
+            return False
     return True
 
 
@@ -113,11 +99,7 @@ class _FakeCollection:
         return sum(1 for d in self.docs if _match_query(d, query))
 
     def update_one(self, query, update, upsert=False):
-        target = None
-        for d in self.docs:
-            if _match_query(d, query):
-                target = d
-                break
+        target = next((d for d in self.docs if _match_query(d, query)), None)
         if target is None:
             if not upsert:
                 return
@@ -128,441 +110,394 @@ class _FakeCollection:
         for k, v in (update.get("$set") or {}).items():
             _set_dotted(target, k, v)
 
-    def bulk_write(self, ops, ordered=False):
-        for op in ops:
-            self.update_one(op._filter, op._doc, upsert=bool(op._upsert))
-
-    def aggregate(self, _pipeline):
-        return []
+    def aggregate(self, pipeline):
+        docs = list(self.docs)
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [d for d in docs if _match_query(d, stage["$match"])]
+            elif "$sort" in stage:
+                for key, direction in reversed(list(stage["$sort"].items())):
+                    docs.sort(key=lambda d: _get_dotted(d, key) or 0, reverse=(direction < 0))
+            elif "$group" in stage:
+                grouped = {}
+                for d in docs:
+                    uname = str(_get_dotted(d, "author.username") or "").lower()
+                    if not uname:
+                        continue
+                    prof = _get_dotted(d, "metadata.platform_extra.author_profile") or {}
+                    pub = int(d.get("publish_time") or 0)
+                    lang = _get_dotted(d, "metadata.lang")
+                    if uname not in grouped:
+                        grouped[uname] = {
+                            "_id": uname,
+                            "screen_name": _get_dotted(d, "author.username"),
+                            "user_id": d.get("author_id"),
+                            "name": prof.get("name"),
+                            "followers_count": prof.get("followers_count", 0),
+                            "following_count": prof.get("following_count", 0),
+                            "is_blue_verified": prof.get("is_blue_verified", False),
+                            "is_verified": prof.get("is_verified", False),
+                            "is_protected": prof.get("is_protected", False),
+                            "description": prof.get("description", ""),
+                            "langs": set(),
+                            "last_active_ts": pub,
+                        }
+                    if lang:
+                        grouped[uname]["langs"].add(lang)
+                    if pub > grouped[uname]["last_active_ts"]:
+                        grouped[uname]["last_active_ts"] = pub
+                docs = [{**v, "langs": list(v["langs"])} for v in grouped.values()]
+        return docs
 
 
 class _FakeDB:
     def __init__(self):
         self.cols = {}
-        self.index_calls = []
 
     def get_collection(self, name):
         if name not in self.cols:
             self.cols[name] = _FakeCollection()
         return self.cols[name]
 
-    def create_index(self, col_name, keys, unique=False):
-        self.index_calls.append((col_name, keys, unique))
+    def create_index(self, *_args, **_kwargs):
+        pass
 
 
-def _base_profile(**overrides):
+def _make_author(**overrides):
     now = 1_800_000_000
-    prof = {
-        "user_id": "1001",
-        "screen_name": "valid_peer",
-        "name": "Valid Peer",
+    obj = {
+        "screen_name": "good_peer",
+        "user_id": "101",
+        "name": "Good Peer",
         "is_blue_verified": True,
         "is_verified": True,
         "is_protected": False,
         "followers_count": 800,
         "following_count": 900,
-        "statuses_count": 120,
-        "description": "Building open tools and writing notes.",
-        "last_active_ts": now - 12 * 3600,
+        "description": "Shipping open tools.",
+        "last_active_ts": now - 3600,
         "languages": ["en"],
     }
-    prof.update(overrides)
-    return prof
+    obj.update(overrides)
+    return obj
 
 
-class TestFollowSelector(unittest.TestCase):
+def _make_post(username, *, pub_ts, **prof_overrides):
+    prof = _make_author(screen_name=username, **prof_overrides)
+    return {
+        "source": "x",
+        "post_id": f"{username}_{pub_ts}",
+        "publish_time": pub_ts,
+        "author_id": prof["user_id"],
+        "author": {"username": username},
+        "metadata": {
+            "lang": (prof.get("languages") or ["en"])[0],
+            "platform_extra": {"author_profile": prof},
+        },
+    }
+
+
+class TestSimpleAutoFollower(unittest.TestCase):
     NOW = 1_800_000_000
 
-    def test_six_hard_gates_rejections(self):
-        # 1. Self & invalid handles
-        for self_h in ("", "unknown", "peterzhu1003", "2434954452qqc", "hsiaohuchu"):
-            res = evaluate_follow_candidate(_base_profile(screen_name=self_h), now_ts=self.NOW)
-            self.assertFalse(res["worth_following"])
-            self.assertEqual(res["reject_reason"], "self_or_invalid_handle")
+    def test_four_filter_rules_and_anti_mutual_precedence(self):
+        # 1. Self / protected / not verified
+        for self_h in ("", "unknown", "peterzhu1003", "hsiaohuchu"):
+            ok, reason, _, kw = is_worth_following(_make_author(screen_name=self_h), now_ts=self.NOW)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "self_or_invalid")
+            self.assertIsNone(kw)
 
-        # 2. Protected / private account
-        res_prot = evaluate_follow_candidate(_base_profile(is_protected=True), now_ts=self.NOW)
-        self.assertFalse(res_prot["worth_following"])
-        self.assertEqual(res_prot["reject_reason"], "protected")
-
-        # 3. Not verified
-        res_unv = evaluate_follow_candidate(
-            _base_profile(is_blue_verified=False, is_verified=False), now_ts=self.NOW
-        )
-        self.assertFalse(res_unv["worth_following"])
-        self.assertEqual(res_unv["reject_reason"], "not_verified")
-
-        # 4. Followers out of range (<100 or >3000)
-        for fc in (99, 3001):
-            res_fc = evaluate_follow_candidate(
-                _base_profile(followers_count=fc, following_count=fc + 100), now_ts=self.NOW
-            )
-            self.assertFalse(res_fc["worth_following"])
-            self.assertEqual(res_fc["reject_reason"], "followers_out_of_range")
-
-        # 5. Following too low / near 5k cap / ratio out of range
-        res_fg_low = evaluate_follow_candidate(
-            _base_profile(followers_count=100, following_count=49), now_ts=self.NOW
-        )
-        self.assertEqual(res_fg_low["reject_reason"], "following_too_low")
-
-        res_cap = evaluate_follow_candidate(
-            _base_profile(followers_count=2000, following_count=4600), now_ts=self.NOW
-        )
-        self.assertEqual(res_cap["reject_reason"], "near_5k_follow_cap")
-
-        # Exception allowed when followers >= 4500 and ratio <= 1.05 (with custom max_followers)
-        res_cap_ok = evaluate_follow_candidate(
-            _base_profile(followers_count=4600, following_count=4600),
-            now_ts=self.NOW,
-            config={"max_followers": 5000},
-        )
-        self.assertTrue(res_cap_ok["worth_following"])
-
-        res_low_r = evaluate_follow_candidate(
-            _base_profile(followers_count=1000, following_count=790), now_ts=self.NOW
-        )
-        self.assertEqual(res_low_r["reject_reason"], "ratio_out_of_range")
-
-        res_high_r = evaluate_follow_candidate(
-            _base_profile(followers_count=500, following_count=1600), now_ts=self.NOW
-        )
-        self.assertEqual(res_high_r["reject_reason"], "ratio_out_of_range")
-
-        # 6. Statuses low / inactive / anti-mutual bio
-        res_st = evaluate_follow_candidate(_base_profile(statuses_count=19), now_ts=self.NOW)
-        self.assertEqual(res_st["reject_reason"], "statuses_too_low")
-
-        res_old = evaluate_follow_candidate(
-            _base_profile(last_active_ts=self.NOW - 8 * 86400), now_ts=self.NOW
-        )
-        self.assertEqual(res_old["reject_reason"], "inactive_over_window")
-
-    def test_anti_mutual_bio_precedes_mutual_bio(self):
-        for bio in (
-            "I don't follow back, no f4f please",
-            "No follow back / one way account",
-            "专业吐槽，不互关，勿扰",
-            "フォロバしません。相互フォロー不可",
-            "Follow back? No F4F!",
-        ):
-            res = evaluate_follow_candidate(_base_profile(description=bio), now_ts=self.NOW)
-            self.assertFalse(res["worth_following"], f"Bio should be rejected: {bio}")
-            self.assertEqual(res["reject_reason"], "anti_mutual_bio")
-
-    def test_mutual_bio_signals_and_tier_s(self):
-        for bio in (
-            "Indie hacker #F4F building in public",
-            "长期主义，有关必回，一起成长",
-            "AI 交流互关中",
-            "Always follow you back!",
-            "フォロバ100 相互フォロー希望",
-        ):
-            res = evaluate_follow_candidate(
-                _base_profile(
-                    followers_count=800,
-                    following_count=900,  # prime ratio 1.125 -> +25
-                    last_active_ts=self.NOW - 6 * 3600,  # <=24h -> +15
-                    description=bio,  # mutual bio -> +20
-                ),
-                now_ts=self.NOW,
-            )
-            self.assertTrue(res["worth_following"], f"Bio should qualify: {bio}")
-            self.assertEqual(res["tier"], "S")
-            self.assertTrue(res["has_mutual_bio"])
-            self.assertIn("mutual_bio", res["signals"])
-            self.assertEqual(res["follow_score"], 100)  # 40 + 25 + 15 + 20
-
-    def test_warm_interaction_is_account_scoped_and_relaxes_ratio(self):
-        db = _FakeDB()
-        # Author has ff_ratio = 0.60 (rejected without warm interaction, accepted WITH warm interaction)
-        upsert_discovered_users(
-            db,
-            [
-                _base_profile(
-                    screen_name="warm_author",
-                    followers_count=1000,
-                    following_count=600,
-                    last_active_ts=self.NOW - 10 * 3600,
-                )
-            ],
-            now_ts=self.NOW,
-        )
-        # Only x_myself (@peterzhu1003) received a reply/like from warm_author in harvested_social_posts
-        posts_col = db.get_collection(POSTS_COLLECTION_NAME)
-        posts_col.docs.append(
-            {
-                "source": "x",
-                "post_id": "p_1",
-                "author": {"username": "warm_author"},
-                AUTO_COMMENT_FIELD: {
-                    "consumed": True,
-                    "consumed_by": "@peterzhu1003",
-                    "consumed_dir": str(Path("W:/temp/x_myself").expanduser().resolve()),
-                    "consumed_at_ts": self.NOW - 3600,
-                    "comment_engagement": {"like_count": 1, "comment_count": 0},
-                },
-            }
+        self.assertEqual(is_worth_following(_make_author(is_protected=True), now_ts=self.NOW)[1], "protected")
+        self.assertEqual(
+            is_worth_following(_make_author(is_blue_verified=False, is_verified=False), now_ts=self.NOW)[1],
+            "not_verified",
         )
 
-        # x_myself sees warm_author as Tier S warm lead
-        myself_cands, myself_stats = select_follow_candidates_for_account(
-            db,
-            account_name="x_myself",
-            account_dir="W:/temp/x_myself",
-            account_handle="peterzhu1003",
-            limit=10,
-            now_ts=self.NOW,
-        )
-        self.assertEqual(len(myself_cands), 1)
-        self.assertEqual(myself_cands[0]["screen_name"], "warm_author")
-        self.assertEqual(myself_cands[0]["tier"], "S")
-        self.assertTrue(myself_cands[0]["has_prior_interaction"])
-        self.assertIn("warm_interaction", myself_cands[0]["signals"])
-        self.assertEqual(myself_stats["warm_leads_available"], 1)
-
-        # x_dahao must NOT inherit x_myself's warm relaxation (ratio=0.60 stays rejected for x_dahao)
-        dahao_cands, dahao_stats = select_follow_candidates_for_account(
-            db,
-            account_name="x_dahao",
-            account_dir="W:/temp/x_dahao",
-            account_handle="2434954452qqc",
-            limit=10,
-            now_ts=self.NOW,
-        )
-        self.assertEqual(len(dahao_cands), 0)
-        self.assertEqual(dahao_stats["warm_leads_available"], 0)
-
-    def test_tier_a_b_boundaries_and_ranking_order(self):
-        db = _FakeDB()
-        upsert_discovered_users(
-            db,
-            [
-                # Tier B: active 5 days ago (>72h)
-                _base_profile(
-                    screen_name="tier_b_old",
-                    followers_count=800,
-                    following_count=900,
-                    last_active_ts=self.NOW - 5 * 86400,
-                ),
-                # Tier B: followers=2800 (>2500)
-                _base_profile(
-                    screen_name="tier_b_big",
-                    followers_count=2800,
-                    following_count=2900,
-                    last_active_ts=self.NOW - 6 * 3600,
-                ),
-                # Tier A: prime ratio 1.1, <=72h, 150..2500
-                _base_profile(
-                    screen_name="tier_a_user",
-                    followers_count=500,
-                    following_count=550,
-                    last_active_ts=self.NOW - 30 * 3600,
-                ),
-                # Tier S: mutual bio
-                _base_profile(
-                    screen_name="tier_s_user",
-                    followers_count=400,
-                    following_count=360,  # 0.90 good_ratio
-                    last_active_ts=self.NOW - 48 * 3600,
-                    description="Let's grow together! #F4F",
-                ),
-            ],
-            now_ts=self.NOW,
-        )
-
-        ranked, stats = select_follow_candidates_for_account(
-            db, account_name="x_myself", account_handle="peterzhu1003", limit=10, now_ts=self.NOW
+        # 2. Followers 100..3000
+        self.assertEqual(
+            is_worth_following(_make_author(followers_count=99, following_count=150), now_ts=self.NOW)[1],
+            "followers_out_of_range",
         )
         self.assertEqual(
-            [c["screen_name"] for c in ranked],
-            ["tier_s_user", "tier_a_user", "tier_b_big", "tier_b_old"],
+            is_worth_following(_make_author(followers_count=3001, following_count=3200), now_ts=self.NOW)[1],
+            "followers_out_of_range",
         )
-        self.assertEqual(stats["tiers"], {"S": 1, "A": 1, "B": 2})
 
-    def test_follow_back_tracking_and_ops_summary(self):
+        # 3. Ratio 0.80..3.00 and <=4500 cap
+        self.assertEqual(
+            is_worth_following(_make_author(followers_count=1000, following_count=790), now_ts=self.NOW)[1],
+            "ratio_out_of_range",
+        )
+        self.assertEqual(
+            is_worth_following(_make_author(followers_count=500, following_count=1550), now_ts=self.NOW)[1],
+            "ratio_out_of_range",
+        )
+        self.assertEqual(
+            is_worth_following(_make_author(followers_count=2000, following_count=4600), now_ts=self.NOW)[1],
+            "near_5k_follow_cap",
+        )
+
+        # 4. Active within 7 days & anti-mutual beats mutual bio
+        self.assertEqual(
+            is_worth_following(_make_author(last_active_ts=self.NOW - 8 * 86400), now_ts=self.NOW)[1],
+            "inactive_over_window",
+        )
+        for bio in ("No follow back", "不互关，勿扰", "フォロバしません", "Follow back? No F4F!"):
+            ok, reason, has_mb, kw = is_worth_following(_make_author(description=bio), now_ts=self.NOW)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "anti_mutual_bio")
+            self.assertFalse(has_mb)
+            self.assertIsNone(kw)
+
+        ok_mut, reason_mut, has_mb_true, kw_mut = is_worth_following(
+            _make_author(description="Indie dev #F4F 互关必回"), now_ts=self.NOW
+        )
+        self.assertTrue(ok_mut)
+        self.assertIsNone(reason_mut)
+        self.assertTrue(has_mb_true)
+        self.assertEqual(kw_mut, "F4F")
+
+    def test_ranking_and_funnel_breakdown(self):
         db = _FakeDB()
-        t0 = self.NOW - 10 * 3600
-        ev_s = evaluate_follow_candidate(
-            _base_profile(screen_name="alice_f4f", description="互关必回"), now_ts=t0
-        )
-        ev_a = evaluate_follow_candidate(
-            _base_profile(screen_name="bob_peer", followers_count=500, following_count=600), now_ts=t0
-        )
+        posts_col = db.get_collection(HARVESTED_POSTS_COLLECTION)
+        posts_col.docs.extend([
+            _make_post("regular_older", pub_ts=self.NOW - 7200, description="Coffee lover", languages=["ja"]),
+            _make_post("regular_newest", pub_ts=self.NOW - 600, description="AI builder", languages=["en"]),
+            _make_post("mutual_older", pub_ts=self.NOW - 86400, description="Always follow back #F4F", languages=["en"]),
+            _make_post("mutual_newer", pub_ts=self.NOW - 1800, description="有关必回，一起成长", languages=["zh"]),
+            _make_post("already_done", pub_ts=self.NOW - 300, description="#F4F"),
+            _make_post("unverified_user", pub_ts=self.NOW - 500, is_blue_verified=False, is_verified=False),
+            _make_post("anti_user", pub_ts=self.NOW - 500, description="No follow back"),
+        ])
+        db.get_collection(FOLLOW_RECORDS_COLLECTION).docs.append({
+            "account_name": "x_myself",
+            "target_handle_lower": "already_done",
+            "status": "followed",
+        })
 
-        record_follow_outcome(
-            db,
-            account_name="x_myself",
-            account_handle="peterzhu1003",
-            account_dir="W:/temp/x_myself",
-            target_profile=_base_profile(screen_name="alice_f4f", followers_count=800, following_count=900),
-            status="followed",
-            evaluation=ev_s,
-            now_ts=t0,
+        cands, total, funnel = find_follow_candidates(
+            db, {"name": "x_myself", "screen_name": "peterzhu1003"}, limit=10, now_ts=self.NOW
         )
-        record_follow_outcome(
-            db,
-            account_name="x_myself",
-            account_handle="peterzhu1003",
-            account_dir="W:/temp/x_myself",
-            target_profile=_base_profile(screen_name="bob_peer", followers_count=500, following_count=600),
-            status="followed",
-            evaluation=ev_a,
-            now_ts=t0,
+        self.assertEqual(total, 4)
+        self.assertEqual(
+            [c["screen_name"] for c in cands],
+            ["mutual_newer", "mutual_older", "regular_newest", "regular_older"],
         )
+        self.assertEqual(funnel["scanned_7d_authors"], 7)
+        self.assertEqual(funnel["excluded_already_recorded"], 1)
+        self.assertEqual(funnel["reject_counts"]["not_verified"], 1)
+        self.assertEqual(funnel["reject_counts"]["anti_mutual_bio"], 1)
+        self.assertEqual(funnel["eligible_mutual_bio"], 2)
+        self.assertEqual(funnel["eligible_top_langs"]["en"], 2)
+        self.assertEqual(cands[0]["mutual_bio_keyword"], "有关必回")
+        self.assertEqual(cands[0]["primary_lang"], "zh")
+        self.assertEqual(cands[0]["post_age_hours"], 0.5)
 
-        fb_res = mark_follow_backs(
-            db,
-            account_name="x_myself",
-            follower_handles=["Alice_F4F", "random_fan"],
-            now_ts=self.NOW,
-        )
-        self.assertEqual(fb_res["newly_followed_back"], 1)
-        self.assertEqual(fb_res["new_handles"], ["alice_f4f"])
+    def test_default_pool_only_myself_with_higher_limits_and_collector_guard(self):
+        pool = resolve_target_accounts()
+        self.assertEqual(len(pool), 1)
+        self.assertEqual(pool[0]["name"], "x_myself")
+        self.assertEqual(pool[0]["screen_name"], "peterzhu1003")
+        self.assertEqual(pool[0]["max_follow_per_run"], TARGET_ACCOUNTS[0]["max_follow_per_run"])
+        self.assertEqual(pool[0]["max_follow_per_day"], TARGET_ACCOUNTS[0]["max_follow_per_day"])
+        self.assertGreaterEqual(pool[0]["max_follow_per_run"], 8)
+        self.assertGreaterEqual(pool[0]["max_follow_per_day"], 80)
 
-        rec = db.get_collection(FOLLOW_RECORDS_COLLECTION_NAME).find_one(
-            {"account_name": "x_myself", "target_handle_lower": "alice_f4f"}
-        )
-        self.assertTrue(rec["followed_back"])
-        self.assertEqual(rec["follow_back_latency_hours"], 10.0)
-
-        summary = build_follow_ops_summary(
-            db,
-            [{"name": "x_myself", "screen_name": "peterzhu1003", "user_data_dir": "W:/temp/x_myself"}],
-            now_ts=self.NOW,
-        )
-        acc_sum = summary["accounts"][0]
-        self.assertEqual(acc_sum["total_followed"], 2)
-        self.assertEqual(acc_sum["followed_back"], 1)
-        self.assertEqual(acc_sum["follow_back_rate_pct"], 50.0)
-        self.assertEqual(summary["by_tier"]["S"]["rate_pct"], 100.0)
-        self.assertEqual(summary["by_tier"]["A"]["rate_pct"], 0.0)
-        self.assertEqual(summary["by_signal"]["mutual_bio"]["followed_back"], 1)
-
-
-class TestAutoFollowerSafetyAndPool(unittest.TestCase):
-    def test_default_pool_has_myself_and_dahao_without_xiaohao(self):
-        pool = _resolve_follower_pool()
-        names = [a["name"] for a in pool]
-        self.assertEqual(names, ["x_myself", "x_dahao"])
-        self.assertNotIn("x_xiaohao", names)
-
-    def test_collector_isolation_blocks_myself_and_dahao(self):
-        for bad_dir in (r"W:\temp\x_myself", r"W:\temp\x_dahao", "./browser_sessions/x_myself"):
+        for bad_dir in (r"W:\temp\x_myself", "./browser_sessions/x_myself"):
             with self.assertRaises(AccountIsolationError):
-                _assert_safe_collector_dir(bad_dir)
-        # x_xiaohao is allowed as collector
-        _assert_safe_collector_dir(r"W:\temp\x_xiaohao")
+                assert_safe_collector_dir(bad_dir)
+        assert_safe_collector_dir(r"W:\temp\x_xiaohao")
 
-    def test_session_missing_never_triggers_cooldown_while_rate_limit_does(self):
+    def test_run_follow_round_preserves_per_account_limits_in_dry_run(self):
         db = _FakeDB()
         now = int(time.time())
-        db.get_collection(POSTS_COLLECTION_NAME).docs.append(
-            {
-                "source": "x",
-                "post_id": "recent_1",
-                "db_update_time": now - 60,
-                "metadata": {"platform_extra": {"category": "x_browser_home"}},
-            }
-        )
-        # Populate enough qualified candidates so refresh reuses DB without launching collector
-        upsert_discovered_users(
+        posts_col = db.get_collection(HARVESTED_POSTS_COLLECTION)
+        for i in range(30):
+            posts_col.docs.append(_make_post(f"cand_{i}", pub_ts=now - 600, last_active_ts=now - 600, description="#F4F"))
+        custom_acc = {
+            "name": "x_myself",
+            "screen_name": "peterzhu1003",
+            "user_data_dir": "W:/temp/x_myself",
+            "max_follow_per_run": 25,
+            "max_follow_per_day": 600,
+        }
+        with patch("x_growth.auto_follower.gen_db_object", return_value=db):
+            res = run_follow_round(round_no=1, accounts=[custom_acc], dry_run=True)
+        self.assertEqual(res["accounts"][0]["max_follow_per_day"], 600)
+        self.assertEqual(res["accounts"][0]["followed_count"], 25)
+
+    def test_telemetry_follow_backs_and_analytics_report(self):
+        db = _FakeDB()
+        t_mature = self.NOW - 30 * 3600
+        t_recent = self.NOW - 4 * 3600
+
+        record_follow_outcome(
             db,
-            [
-                _base_profile(
-                    screen_name=f"peer_{i}",
-                    followers_count=500 + i,
-                    following_count=600 + i,
-                    last_active_ts=now - 3600,
-                )
-                for i in range(32)
-            ],
-            now_ts=now,
+            account_name="x_myself",
+            account_handle="peterzhu1003",
+            account_dir="W:/temp/x_myself",
+            target_profile=_make_author(
+                screen_name="Alice_F4F",
+                followers_count=400,
+                following_count=520,
+                description="Follow back #F4F",
+                languages=["en"],
+                last_active_ts=t_mature - 1800,
+            ),
+            status="followed",
+            candidate_rank=1,
+            eligible_pool_size=250,
+            now_ts=t_mature,
         )
+        record_follow_outcome(
+            db,
+            account_name="x_myself",
+            account_handle="peterzhu1003",
+            account_dir="W:/temp/x_myself",
+            target_profile=_make_author(
+                screen_name="bob_peer",
+                followers_count=1800,
+                following_count=1600,
+                description="Normal bio",
+                languages=["ja"],
+                last_active_ts=t_mature - 40 * 3600,
+            ),
+            status="followed",
+            candidate_rank=2,
+            eligible_pool_size=250,
+            now_ts=t_mature,
+        )
+        record_follow_outcome(
+            db,
+            account_name="x_myself",
+            account_handle="peterzhu1003",
+            account_dir="W:/temp/x_myself",
+            target_profile=_make_author(
+                screen_name="carol_fresh",
+                followers_count=900,
+                following_count=1600,
+                description="Normal bio",
+                languages=["zh"],
+                last_active_ts=t_recent - 80 * 3600,
+            ),
+            status="followed",
+            candidate_rank=3,
+            eligible_pool_size=250,
+            now_ts=t_recent,
+        )
+
+        alice_rec = db.get_collection(FOLLOW_RECORDS_COLLECTION).find_one(
+            {"account_name": "x_myself", "target_handle_lower": "alice_f4f"}
+        )
+        self.assertEqual(alice_rec["strategy_version"], STRATEGY_VERSION)
+        self.assertEqual(alice_rec["primary_lang"], "en")
+        self.assertEqual(alice_rec["post_age_hours_at_follow"], 0.5)
+        self.assertEqual(alice_rec["candidate_rank"], 1)
+        self.assertEqual(alice_rec["eligible_pool_size"], 250)
+        self.assertIn("followed_hour_cn", alice_rec)
+        self.assertTrue(alice_rec["has_mutual_bio"])
+        self.assertEqual(alice_rec["mutual_bio_keyword"], "Follow back")
+
+        fb = mark_follow_backs(db, account_name="x_myself", follower_handles=["alice_f4f"], now_ts=self.NOW)
+        self.assertEqual(fb["newly_followed_back"], 1)
+        self.assertEqual(fb["new_handles"], ["Alice_F4F"])
+        self.assertEqual(len(fb["matched_details"]), 1)
+        self.assertEqual(fb["matched_details"][0]["latency_hours"], 30.0)
+
+        alice_after = db.get_collection(FOLLOW_RECORDS_COLLECTION).find_one(
+            {"account_name": "x_myself", "target_handle_lower": "alice_f4f"}
+        )
+        bob_after = db.get_collection(FOLLOW_RECORDS_COLLECTION).find_one(
+            {"account_name": "x_myself", "target_handle_lower": "bob_peer"}
+        )
+        self.assertEqual(alice_after["follow_back_check_count"], 1)
+        self.assertEqual(bob_after["follow_back_check_count"], 1)
+        self.assertEqual(alice_after["last_follow_back_check_ts"], self.NOW)
+
+        report = build_status_report(
+            db,
+            [{"name": "x_myself", "screen_name": "peterzhu1003", "max_follow_per_day": 80}],
+            now_ts=self.NOW,
+        )
+        acc = report["accounts"][0]
+        self.assertEqual(acc["follows_24h"], 1)
+        self.assertEqual(acc["total_followed"], 3)
+        self.assertEqual(acc["followed_back"], 1)
+        self.assertEqual(acc["follow_back_rate_pct"], 33.3)
+
+        an = report["analytics"]
+        self.assertEqual(an["mature_24h_followed"], 2)
+        self.assertEqual(an["mature_24h_followed_back"], 1)
+        self.assertEqual(an["mature_24h_rate_pct"], 50.0)
+        self.assertEqual(an["median_follow_back_latency_hours"], 30.0)
+        self.assertEqual(an["by_mutual_bio"]["mutual_bio"]["rate_pct"], 100.0)
+        self.assertEqual(an["by_mutual_bio"]["normal"]["rate_pct"], 0.0)
+        self.assertEqual(an["by_lang"]["en"]["rate_pct"], 100.0)
+        self.assertEqual(an["by_lang"]["ja"]["followed"], 1)
+        self.assertEqual(an["by_followers"]["100~499"]["rate_pct"], 100.0)
+        self.assertEqual(an["by_ff_ratio"]["1.0~1.5"]["rate_pct"], 100.0)
+        self.assertEqual(an["by_post_age"]["<=24h"]["rate_pct"], 100.0)
+
+        rendered = format_status_text(report)
+        self.assertIn("策略效果分析", rendered)
+        self.assertIn("满24h成熟样本=1/2 (50.0%)", rendered)
+        self.assertIn("中位回关耗时=30.0h", rendered)
+
+    def test_round_cooldown_and_protected_sniffer(self):
+        db = _FakeDB()
+        now = int(time.time())
+        posts_col = db.get_collection(HARVESTED_POSTS_COLLECTION)
+        posts_col.docs.append({
+            "source": "x",
+            "post_id": "recent_browser",
+            "publish_time": now - 600,
+            "db_update_time": now - 60,
+            "author": {"username": "peer_0"},
+            "metadata": {
+                "lang": "en",
+                "platform_extra": {
+                    "category": "x_browser_home",
+                    "author_profile": _make_author(screen_name="peer_0", last_active_ts=now - 600),
+                },
+            },
+        })
+        for i in range(1, 32):
+            posts_col.docs.append(_make_post(f"peer_{i}", pub_ts=now - 600, last_active_ts=now - 600))
 
         with tempfile.TemporaryDirectory() as tmp:
-            existing_myself = Path(tmp) / "acc_myself"
-            existing_myself.mkdir()
-            missing_dahao = Path(tmp) / "acc_dahao_missing"
-
-            test_pool = [
-                {
-                    "name": "x_myself",
-                    "screen_name": "peterzhu1003",
-                    "user_data_dir": str(existing_myself),
-                    "overrides": {"max_follow_per_run": 1, "max_follow_per_day": 15},
-                },
-                {
-                    "name": "x_dahao",
-                    "screen_name": "2434954452qqc",
-                    "user_data_dir": str(missing_dahao),
-                    "overrides": {"max_follow_per_run": 1, "max_follow_per_day": 25},
-                },
+            acc_ok_dir = Path(tmp) / "ok_acc"
+            acc_ok_dir.mkdir()
+            acc_miss_dir = Path(tmp) / "missing_acc"
+            pool = [
+                {"name": "acc_ok", "screen_name": "u1", "user_data_dir": str(acc_ok_dir)},
+                {"name": "acc_miss", "screen_name": "u2", "user_data_dir": str(acc_miss_dir)},
             ]
+            cd_map = {}
 
-            cooldown_map = {}
-
-            def _fake_exec(acc_cfg, **_kwargs):
-                if acc_cfg["name"] == "x_myself":
-                    return {
-                        "account_name": "x_myself",
-                        "screen_name": "peterzhu1003",
-                        "user_data_dir": acc_cfg["user_data_dir"],
-                        "status": "rate_limited",
-                        "dry_run": False,
-                        "warning": "code=161",
-                        "follows_24h": 0,
-                        "max_follow_per_day": 15,
-                        "followed_count": 0,
-                        "followed_items": [],
-                        "skipped_items": [],
-                    }
-                return {
-                    "account_name": "x_dahao",
-                    "screen_name": "2434954452qqc",
-                    "user_data_dir": acc_cfg["user_data_dir"],
-                    "status": "session_missing",
-                    "dry_run": False,
-                    "warning": "missing dir",
-                    "follows_24h": 0,
-                    "max_follow_per_day": 25,
-                    "followed_count": 0,
-                    "followed_items": [],
-                    "skipped_items": [],
-                }
+            def _fake_run(acc_cfg, **_kwargs):
+                if acc_cfg["name"] == "acc_ok":
+                    return {"account_name": "acc_ok", "status": "rate_limited", "follows_24h": 0, "max_follow_per_day": 80, "followed_count": 0, "followed_items": []}
+                return {"account_name": "acc_miss", "status": "session_missing", "follows_24h": 0, "max_follow_per_day": 80, "followed_count": 0, "followed_items": []}
 
             with patch("x_growth.auto_follower.gen_db_object", return_value=db), \
-                 patch("x_growth.auto_follower.execute_follows_for_account", side_effect=_fake_exec), \
-                 patch("x_growth.auto_follower._save_runtime_status_heartbeat"), \
-                 patch("x_growth.auto_follower._sleep_jitter"):
-                res = run_follow_round(round_no=1, accounts=test_pool, cooldown_until=cooldown_map)
+                 patch("x_growth.auto_follower.run_account_follow", side_effect=_fake_run), \
+                 patch("x_growth.auto_follower._save_status_heartbeat"):
+                res = run_follow_round(round_no=1, accounts=pool, cooldown_until=cd_map)
 
             self.assertEqual(res["refresh"]["fetch_mode"], "reused_recent_harvest")
-            self.assertIn(str(existing_myself), cooldown_map)
-            self.assertNotIn(str(missing_dahao), cooldown_map)
+            self.assertIn(str(acc_ok_dir), cd_map)
+            self.assertNotIn(str(acc_miss_dir), cd_map)
 
-    def test_sniffer_captures_protected_and_exports_users(self):
-        gql_user = {
+        prof = extract_user_profile_from_gql_result({
             "__typename": "User",
             "rest_id": "777",
             "is_blue_verified": True,
             "privacy": {"protected": True},
             "core": {"screen_name": "LockedBlue", "name": "Locked"},
             "relationship_counts": {"followers": 500, "following": 600},
-            "tweet_counts": {"tweets": 120},
-            "profile_bio": {"description": "Locked account"},
-        }
-        prof = extract_user_profile_from_gql_result(gql_user)
-        self.assertIsNotNone(prof)
+        })
         self.assertTrue(prof["is_protected"])
-        self.assertTrue(prof["is_blue_verified"])
-
-        sniffer = XPassiveGraphQLSniffer()
-        sniffer.register_user(prof, source_role="comment_author", post_lang="en-US")
-        sniffer.register_user(prof, source_role="comment_author", post_lang="ja")
-        exported = sniffer.export_discovered_users()
-        self.assertEqual(len(exported), 1)
-        self.assertEqual(exported[0]["observed_langs"], ["en", "ja"])
 
 
 if __name__ == "__main__":
