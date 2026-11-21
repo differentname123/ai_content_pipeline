@@ -60,9 +60,9 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 4, "备注": "来源gemini_web"},
     {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 4, "备注": "来源gemini_web"},
 
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 1, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-4-hydrogen", "权重": 4, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 0.5, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.8-flash", "权重": 2, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-4-hydrogen", "权重": 1, "备注": "来源aistudio_web"},
 
     # {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端 (占组内总权重 4%)"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
@@ -87,14 +87,14 @@ LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
 
-    {"model_name": "gemini-aistudio-api-key-2.5-flash-lite", "权重": 0.2, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
-    {"model_name": "gemini-aistudio-api-key-2.5-flash", "权重": 0.1, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
+    {"model_name": "gemini-aistudio-api-key-2.5-flash-lite", "权重": 0.1, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
+    {"model_name": "gemini-aistudio-api-key-2.5-flash", "权重": 0.05, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
     {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "权重": 0.5, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
     {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "权重": 0.5, "备注": "来源api key aistudio 理论上是1500次/每天/每api key"},
 
 
-    {"model_name": "gemini-aistudio-3.5-flash-lite", "权重": 0.5, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.1-flash-lite", "权重": 0.5, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.5-flash-lite", "权重": 0.2, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-flash-lite", "权重": 0.2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0, "备注": "来源aistudio_web"},
 
 
