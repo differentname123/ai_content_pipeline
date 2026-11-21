@@ -154,17 +154,11 @@ PIPELINE_DEFAULTS: Dict[str, Any] = {**COLLECTOR_DEFAULTS, **GENERATOR_DEFAULTS}
 # ==============================================================================
 PUBLISHER_DEFAULTS: Dict[str, Any] = {
     "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),  # 默认单账号兼容项（@peterzhu1003）
-    "account_pool": [                   # 公共评论池消费账号池：严格隔离主号中文币圈人设与英/日泛娱乐养号号
-        # 【保留过滤原因说明】线上实测（2026-11-16~19）表明：`x_myself`（@peterzhu1003）同时承担简中加密主帖发布，
-        # 挂载 ALL 赛道英/日评论 3 天共发 67 条仅获中位 7 浏览、0 增粉，反而撕裂了 X SimClusters 语种与垂直赛道画像，
-        # 导致主号后续 12 条简中加密主帖全被锁死在 24~62 浏览上限。因此默认暂停主号消费英/日非垂直评论池；
-        # 仅当接入纯英文/日文专职养号浏览器目录时，将其加入下方并设置 `"enabled": True`。
+    "account_pool": [                   # 公共评论池消费账号池：小号 x_xiaohao 专职采集，当前使用主号 x_myself (@peterzhu1003) 发评
         {
             "name": "x_myself",
             "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
-            "enabled": False,
-            "allowed_categories": ["crypto_web3"],
-            "allowed_languages": ("en",),
+            "enabled": True,
         },
     ],
     "continuous_loop": True,            # True=直接运行 comment_publisher.py 即按周期常驻自动发评
