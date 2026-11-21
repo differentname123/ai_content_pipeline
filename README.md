@@ -9,7 +9,7 @@
 
 ## 核心架构与活跃模块
 
-系统收束为四层正交结构与 **4 个常驻生产主进程**：
+系统收束为五层正交结构，覆盖 **币圈垂直发帖、跨五平台全领域热点感知与原创生产、X 自动增长互动** 共 **7 个核心运行入口**：
 
 ```text
 ai_content_pipeline/
@@ -30,13 +30,27 @@ ai_content_pipeline/
 │
 ├── app/ai_api/model_api.py           # OpenAI 兼容网关统一调度、多模型负载均衡与文件锁审计
 │
-├── platforms/                        # 平台接口、共享 Playwright 底座与 X 中文爆款自动发帖
+├── platforms/                        # 平台接口、共享 Playwright 底座、五大平台采集与 X 中文爆款发帖
 │   ├── playwright_base.py            # `persistent_browser_session`、真实 Chrome 无头伪装、浮层看门狗、WAF识别、取证
 │   ├── binance_api.py / binance_playwright.py
 │   ├── okx_api.py / okx_playwright.py
 │   ├── x_api.py                      # X 历史抓取、`fxtwitter` + `syndication` 双通道免登查询、小号防主号隔离
 │   ├── x_playwright.py               # X 发帖/回复/关注（含媒体上传就绪守卫与零重发安全重试）
+│   ├── external_link_extractor.py    # 站外长文正文与头图通用抓取提取器
+│   ├── harvesters/                   # 五大平台采集器（`binance` / `okx` / `x` / `reddit` / `hackernews` + `base_harvester.py`）
+│   ├── harvester_runner.py           # 【五大平台采集总控】广谱每小时定时全量采集与按关键词定向深挖统一入口
 │   └── x_auto_publisher.py           # 【生产守护进程 2】X 中文爆款精选改写与自动发帖
+│
+├── content_pipeline/                 # 【跨五平台热点感知与原创图文总控】通用全领域多模态生产流水线
+│   ├── pipeline_config.py / pipeline_db.py / pipeline_logger.py / llm_gateway.py
+│   ├── step2_comprehension.py        # 单帖多模态无损理解档案（`pipeline_post_digests`）
+│   ├── topic_radar.py                # 跨五平台热点方向发现雷达与多批归并
+│   ├── direction_expander.py         # 按选定方向跨五大平台「指哪打哪」关键词深挖
+│   ├── material_curator.py           # 方向素材精选去噪与空心方向熔断
+│   ├── content_creator.py / visual_studio.py  # 解耦原创图文创作与真实原图无损挑选
+│   ├── blind_reviewer.py             # 100% 上下文物理隔离普通网友盲测终审（`pipeline_creations`）
+│   ├── comment_creator.py            # 【独立旁路工具】单帖多语种神评候选生成
+│   └── pipeline_runner.py            # 全自动双环/人工指定方向/纯素材直通一键总控入口
 │
 ├── parser/                           # 【生产守护进程 1】Binance / OKX 内容采编发布流水线
 │   ├── config.py                     # 统一调参中心（提示词版本、冷却时长、阈值、互动开关、字数规则）
@@ -57,7 +71,7 @@ ai_content_pipeline/
 │   ├── comment_publisher.py          # 【生产守护进程 4】主号神评消费、防爆楼（<=15 评 / >=75 分）与免登指标回流
 │   └── auto_follower.py              # 极简高内聚自动互关脚本（`x_user_profiles` 首页+评论+蓝V粉丝圈评分 + `x_follow_records` 分账号关注）
 │
-├── prompt/                           # 当前活跃的 11 个生产/人工复盘提示词模板
+├── prompt/                           # 当前活跃的 20 个生产/多阶段提示词模板（含 `pipeline_v2/` 8 个与 `x_growth/` 2 个）
 └── tests/                            # 确定性离线单元测试套件（零真实网络/数据库/浏览器副作用）
 ```
 
@@ -72,9 +86,18 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 核心运行入口（均支持 `--help` 查看参数）
+### 2. 核心运行入口
 
-- **Binance / OKX 采集-生产-总编发布主流水线**：
+- **五大平台（X / Reddit / HackerNews / Binance / OKX）广谱全量采集总控**：
+  ```bash
+  python platforms/harvester_runner.py               # 默认按文件顶部 GLOBAL_SCHEDULE_CONFIG["continuous_loop"] 每小时常驻采集入库（harvested_social_posts）
+  ```
+- **跨五平台全领域热门题材感知与原创图文生产总控**：
+  ```bash
+  python content_pipeline/pipeline_runner.py         # 按 content_pipeline/pipeline_config.py 开关执行：单帖理解 -> 热点雷达 -> 跨五平台深挖 -> 素材精选 -> 图文创作 -> 盲测终审
+  python content_pipeline/comment_creator.py         # 独立旁路示例：单帖多语种神评生成
+  ```
+- **Binance / OKX 采集-生产-总编发布主流水线**（支持 `--help` 查看参数）：
   ```bash
   python parser/article_format_logical.py            # 启动 7 个启用后台线程常驻运行
   python parser/article_format_logical.py --dry-run  # 只读检查任务清单与账号可用/冷却状态

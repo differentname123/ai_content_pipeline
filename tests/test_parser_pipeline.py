@@ -422,7 +422,7 @@ class TestPublisherArena(unittest.TestCase):
             self.assertEqual(len(cands), 1)
             self.assertEqual(cands[0][0]["source"], "binance")
 
-    def test_chief_editor_strips_scores_and_rejects_rival_keywords(self):
+    def test_chief_editor_strips_scores_and_never_rewrites_draft(self):
         with tempfile.TemporaryDirectory() as tmp:
             img_p = _create_tiny_png(Path(tmp), "editor.png")
             art = {
@@ -444,17 +444,19 @@ class TestPublisherArena(unittest.TestCase):
             mock_mgr = MagicMock()
             mock_mgr.find_articles.return_value = []
             mock_mgr.collection_name = "generated_articles"
+            mock_col = MagicMock()
+            mock_mgr.db.get_collection.return_value = mock_col
 
             captured_prompt = {}
 
             def _fake_editor(**kwargs):
                 captured_prompt["text"] = kwargs["prompt"]
-                # Deliberately return rival keyword "OKX" on Binance so arena MUST reject overwriting draft_text!
+                # Even if model adds extra fields, pick-only editor MUST NOT overwrite draft_text or call DB update_one
                 return (
                     {
                         "selected_candidate_no": 1,
-                        "final_text": "欢迎去 OKX 交易 BTC",
-                        "final_comments": ["走起"],
+                        "final_text": "擅自篡改正文",
+                        "final_comments": ["篡改神评"],
                         "reason": "test",
                     },
                     {"ok": True, "model_used": "editor-model-v1"},
@@ -474,11 +476,12 @@ class TestPublisherArena(unittest.TestCase):
 
             self.assertEqual(idx, 0)
             self.assertNotIn("9.9", captured_prompt["text"])
-            # Original clean text preserved because polished output mentioned rival OKX
             self.assertEqual(art["article_info"]["text"], "原始干净正文")
+            self.assertEqual(art["article_info"]["god_comments"], ["稳健观点"])
+            mock_col.update_one.assert_not_called()
             self.assertEqual(art["_selection_meta"]["model_used"], "editor-model-v1")
 
-    def test_chief_editor_isolates_article_type_and_filters_throttled_accounts(self):
+    def test_chief_editor_isolates_article_type_and_uses_minimal_recent_topics(self):
         with tempfile.TemporaryDirectory() as tmp:
             img_p = _create_tiny_png(Path(tmp), "editor2.png")
             art = {
@@ -498,22 +501,12 @@ class TestPublisherArena(unittest.TestCase):
                 },
             }
             now = time.time()
-            # Simulate 5 throttled qiqi posts (<50 med) + 2 normal ruru posts
             hist_docs = [
-                {
-                    "article_id": f"q{i}",
-                    "type": ARTICLE_TYPE_VIRAL,
-                    "topic": "BTC",
-                    "article_info": {"post_text": f"限流号样本{i}"},
-                    "publish_records": {"binance": {"published_by": "qiqi", "publish_time": now - 10 * 3600, "view_count": 20, "metrics_synced_at": now - 100}},
-                }
-                for i in range(5)
-            ] + [
                 {
                     "article_id": "r1",
                     "type": ARTICLE_TYPE_VIRAL,
                     "topic": "ETH",
-                    "article_info": {"post_text": "正常号大爆款样本"},
+                    "article_info": {"post_text": "最近发过ETH巨鲸爆仓吃瓜帖"},
                     "publish_records": {"binance": {"published_by": "ruru", "publish_time": now - 10 * 3600, "view_count": 1200, "metrics_synced_at": now - 100}},
                 }
             ]
@@ -525,7 +518,7 @@ class TestPublisherArena(unittest.TestCase):
             def _fake_editor(**kwargs):
                 captured_payload["prompt"] = kwargs["prompt"]
                 return (
-                    {"selected_candidate_no": 1, "final_text": "原始干净吃瓜正文", "final_comments": ["笑死"], "reason": "ok"},
+                    {"selected_candidate_no": 1, "reason": "ok"},
                     {"ok": True, "model_used": "editor-model-v2"},
                 )
 
@@ -541,12 +534,11 @@ class TestPublisherArena(unittest.TestCase):
                     ARTICLE_TYPE_VIRAL,
                 )
 
-            # Query must isolate by article type
             q_used = mock_mgr.find_articles.call_args.kwargs["query"]
             self.assertEqual(q_used.get("type"), ARTICLE_TYPE_VIRAL)
-            self.assertIn("account_view_baselines", captured_payload["prompt"])
-            self.assertIn("正常号大爆款样本", captured_payload["prompt"])
-            self.assertNotIn("限流号样本0", captured_payload["prompt"])
+            self.assertIn("recent_topics", captured_payload["prompt"])
+            self.assertNotIn("account_view_baselines", captured_payload["prompt"])
+            self.assertIn("最近发过ETH巨鲸爆仓吃瓜帖", captured_payload["prompt"])
 
 
 class TestLazyMediaDownload(unittest.TestCase):

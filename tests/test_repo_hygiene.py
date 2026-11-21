@@ -6,13 +6,10 @@ import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ACTIVE_CODE_DIRS = ("app", "common", "parser", "platforms", "x_growth", "tests")
+ACTIVE_CODE_DIRS = ("app", "common", "content_pipeline", "parser", "platforms", "x_growth", "tests")
 
 RETIRED_IMPORTS = (
     "antigravity_client",
-    "content_pipeline",
-    "platforms.harvesters",
-    "external_link_extractor",
 )
 
 EXPECTED_ACTIVE_PROMPTS = {
@@ -24,7 +21,16 @@ EXPECTED_ACTIVE_PROMPTS = {
     "prompt/内容生成方案_娱乐类_单帖洗稿和神评生成.txt",
     "prompt/内容生成方案_娱乐类_发布前总编精选.txt",
     "prompt/X平台_基于历史表现选帖与改写提示词.txt",
+    "prompt/X平台_单篇看图直写提示词.txt",
     "prompt/X平台_结构化自动选帖与改写提示词.txt",
+    "prompt/pipeline_v2/post_comment_creation.md",
+    "prompt/pipeline_v2/step2_post_comprehension.md",
+    "prompt/pipeline_v2/step3_radar_merge.md",
+    "prompt/pipeline_v2/step3_topic_radar.md",
+    "prompt/pipeline_v2/step4_creation_en_x.md",
+    "prompt/pipeline_v2/step4_creation_zh_viral.md",
+    "prompt/pipeline_v2/step4_material_curation.md",
+    "prompt/pipeline_v2/step5_cold_reader_review.md",
     "prompt/x_growth/batch_comment_and_classify.md",
     "prompt/x_growth/batch_score_comments.md",
 }
@@ -76,7 +82,7 @@ class TestRepoHygiene(unittest.TestCase):
             "E:\\chrome\\",
             "C:\\Users\\zxh\\",
         )
-        for folder in ("app", "common", "parser", "platforms", "x_growth"):
+        for folder in ("app", "common", "content_pipeline", "parser", "platforms", "x_growth"):
             for p in sorted((ROOT / folder).rglob("*.py")):
                 if "__pycache__" in p.parts:
                     continue
@@ -91,7 +97,7 @@ class TestRepoHygiene(unittest.TestCase):
 
         active_corpus = "\n".join(
             p.read_text(encoding="utf-8")
-            for folder in ("parser", "platforms", "x_growth")
+            for folder in ("content_pipeline", "parser", "platforms", "x_growth")
             for p in sorted((ROOT / folder).rglob("*.py"))
         )
         for rel_prompt in EXPECTED_ACTIVE_PROMPTS:

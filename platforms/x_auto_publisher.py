@@ -43,7 +43,6 @@ from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPost
 from common.x_text import calc_x_weighted_length
 from platforms.x_api import (
     fetch_multi_x_user_posts,
-    format_historical_x_posts_for_prompt,
     load_cached_x_posts,
     merge_x_account_posts,
     resolve_x_accounts,
@@ -89,24 +88,23 @@ MAX_X_UNITS: int = 280                      # X 平台标准计数单位上限�
 STRICT_X_LENGTH_GATE: bool = True           # 是否启用字符数量代码级二次强制校验
 
 # 4. 候选素材抓取与精简排序配置
-HISTORICAL_PROMPT_ACCOUNTS: List[str] = get_config("x_prompt_accounts", ["dahao", "myself"])  # 对比账号矩阵（包含大号与发帖号）
 CANDIDATE_LOOKBACK_HOURS: int = 6           # 抓取近 6 小时内的全部候选帖
 CANDIDATE_QUERY_LIMIT: int = 0              # 0 表示从数据库全量拉取 6h 候选，再按热度与新鲜度预排精选
 HISTORICAL_REF_COUNT: int = 50              # 单账号实时抓取参考历史上限
-HISTORICAL_SELF_ANTIDUP_COUNT: int = 30     # 仅当前待发账号近期已发条数，构成严格撞题禁止区
-HISTORICAL_BENCHMARK_COUNT: int = 8         # 跨账号高浏览代表作条数，仅作风格与写法参考（绝不作为本号防重门槛）
+HISTORICAL_SELF_ANTIDUP_COUNT: int = 30     # 仅当前待发账号近期已发条数，构成严格一行防重禁止区
 # 【保留过滤原因说明】实测 6h 全量 198 篇候选拼接超 17 万字符，导致中档模型注意力分散且耗时翻倍；
-# 经 6 窗口历史回放校准，前 35 篇会截断少数头部历史爆款，调整为前 50 篇既完整覆盖爆款池，又较原全量压缩 ~70% 上下文。
+# 经 6 窗口历史回放校准，前 50 篇既完整覆盖爆款池，又显著压缩上下文并提速。
 MAX_LLM_CANDIDATES: int = 50
 _MEDIA_TAG_RE = re.compile(r"\[(?:插图|长文封面|视频封面|视频|ASSET_IMG|IMAGE|VIDEO)[^\]]*\]")
 
-# 5. 运行模式与模型调用
+# 5. 运行模式与模型调用（第一步极简纯选品 -> 第二步单篇多模态看图直写）
 BROWSER_VISIBLE: bool = True                # Playwright 发帖是否显示浏览器可见窗口（方便实时观测发帖状态）
 MODEL_PRESET_GROUP: str = "medium"          # 按用户要求切换至中等模型组（避免消耗 high 组额度）
-AI_TIMEOUT_SECONDS: int = 1200              # 模型调用超时阈值（秒），确保长候选列表推理不提前超时中断
+AI_TIMEOUT_SECONDS: int = 1200              # 模型调用超时阈值（秒）
 AI_MAX_RETRIES: int = 3                     # 模型调用失败时的最大重试次数（默认 3 次）
 AI_RETRY_DELAY_SECONDS: int = 15            # 重试退避等待基础间隔（秒）
 PROMPT_TEMPLATE_PATH: str = str(PROMPT_DIR / "X平台_结构化自动选帖与改写提示词.txt")
+DRAFT_PROMPT_TEMPLATE_PATH: str = str(PROMPT_DIR / "X平台_单篇看图直写提示词.txt")
 STATE_FILE_PATH: str = str(get_runtime_file_path("x_publisher_state.json"))
 
 
@@ -277,8 +275,8 @@ def rank_and_trim_x_candidates(
 
 def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
-    将候选文章列表转换为高信息密度的精简结构（含原帖人话 `original_text` 与保留图精简描述），
-    并建立快速查找字典。
+    为第一步「极简纯选品」生成高密度候选摘要（剔除上游二改文案 `draft_text` 与长分析字段），
+    保留原始人话、一句话图意、源帖热度与时效，并建立完整候选映射字典供第二步看图直写使用。
     返回: (candidate_prompt_list, candidates_map)
     """
     prompt_list = []
@@ -301,27 +299,24 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
             candidates_map[src_pid] = art
 
         orig_raw = ((art.get("creation_brief") or {}).get("original_post") or {}).get("text_content") or ""
-        original_text = _strip_media_markers(orig_raw)[:220]
-        kept_images = [
-            {"id": img.get("id"), "desc": str(img.get("semantic_role") or "")[:90]}
+        original_text = _strip_media_markers(orig_raw)[:200] or str(info.get("post_text") or "")[:180]
+        kept_imgs = [
+            str(img.get("semantic_role") or "")[:45]
             for img in (info.get("image_semantics") or [])
             if isinstance(img, dict) and img.get("keep")
         ]
+        image_brief = "；".join(r for r in kept_imgs if r)[:120]
 
-        # 【保留过滤原因说明】：纯字段级精简，仅传 X 选帖与改写高价值信息：
-        # 1. 剔除冗余废图语义（keep=False）与思考脚手架（decision_reason/image_role/viral_score 避免偏见与冗余）；
-        # 2. 补充 original_text 让选帖模型能直接回看活人原话，避免被上游过分改写带偏。
+        # 【保留过滤原因说明】：经大样本对照验证，纯选品阶段剔除上游二改稿可压缩 67% 上下文且避免盲改失真。
         cleaned_item = {
             "id": primary_id,
-            "topic_tag": info.get("topic_tag", ""),
-            "source_views": art.get("_src_views"),
-            "source_age_hours": art.get("_src_age_hours"),
-            "original_text": original_text,
-            "draft_text": info.get("post_text", ""),
-            "kept_images": kept_images,
-            "viral_analysis": str(info.get("viral_analysis") or "")[:120],
+            "原始人话": original_text,
+            "图意一句话": image_brief,
+            "源帖浏览量": art.get("_src_views"),
+            "距今小时": art.get("_src_age_hours"),
+            "配图张数": len(kept_imgs) or len(info.get("selected_images") or []),
         }
-        cleaned_item = {k: v for k, v in cleaned_item.items() if v not in (None, "", [], {})}
+        cleaned_item = {k: v for k, v in cleaned_item.items() if v not in (None, "", [], {}, 0)}
         prompt_list.append(cleaned_item)
 
     return prompt_list, candidates_map
@@ -329,28 +324,20 @@ def build_candidate_prompt_data(candidates: List[Dict[str, Any]]) -> Tuple[List[
 
 def build_account_historical_posts_block(account: Dict[str, Any], count: int = HISTORICAL_REF_COUNT) -> str:
     """
-    物理隔离「本号防重撞题名单」与「跨号高流爆款标杆」：
-    - 区块 A：仅当前待发账号自己最近 30 条推文（严禁与本区块事件撞题）；
-    - 区块 B：参考账号矩阵（排除本号）高浏览 Top 8 代表作（仅供写法与钩子标尺参考，严禁作本号撞题淘汰依据）。
+    仅拉取当前发帖账号自己近期已发推文，压缩成极简一行防重清单，彻底剔除对照号全文噪音。
     """
     cur_sn = str(account.get("screen_name") or "").lstrip("@").strip()
     cur_alias = str(account.get("alias") or "").strip()
-    raw_accounts = list(HISTORICAL_PROMPT_ACCOUNTS or [])
-    if cur_sn:
-        raw_accounts.append(f"@{cur_sn}")
-    target_specs = resolve_x_accounts(raw_accounts, default_accounts=["dahao", "myself"])
+    self_specs = resolve_x_accounts([f"@{cur_sn}"] if cur_sn else [cur_alias])
 
     posts_by_acc = None
     try:
-        posts_by_acc = fetch_multi_x_user_posts(accounts=target_specs, count=max(count, 50), sort_by="time")
+        posts_by_acc = fetch_multi_x_user_posts(accounts=self_specs, count=max(count, 50), sort_by="time")
     except Exception as e:
-        logger.warning(f"[历史/同步] 实时获取账号矩阵最新推文受阻: {e}，降级使用本地历史缓存")
+        logger.warning(f"[历史/同步] 实时获取当前账号最新推文受阻: {e}，降级使用本地历史缓存")
 
     if not posts_by_acc:
-        posts_by_acc = load_cached_x_posts(accounts=target_specs, sort_by="time")
-
-    self_specs = resolve_x_accounts([f"@{cur_sn}"] if cur_sn else [cur_alias])
-    other_specs = [s for s in target_specs if s["screen_name"].lower() != cur_sn.lower()]
+        posts_by_acc = load_cached_x_posts(accounts=self_specs, sort_by="time")
 
     self_posts = merge_x_account_posts(
         posts_by_acc,
@@ -358,41 +345,24 @@ def build_account_historical_posts_block(account: Dict[str, Any], count: int = H
         total_count=HISTORICAL_SELF_ANTIDUP_COUNT,
         sort_by="time",
     )
-    bench_posts = (
-        merge_x_account_posts(
-            posts_by_acc,
-            accounts=other_specs,
-            total_count=HISTORICAL_BENCHMARK_COUNT,
-            sort_by="views",
-        )
-        if other_specs
-        else []
-    )
+    lines: List[str] = []
+    for p in self_posts[:HISTORICAL_SELF_ANTIDUP_COUNT]:
+        ts_str = str(p.get("publish_time_str") or "")[5:16]
+        txt = str((p.get("content") or {}).get("text_content") or "").replace("\n", " ").strip()[:48]
+        if txt:
+            lines.append(f"[{ts_str}] {txt}" if ts_str else txt)
+    summary_text = "\n".join(lines) if lines else "（当前账号暂无近期已发记录）"
 
-    self_block = format_historical_x_posts_for_prompt(
-        self_posts,
-        recent_count=HISTORICAL_SELF_ANTIDUP_COUNT,
-        include_account_summary=True,
-    )
-    bench_block = format_historical_x_posts_for_prompt(
-        bench_posts,
-        recent_count=HISTORICAL_BENCHMARK_COUNT,
-        include_account_summary=True,
-    )
     return (
         "<target_account_posted_history>\n"
-        f"【严格防重区 — 仅当前发帖账号 @{cur_sn or cur_alias} 近期已发推文；凡与本区内同事件/同钱包/同波操作重合的候选必须淘汰】\n"
-        + self_block.strip()
-        + "\n</target_account_posted_history>\n\n"
-        + "<cross_account_viral_benchmarks>\n"
-        "【爆款风格与写法标杆 — 来自对照账号高浏览代表作；仅供提炼标题钩子、口吻与长度标尺，严禁将其作为本号撞题淘汰依据】\n"
-        + bench_block.strip()
-        + "\n</cross_account_viral_benchmarks>"
+        f"【本号防重清单 — 仅 @{cur_sn or cur_alias} 近期 {len(lines)} 条已发；同事件或同人物必跳】\n"
+        + summary_text
+        + "\n</target_account_posted_history>"
     )
 
 
 # ==============================================================================
-# 四、强模型决策与双重门禁校验
+# 四、两步正交决策：极简纯选品 -> 单篇带真图直写 + 双重门禁校验
 # ==============================================================================
 
 def _validate_x_selection_payload(data: Dict[str, Any]) -> Optional[str]:
@@ -401,9 +371,90 @@ def _validate_x_selection_payload(data: Dict[str, Any]) -> Optional[str]:
     if "selected_posts" not in data and "rejected_posts" not in data:
         return "缺少必填字段 selected_posts / rejected_posts"
     selected = data.get("selected_posts")
-    if selected is not None and not isinstance(selected, (list, dict)):
-        return "selected_posts 必须是数组或对象"
+    if selected is not None:
+        if not isinstance(selected, (list, dict)):
+            return "selected_posts 必须是数组或对象"
+        sel_list = [selected] if isinstance(selected, dict) else selected
+        s_cnt = sum(1 for item in sel_list if isinstance(item, dict) and str(item.get("grade") or "").strip().upper() == "S")
+        if s_cnt > 2:
+            return f"S 级候选最多 2 条，实际返回 {s_cnt} 条"
+        for item in sel_list:
+            if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                return "selected_posts 中每一项必须包含有效候选 id"
     return None
+
+
+def _validate_x_draft_payload(data: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return "返回内容不是合法 JSON 对象"
+    final_text = str(data.get("final_x_text") or "").strip()
+    if not final_text:
+        return "final_x_text 不能为空"
+    gate_ok, gate_reason, _, _ = validate_double_gates({"id": "draft", "grade": "S", "final_x_text": final_text})
+    if not gate_ok:
+        return f"正文未通过字数安全门禁，请精简至 <= {MAX_X_RAW_CHARS} 字 / <= {MAX_X_UNITS} X单位：{gate_reason}"
+    comments = data.get("bait_comments")
+    if not isinstance(comments, list) or not any(isinstance(c, str) and c.strip() for c in comments):
+        return "bait_comments 至少需包含 1 条非空神评"
+    return None
+
+
+def draft_x_post_with_vision(
+    candidate_doc: Dict[str, Any],
+    *,
+    selection_reason: str = "",
+    model_group: str = MODEL_PRESET_GROUP,
+    max_retries: int = AI_MAX_RETRIES,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    第二步「单篇看图直写」：同时传入原帖原始人话 + 上游已核对画面事实锚点 + 真实本地配图（多模态看图），
+    直出原生爆款 X 正文与一楼神评（零上游二改文案传递失真）。
+    """
+    draft_prompt_path = Path(DRAFT_PROMPT_TEMPLATE_PATH)
+    if not draft_prompt_path.is_file():
+        raise FileNotFoundError(f"未找到 X 看图直写提示词模板: {DRAFT_PROMPT_TEMPLATE_PATH}")
+
+    info = candidate_doc.get("article_info") or {}
+    kept_keys = [str(k) for k in (info.get("selected_images") or []) if k]
+    local_images = [p for p in resolve_candidate_images(candidate_doc, kept_keys) if os.path.isfile(p)]
+
+    orig_raw = ((candidate_doc.get("creation_brief") or {}).get("original_post") or {}).get("text_content") or ""
+    original_text = _strip_media_markers(orig_raw) or str(info.get("post_text") or "")
+
+    # 仅保留上游“画面事实锚点”，专门兜底防止极少数多模态小字数值错读，绝不传入上游二改正文
+    visual_anchors = [
+        f"{img.get('id', '')}: {str(img.get('semantic_role') or '').strip()}"
+        for img in (info.get("image_semantics") or [])
+        if isinstance(img, dict) and img.get("keep") and str(img.get("semantic_role") or "").strip()
+    ]
+    eng_views = candidate_doc.get("_src_views")
+    payload = {
+        "原始正文": original_text,
+        "参考画面事实锚点": visual_anchors,
+        "源帖热度": eng_views,
+        "选品切角": selection_reason,
+    }
+    payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+
+    base_prompt, prompt_meta = render_prompt_template(draft_prompt_path)
+    parsed, trace = call_llm_json(
+        prompt=f"{base_prompt.strip()}\n{json.dumps(payload, ensure_ascii=False, indent=2)}",
+        prompt_meta=prompt_meta,
+        model=None,
+        preset_model_group=model_group,
+        file_paths=local_images,
+        timeout=AI_TIMEOUT_SECONDS,
+        expected_type=dict,
+        validator=_validate_x_draft_payload,
+        schema_retries=max(1, int(max_retries)),
+        retry_times=2,
+        task_label="X单篇看图直写",
+        logger_obj=logger,
+    )
+    if isinstance(parsed, dict):
+        parsed = dict(parsed)
+        parsed["selected_images"] = kept_keys
+    return parsed, trace
 
 
 def select_x_posts_via_llm(
@@ -411,17 +462,20 @@ def select_x_posts_via_llm(
     historical_block: str,
     candidate_prompt_list: List[Dict[str, Any]],
     max_retries: int = AI_MAX_RETRIES,
+    *,
+    candidates_map: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    通过统一 LLM 网关 (`model=None` + `preset_model_group="medium"`) 执行结构化选帖与改写，
-    返回 `(parsed_obj, llm_meta)`，忠实保留 `model_used`。
+    两步正交 X 决策链（统一通过 `model=None` + `preset_model_group="medium"` 调度）：
+    1. 极简纯选品：仅依据本号一行防重与原帖摘要，从 Top-50 选出 0~2 条 S 级候选 ID；
+    2. 单篇看图直写：仅针对命中的 S 级候选附带真实配图直出高爆发 X 文案与神评。
     """
     prompt_path = Path(PROMPT_TEMPLATE_PATH)
     if not prompt_path.is_file():
         raise FileNotFoundError(f"未找到提示词模板文件: {PROMPT_TEMPLATE_PATH}")
 
     candidate_block = (
-        f"以下是我待筛选的候选帖子列表（共 {len(candidate_prompt_list)} 篇，已按原帖热度与新鲜度预排）：\n"
+        f"共 {len(candidate_prompt_list)} 篇候选（已按热度与新鲜度预排）：\n"
         + json.dumps(candidate_prompt_list, ensure_ascii=False)
     )
     full_prompt, prompt_meta = render_prompt_template(
@@ -433,7 +487,7 @@ def select_x_posts_via_llm(
     )
 
     logger.info(
-        f"🤖 [AI决策/启动] 正在调度模型组 [{MODEL_PRESET_GROUP}] 审查候选池 | "
+        f"🤖 [X纯选品/启动] 正在调度模型组 [{MODEL_PRESET_GROUP}] 筛选候选池 | "
         f"发帖账号: [@{account['screen_name']}] | 候选帖数: [{len(candidate_prompt_list)}] 篇"
     )
 
@@ -446,20 +500,57 @@ def select_x_posts_via_llm(
         validator=_validate_x_selection_payload,
         schema_retries=max(1, int(max_retries)),
         retry_times=2,
-        task_label="X选帖",
+        task_label="X极简纯选品",
         logger_obj=logger,
     )
-    if parsed_obj:
-        logger.info(
-            f"✅ [AI决策/完成] 结构化决策成功 | 模型: [{llm_meta.get('model_used')}] "
-            f"| 耗时: {llm_meta.get('duration_seconds', 0):.2f}s"
+    if not parsed_obj:
+        logger.error(
+            f"❌ [X纯选品/失败] 模型组 [{MODEL_PRESET_GROUP}] 未返回有效选品决策: {llm_meta.get('error') or llm_meta.get('error_history')}"
         )
-        return parsed_obj, llm_meta
+        return {}, llm_meta
 
-    logger.error(
-        f"❌ [AI决策/失败] 模型组 [{MODEL_PRESET_GROUP}] 未返回有效决策: {llm_meta.get('error') or llm_meta.get('error_history')}"
+    logger.info(
+        f"✅ [X纯选品/完成] 选品决策成功 | 模型: [{llm_meta.get('model_used')}] "
+        f"| 耗时: {llm_meta.get('duration_seconds', 0):.2f}s"
     )
-    return {}, llm_meta
+
+    # 第二步：若传入候选映射表，对达标等级（默认 S 级）执行单篇带真实配图直写
+    if candidates_map is not None:
+        allowed_set = {g.upper() for g in ALLOWED_GRADES}
+        raw_sel = parsed_obj.get("selected_posts") or []
+        if isinstance(raw_sel, dict):
+            raw_sel = [raw_sel]
+        enriched_sel: List[Dict[str, Any]] = []
+        for item in raw_sel:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "").strip()
+            grade = str(item.get("grade") or "").strip().upper()
+            doc = candidates_map.get(cid)
+            if grade not in allowed_set or not doc:
+                enriched_sel.append(item)
+                continue
+            draft_res, draft_meta = draft_x_post_with_vision(
+                doc,
+                selection_reason=str(item.get("decision_reason") or ""),
+                model_group=MODEL_PRESET_GROUP,
+                max_retries=max_retries,
+            )
+            if isinstance(draft_res, dict) and draft_res.get("final_x_text"):
+                merged_item = dict(item)
+                merged_item["final_x_text"] = draft_res["final_x_text"]
+                merged_item["bait_comments"] = draft_res.get("bait_comments") or []
+                merged_item["selected_images"] = draft_res.get("selected_images") or []
+                merged_item["_draft_model_used"] = draft_meta.get("model_used")
+                enriched_sel.append(merged_item)
+                llm_meta["draft_model_used"] = draft_meta.get("model_used")
+                logger.info(
+                    f"✍️ [X看图直写/完成] ID=[{cid}] | 模型: [{draft_meta.get('model_used')}] "
+                    f"| 耗时: {draft_meta.get('duration_seconds', 0):.2f}s"
+                )
+        parsed_obj["selected_posts"] = enriched_sel
+
+    return parsed_obj, llm_meta
 
 
 def query_ai_for_structured_selection(
@@ -745,8 +836,13 @@ def run_single_check_cycle(
         # 3. 获取客观历史战报
         historical_block = build_account_historical_posts_block(account, count=HISTORICAL_REF_COUNT)
 
-        # 4. 结构化选帖决策
-        ai_res, llm_meta = select_x_posts_via_llm(account, historical_block, prompt_candidates)
+        # 4. 两步极简选品 + 单篇看图直写
+        ai_res, llm_meta = select_x_posts_via_llm(
+            account,
+            historical_block,
+            prompt_candidates,
+            candidates_map=candidates_map,
+        )
         if not ai_res:
             logger.warning(f"⚠️ [决策跳过] 模型组未返回有效决策，账号 [@{screen_name}] 等待下轮巡检")
             continue

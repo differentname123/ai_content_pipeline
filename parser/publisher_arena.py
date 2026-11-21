@@ -14,7 +14,6 @@
 import json
 import math
 import re
-import statistics
 import threading
 import time
 from collections import Counter
@@ -404,53 +403,21 @@ def _select_and_polish_best_candidate(
 
     rule = PUBLISH_RULES[article_type]
     viral = article_type == ARTICLE_TYPE_VIRAL
-    comments_key = "bait_comments" if viral else "god_comments"
 
     target_accs = PLATFORM_ACCOUNTS.get(platform)
     historical_performance = _get_recent_published_history_with_metrics(
         article_manager,
         platform,
         target_accounts=target_accs,
-        limit=50,
+        limit=25,
         article_type=article_type,
     )
-
-    acc_views_map: Dict[str, List[float]] = {}
-    for item in historical_performance:
-        if (
-            item.get("is_mature")
-            and isinstance(item.get("views"), (int, float))
-            and not isinstance(item.get("views"), bool)
-        ):
-            acc_name = str(item.get("account") or "").strip() or "unknown"
-            acc_views_map.setdefault(acc_name, []).append(float(item["views"]))
-    account_view_baselines: Dict[str, Dict[str, Any]] = {
-        acc_name: {
-            "mature_posts": len(vals),
-            "median_views": round(statistics.median(vals), 1),
-        }
-        for acc_name, vals in acc_views_map.items()
-    }
-    throttled_other_accounts = {
-        acc_name
-        for acc_name, base_info in account_view_baselines.items()
-        if acc_name != account and base_info["mature_posts"] >= 5 and base_info["median_views"] < 50.0
-    }
-    filtered_history: List[Dict[str, Any]] = []
-    for item in historical_performance:
-        acc_name = str(item.get("account") or "").strip() or "unknown"
-        if acc_name in throttled_other_accounts and len(account_view_baselines) > len(throttled_other_accounts):
-            continue
-        enriched_item = dict(item)
-        base_med = (account_view_baselines.get(acc_name) or {}).get("median_views") or 0.0
-        if (
-            item.get("is_mature")
-            and base_med > 0
-            and isinstance(item.get("views"), (int, float))
-            and not isinstance(item.get("views"), bool)
-        ):
-            enriched_item["vs_account_median"] = f"{round(float(item['views']) / base_med, 2)}x"
-        filtered_history.append(enriched_item)
+    # 仅保留极简一行防重摘要（过滤浏览量/账号均值噪声，防止小号或未成熟数据误导选品）
+    recent_topics = [
+        f"{item.get('topic') or '热帖'} | {str(item.get('content') or '').strip()[:45]}"
+        for item in historical_performance
+        if str(item.get("content") or "").strip()
+    ][:25]
 
     arena_items = []
     for rank_no, idx in enumerate(valid_indices, 1):
@@ -474,40 +441,32 @@ def _select_and_polish_best_candidate(
             )
         else:
             brief_mats = (art.get("creation_brief") or {}).get("materials") or []
-            used_ids = set(info.get("used_material_ids") or [])
             selected_phs = set(info.get("image_placeholders") or [])
-            used_facts, img_descs = [], []
+            img_descs = []
             for m in brief_mats:
                 if not isinstance(m, dict):
                     continue
-                if m.get("id") in used_ids and m.get("fact"):
-                    used_facts.append(m["fact"])
                 vis = m.get("visual_evidence")
                 vis_list = vis if isinstance(vis, list) else ([vis] if isinstance(vis, dict) else [])
                 for v in vis_list:
                     if isinstance(v, dict) and v.get("placeholder") in selected_phs and v.get("what_it_shows"):
                         img_descs.append(v["what_it_shows"])
-            # 严格剔除内部打分，仅保留客观盘面论据与初稿
+            # 严格剔除内部打分，仅保留客观盘面初稿与配图描述
             arena_items.append(
                 {
                     "candidate_no": rank_no,
                     "topic": art.get("topic"),
                     "stance": art.get("stance"),
                     "kept_images_desc": img_descs,
-                    "core_facts": used_facts,
                     "draft_text": info.get("text", ""),
                     "draft_comments": info.get("god_comments", []),
                 }
             )
 
-    rival_ban = "严禁出现“币安/Binance”字样" if platform == PLATFORM_OKX else "严禁出现“欧易/OKX”字样"
     prompt_name = VIRAL_EDITOR_PROMPT_NAME if viral else ANALYSIS_EDITOR_PROMPT_NAME
     payload = {
         "platform": platform.upper(),
-        "current_account": account,
-        "platform_constraints": f"{rival_ban}；正文非空白字符数 <= {ARTICLE_MAX_CHARS}",
-        "account_view_baselines": account_view_baselines,
-        "historical_published_performance": filtered_history,
+        "recent_topics": recent_topics,
         "candidates": arena_items,
     }
 
@@ -535,33 +494,7 @@ def _select_and_polish_best_candidate(
         chosen_idx = valid_indices[cand_no - 1]
         chosen_art, _, chosen_coin = candidates[chosen_idx]
 
-        final_text = str(parsed.get("final_text") or "").strip()
-        final_comments = [
-            str(c).strip()
-            for c in (parsed.get("final_comments") or [])
-            if isinstance(c, str) and str(c).strip() and len(re.sub(r"\s", "", str(c))) <= 24
-        ][:3]
-        if (
-            final_text
-            and len(re.sub(r"\s", "", final_text)) <= ARTICLE_MAX_CHARS
-            and not re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", final_text)
-            and not has_rival_keyword(platform, final_text + " " + " ".join(final_comments))
-        ):
-            chosen_art["article_info"][rule["text"]] = final_text
-            if final_comments:
-                chosen_art["article_info"][comments_key] = final_comments
-            article_id = chosen_art.get("article_id")
-            if article_id and hasattr(article_manager, "db") and hasattr(article_manager.db, "get_collection"):
-                col = article_manager.db.get_collection(article_manager.collection_name)
-                col.update_one(
-                    {"article_id": article_id},
-                    {
-                        "$set": {
-                            f"article_info.{rule['text']}": chosen_art["article_info"][rule["text"]],
-                            f"article_info.{comments_key}": chosen_art["article_info"][comments_key],
-                        }
-                    },
-                )
+        # 经对照实验证实：盲眼总编只选不改可避免无图改写失真与幻觉，原汁原味保留上游看图初稿与神评
         chosen_art["_selection_meta"] = {
             "prompt_version": SELECTION_PROMPT_VERSION,
             "reason": str(parsed.get("reason") or ""),
@@ -572,7 +505,7 @@ def _select_and_polish_best_candidate(
         }
         _log(
             f"{rule['action']}/总编擂台",
-            "横向比稿与终审精修完成",
+            "极简纯选优挑稿完成（只选不改）",
             平台=platform,
             账号=account,
             模型=trace.get("model_used") or "未返回",

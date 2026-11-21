@@ -381,12 +381,12 @@ class TestXApiAndAutoPublisher(unittest.TestCase):
         plist, cmap = build_candidate_prompt_data(trimmed)
         self.assertEqual(len(plist), 4)
         self.assertIn(plist[0]["id"], cmap)
-        self.assertIn("original_text", plist[0])
-        self.assertNotIn("[插图:", plist[0]["original_text"])
-        self.assertEqual(len(plist[0]["kept_images"]), 1)
-        self.assertEqual(plist[0]["kept_images"][0]["id"], "[IMAGE_1]")
+        self.assertIn("原始人话", plist[0])
+        self.assertIn("图意一句话", plist[0])
+        self.assertNotIn("[插图:", plist[0]["原始人话"])
+        self.assertNotIn("draft_text", plist[0])
 
-        # 2. build_account_historical_posts_block physically splits anti-dup vs cross-account benchmarks
+        # 2. build_account_historical_posts_block includes ONLY current account's concise anti-dup lines
         fake_posts = {
             "peterzhu1003": [
                 {
@@ -414,10 +414,48 @@ class TestXApiAndAutoPublisher(unittest.TestCase):
         with patch("platforms.x_auto_publisher.fetch_multi_x_user_posts", return_value=fake_posts):
             hist_block = build_account_historical_posts_block({"alias": "myself", "screen_name": "peterzhu1003"})
         self.assertIn("<target_account_posted_history>", hist_block)
-        self.assertIn("<cross_account_viral_benchmarks>", hist_block)
-        self.assertIn("本号自己发过的旧闻", hist_block.split("</target_account_posted_history>")[0])
-        self.assertNotIn("对照号跑出的大爆款", hist_block.split("</target_account_posted_history>")[0])
-        self.assertIn("对照号跑出的大爆款", hist_block.split("<cross_account_viral_benchmarks>")[1])
+        self.assertIn("本号自己发过的旧闻", hist_block)
+        self.assertNotIn("对照号跑出的大爆款", hist_block)
+
+        # 3. draft_x_post_with_vision sends real image file + visual anchor, enforces length gate, and sets selected_images
+        from platforms.x_auto_publisher import draft_x_post_with_vision
+
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = Path(tmp) / "real_chart.png"
+            img_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            cand_doc = {
+                "article_id": "art_vis_1",
+                "creation_brief": {"original_post": {"text_content": "ETH扛单快爆了 [插图: https://a.com/1.png]"}},
+                "article_info": {
+                    "selected_images": ["[IMAGE_1]"],
+                    "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "5倍ETH多单浮亏4万刀", "keep": True}],
+                    "image_mapping": {"[IMAGE_1]": {"local_path": str(img_path)}},
+                    "post_text": "上游二改冗余稿",
+                },
+                "_src_views": 35000,
+            }
+            captured = {}
+
+            def _fake_vision(**kwargs):
+                captured["kwargs"] = kwargs
+                # Ensure validator blocks oversized tweet
+                self.assertIsNotNone(kwargs["validator"]({"final_x_text": "币" * 141, "bait_comments": ["ok"]}))
+                self.assertIsNone(kwargs["validator"]({"final_x_text": "$ETH 5倍多单硬扛四万刀，强平线就在脚下。", "bait_comments": ["太狠了"]}))
+                return (
+                    {"final_x_text": "$ETH 5倍多单硬扛四万刀，强平线就在脚下。", "bait_comments": ["太狠了"]},
+                    {"ok": True, "model_used": "vision-model-v1"},
+                )
+
+            with patch("platforms.x_auto_publisher.call_llm_json", side_effect=_fake_vision):
+                draft, trace = draft_x_post_with_vision(cand_doc, selection_reason="极端扛单")
+
+        self.assertEqual(trace["model_used"], "vision-model-v1")
+        self.assertIsNone(captured["kwargs"]["model"])
+        self.assertEqual(captured["kwargs"]["preset_model_group"], "medium")
+        self.assertEqual(captured["kwargs"]["file_paths"], [str(img_path)])
+        self.assertIn("5倍ETH多单浮亏4万刀", captured["kwargs"]["prompt"])
+        self.assertNotIn("上游二改冗余稿", captured["kwargs"]["prompt"])
+        self.assertEqual(draft["selected_images"], ["[IMAGE_1]"])
 
 
 class TestXGrowth(unittest.TestCase):
