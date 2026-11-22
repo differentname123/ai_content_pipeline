@@ -70,7 +70,13 @@ SUB_ACCOUNT_POOL: List[str] = [
 SUB_ACCOUNT_EMAIL: Optional[str] = (
     os.environ.get("ANTIGRAVITY_SUB_ACCOUNT", "").strip().lower() or None
 )
-
+# SUB_ACCOUNT_POOL: List[str] = [
+#     "paschelsvetz946@gmail.com",    # Google AI Ultra (支持: Argon / 3.8-Flash，高算力号)
+#     "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
+#     "hsuehpylant255@gmail.com",     # Google AI Pro   (支持: Argon / 3.8-Flash)
+#     "simmondszaleski@gmail.com",    # Google AI Pro   (支持: Argon / 3.8-Flash)
+#     "just4mike@usa.com",            # Google AI Pro   (支持: 3.8-Flash)
+# ]
 
 # 暴露指定的 Antigravity 本地模型名（同时兼容原名）
 MODEL_ALIASES: Dict[str, str] = {
