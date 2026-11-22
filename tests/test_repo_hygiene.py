@@ -29,6 +29,7 @@ EXPECTED_ACTIVE_PROMPTS = {
     "prompt/pipeline_v2/step4_creation_zh_viral.md",
     "prompt/pipeline_v2/step4_material_curation.md",
     "prompt/pipeline_v2/step5_cold_reader_review.md",
+    "prompt/x_growth/auto_reply_comment.md",
     "prompt/x_growth/batch_comment_and_classify.md",
     "prompt/x_growth/batch_score_comments.md",
 }
