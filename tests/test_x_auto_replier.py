@@ -2,6 +2,7 @@
 """Offline unit tests for parallel X comment auto-replier (`x_growth/auto_replier.py`)."""
 import ast
 import contextlib
+import logging
 import pathlib
 import re
 import tempfile
@@ -18,13 +19,16 @@ from x_growth.auto_replier import (
     ACTION_DELAY_RANGE,
     AUTO_REPLIER_PROMPT_DIR,
     COLLECT_INTERVAL_SECONDS,
+    GENERATE_INITIAL_DELAY_SECONDS,
     GENERATE_INTERVAL_SECONDS,
     GENERATOR_MODEL_GROUP,
     MAX_REPLIES_PER_USER_PER_POST,
     POST_CHECKPOINTS_COLLECTION,
     PROMPT_TEMPLATE_FILENAME,
     REPLY_INBOX_COLLECTION,
+    REPLY_INITIAL_DELAY_SECONDS,
     REPLY_INTERVAL_SECONDS,
+    RETRY_COOLDOWN_SECONDS,
     RISK_COOLDOWN_SECONDS,
     RUN_MODE,
     SESSION_MAX_HOLD_SECONDS,
@@ -245,6 +249,17 @@ def _make_fake_page(*, url="https://x.com/home", status_ok=True, visible_selecto
 
 
 class TestAutoReplier(unittest.TestCase):
+    def setUp(self):
+        self.silent_logger = logging.getLogger("test_x_auto_replier_silent")
+        self.silent_logger.handlers = [logging.NullHandler()]
+        self.silent_logger.propagate = False
+        self.silent_logger.setLevel(logging.INFO)
+        self._logger_patcher = patch("x_growth.auto_replier._get_logger", return_value=self.silent_logger)
+        self._logger_patcher.start()
+
+    def tearDown(self):
+        self._logger_patcher.stop()
+
     def test_architecture_isolation_config_and_prompt_rendering(self):
         mod_path = pathlib.Path(__file__).resolve().parent.parent / "x_growth" / "auto_replier.py"
         src = mod_path.read_text(encoding="utf-8")
@@ -262,9 +277,12 @@ class TestAutoReplier(unittest.TestCase):
             self.assertNotIn(legacy_tbl, src)
 
         self.assertEqual(RUN_MODE, "daemon")
-        self.assertEqual(COLLECT_INTERVAL_SECONDS, 3600)
-        self.assertEqual(GENERATE_INTERVAL_SECONDS, 3600)
-        self.assertEqual(REPLY_INTERVAL_SECONDS, 3600)
+        self.assertEqual(COLLECT_INTERVAL_SECONDS, 600)
+        self.assertEqual(GENERATE_INTERVAL_SECONDS, 600)
+        self.assertEqual(REPLY_INTERVAL_SECONDS, 600)
+        self.assertEqual(GENERATE_INITIAL_DELAY_SECONDS, 60)
+        self.assertEqual(REPLY_INITIAL_DELAY_SECONDS, 120)
+        self.assertEqual(RETRY_COOLDOWN_SECONDS, 600)
         self.assertEqual(GENERATOR_MODEL_GROUP, "low")
         self.assertEqual(MAX_REPLIES_PER_USER_PER_POST, 1)
         self.assertLessEqual(SESSION_MAX_HOLD_SECONDS, 180)
@@ -368,6 +386,13 @@ class TestAutoReplier(unittest.TestCase):
         found = sniffer.find_my_existing_reply("2001", self_handle_lower="peterzhu1003", self_uid="u_me")
         self.assertIsNotNone(found)
         self.assertEqual(found["tweet_id"], "3001")
+
+        # 5. Monotonic reply_count merge: a subsequent stale rc=0 payload does NOT downgrade rc=2
+        sniffer.set_source("notifications_all")
+        stale_my_post = _gql_tweet("1001", "peterzhu1003", uid="u_me", full_text="My root post", reply_count=0)
+        sniffer.ingest_payload("TweetDetail", {"nodes": [stale_my_post]})
+        self.assertEqual(sniffer.tweets_by_id["1001"]["reply_count"], 2)
+        self.assertIn("tweet_detail", sniffer.reply_sources_by_id["2001"])
 
     def test_upsert_collected_replies_dedup_upgrades_and_limits(self):
         db = _FakeDB()
@@ -546,11 +571,18 @@ class TestAutoReplier(unittest.TestCase):
                 self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "@alice"}))
                 payload = {"skip": False, "skip_reason": "", "language": "en", "reply_text": "@alice It stores unique reply IDs locally before sending."}
                 self.assertIsNone(validator(payload))
-                return payload, {"model_used": "mock-low"}
+                return payload, {
+                    "model_used": "mock-low",
+                    "elapsed_ms": 420,
+                    "schema_attempt": 1,
+                    "trace_id": "tr_1",
+                    "prompt_file": PROMPT_TEMPLATE_FILENAME,
+                    "prompt_sha1": "abc123",
+                }
             if rid == "r_skip":
                 payload = {"skip": True, "skip_reason": "spam_solicitation", "language": "en", "reply_text": ""}
                 self.assertIsNone(validator(payload))
-                return payload, {"model_used": "mock-low"}
+                return payload, {"model_used": "mock-low", "elapsed_ms": 210, "schema_attempt": 1, "trace_id": "tr_2"}
             return None, {"parse_error": "gateway_timeout"}
 
         with patch("x_growth.auto_replier.call_llm_json", side_effect=_fake_call_llm_json):
@@ -573,10 +605,17 @@ class TestAutoReplier(unittest.TestCase):
         self.assertEqual(d_ok["status"], "ready_to_reply")
         self.assertEqual(d_ok["generated_reply"], "It stores unique reply IDs locally before sending.")
         self.assertEqual(d_ok["generated_lang"], "en")
+        self.assertEqual(d_ok["generator_prompt_file"], PROMPT_TEMPLATE_FILENAME)
+        self.assertEqual(d_ok["generator_prompt_sha1"], "abc123")
+        self.assertEqual(d_ok["generate_elapsed_ms"], 420)
+        self.assertEqual(d_ok["generate_schema_attempts"], 1)
+        self.assertEqual(d_ok["generate_trace_id"], "tr_1")
 
         d_skip = col.find_one({"reply_id": "r_skip"})
         self.assertEqual(d_skip["status"], "skipped")
         self.assertEqual(d_skip["skip_reason"], "ai_safety:spam_solicitation")
+        self.assertEqual(d_skip["generate_elapsed_ms"], 210)
+        self.assertEqual(d_skip["generate_trace_id"], "tr_2")
 
         d_fail = col.find_one({"reply_id": "r_fail"})
         self.assertEqual(d_fail["status"], "failed")
@@ -668,6 +707,8 @@ class TestAutoReplier(unittest.TestCase):
             self.assertIn("https://x.com/alice/status/r_send", visited_urls)
             self.assertEqual(col.find_one({"reply_id": "r_send"})["status"], "replied")
             self.assertEqual(col.find_one({"reply_id": "r_send"})["replied_tweet_id"], "7777")
+            self.assertIs(col.find_one({"reply_id": "r_send"})["liked_before_reply"], True)
+            self.assertIsNotNone(col.find_one({"reply_id": "r_send"})["end_to_end_delay_sec"])
             self.assertEqual(col.find_one({"reply_id": "r_dup"})["replied_source"], "detected_on_x")
             self.assertEqual(col.find_one({"reply_id": "r_gone"})["status"], "unavailable")
             self.assertEqual(col.find_one({"reply_id": "r_biz"})["reply_attempts"], 1)
@@ -924,6 +965,8 @@ class TestAutoReplier(unittest.TestCase):
                 self.assertEqual(doc_5101["status"], "pending_generate")
                 self.assertEqual(doc_5101["reply_text"], "安全第一")
                 self.assertEqual(doc_5101["post_text"], "Post one context")
+                self.assertIn("notifications_all", doc_5101["collected_via"])
+                self.assertEqual(doc_5101["collect_delay_sec"], 120)
                 self.assertIsNone(inbox.find_one({"reply_id": "5102"}))
                 self.assertIsNone(inbox.find_one({"reply_id": "5103"}))
                 self.assertEqual(cp.find_one({"post_id": "5001"})["last_captured_replies"], 1)
@@ -983,6 +1026,84 @@ class TestAutoReplier(unittest.TestCase):
             txt = format_status_text(rep)
             self.assertIn("x_myself @peterzhu1003", txt)
             self.assertIn("待生成=0", txt)
+
+            # Verify analytics aggregation & legacy-doc fallback + idle heartbeat suppression on round #2
+            now_st = int(time.time())
+            db_an = _FakeDB()
+            an_col = db_an.get_collection(REPLY_INBOX_COLLECTION)
+            an_col.docs.extend([
+                {
+                    "account_name": "x_myself",
+                    "reply_id": "m1",
+                    "reply_author": "u1",
+                    "reply_text": "nice",
+                    "generated_reply": "thanks",
+                    "status": "replied",
+                    "replied_source": "auto_replier",
+                    "generator_model": "model-a",
+                    "collected_via": ["notifications_all"],
+                    "collect_delay_sec": 300,
+                    "generate_elapsed_ms": 1500,
+                    "end_to_end_delay_sec": 420,
+                    "replied_at_ts": now_st - 60,
+                    "updated_at_ts": now_st - 60,
+                },
+                {
+                    # Legacy doc missing new explicit delay/via fields -> falls back safely to timestamps
+                    "account_name": "x_myself",
+                    "reply_id": "m2",
+                    "reply_author": "u2",
+                    "reply_text": "ok",
+                    "generated_reply": "cheers",
+                    "status": "replied",
+                    "replied_source": "auto_replier",
+                    "generator_model": "model-b",
+                    "reply_publish_ts": now_st - 1200,
+                    "collected_at_ts": now_st - 600,
+                    "replied_at_ts": now_st - 300,
+                    "updated_at_ts": now_st - 300,
+                },
+                {
+                    "account_name": "x_myself",
+                    "reply_id": "m3",
+                    "reply_author": "u3",
+                    "reply_text": "",
+                    "status": "skipped",
+                    "skip_reason": "media_only_no_text",
+                    "updated_at_ts": now_st - 200,
+                },
+            ])
+            rep_an = build_status_report(db_an, [acc], now_ts=now_st)
+            txt_an = format_status_text(rep_an)
+            self.assertEqual(rep_an["accounts"][0]["analytics"]["via_counts"], {"notifications_all": 1})
+            self.assertEqual(rep_an["accounts"][0]["analytics"]["model_counts"], {"model-a": 1, "model-b": 1})
+            self.assertEqual(rep_an["accounts"][0]["analytics"]["skip_reasons"], {"media_only_no_text": 1})
+            self.assertIn("指标:", txt_an)
+            self.assertIn("跳过原因:", txt_an)
+
+            # Verify idle round #2 suppresses duplicate "下次执行" log when no work occurred
+            cap_log = MagicMock()
+            with patch("x_growth.auto_replier._get_logger", return_value=cap_log), \
+                 patch("x_growth.auto_replier.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_replier.collect_replies_for_account", side_effect=_rec("collect")), \
+                 patch("x_growth.auto_replier.generate_replies_from_db", side_effect=_rec("generate")), \
+                 patch("x_growth.auto_replier.publish_replies_for_account", side_effect=_rec("publish")), \
+                 patch("common.daemon.interruptible_sleep", return_value=True):
+                run_parallel_daemon(
+                    accounts=[acc],
+                    max_rounds=3,
+                    config={
+                        "collect_initial_delay_seconds": 0,
+                        "generate_initial_delay_seconds": 0,
+                        "reply_initial_delay_seconds": 0,
+                        "collect_interval_seconds": 60,
+                        "generate_interval_seconds": 60,
+                        "reply_interval_seconds": 60,
+                    },
+                )
+            sched_msgs = [str(c.args[0]) for c in cap_log.info.call_args_list if "下次执行" in str(c.args[0])]
+            self.assertTrue(any("| #1]" in m for m in sched_msgs))
+            self.assertFalse(any("| #2]" in m for m in sched_msgs))
 
 
 if __name__ == "__main__":
