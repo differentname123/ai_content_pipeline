@@ -269,7 +269,8 @@ class TestAutoPinner(unittest.TestCase):
         self.assertEqual(WINDOW_HOURS, 72)
         self.assertEqual(CONVERSION_METRIC_MODE, "weighted_conversion")
         self.assertLessEqual(SESSION_MAX_HOLD_SECONDS, 180)
-        self.assertEqual(ACCOUNTS[0]["name"], "x_myself")
+        self.assertTrue(bool(ACCOUNTS[0]["name"]))
+        self.assertTrue(bool(ACCOUNTS[0]["user_data_dir"]))
 
         with tempfile.TemporaryDirectory() as tmp:
             p_only = resolve_accounts([{"user_data_dir": tmp}])

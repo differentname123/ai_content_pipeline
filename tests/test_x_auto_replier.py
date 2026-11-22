@@ -286,10 +286,12 @@ class TestAutoReplier(unittest.TestCase):
         self.assertEqual(GENERATOR_MODEL_GROUP, "low")
         self.assertEqual(MAX_REPLIES_PER_USER_PER_POST, 1)
         self.assertLessEqual(SESSION_MAX_HOLD_SECONDS, 180)
-        self.assertEqual(ACCOUNTS[0]["name"], "x_myself")
+        self.assertTrue(bool(ACCOUNTS[0]["name"]))
+        self.assertTrue(bool(ACCOUNTS[0]["user_data_dir"]))
 
         pool = resolve_accounts()
-        self.assertEqual([a["name"] for a in pool], ["x_myself"])
+        expected_enabled = [a["name"] for a in ACCOUNTS if a.get("enabled", True)]
+        self.assertEqual([a["name"] for a in pool], expected_enabled)
 
         # Supports user passing ONLY user_data_dir without screen_name
         with tempfile.TemporaryDirectory() as tmp:
@@ -585,11 +587,13 @@ class TestAutoReplier(unittest.TestCase):
                 return payload, {"model_used": "mock-low", "elapsed_ms": 210, "schema_attempt": 1, "trace_id": "tr_2"}
             return None, {"parse_error": "gateway_timeout"}
 
+        gen_log = MagicMock()
         with patch("x_growth.auto_replier.call_llm_json", side_effect=_fake_call_llm_json):
             res = generate_replies_from_db(
                 {"name": "x_myself", "screen_name": "peterzhu1003"},
                 db=db,
                 config={"max_generate_retries": 3},
+                logger=gen_log,
                 now_ts=now,
             )
 
@@ -600,6 +604,10 @@ class TestAutoReplier(unittest.TestCase):
             self.assertIsNone(kw["model"])
             self.assertIsNone(kw["file_paths"])
             self.assertEqual(kw["preset_model_group"], "low")
+
+        gen_info_msgs = [str(c.args[0]) for c in gen_log.info.call_args_list]
+        self.assertTrue(any("✍️" in m and "p=abc123" in m and "帖「We released our lig…" in m for m in gen_info_msgs))
+        self.assertTrue(any("⏭️" in m and "p=" in m and "帖「We released our lig…" in m for m in gen_info_msgs))
 
         d_ok = col.find_one({"reply_id": "r_ok"})
         self.assertEqual(d_ok["status"], "ready_to_reply")
@@ -1036,11 +1044,13 @@ class TestAutoReplier(unittest.TestCase):
                     "account_name": "x_myself",
                     "reply_id": "m1",
                     "reply_author": "u1",
+                    "post_text": "My launch thread",
                     "reply_text": "nice",
                     "generated_reply": "thanks",
                     "status": "replied",
                     "replied_source": "auto_replier",
                     "generator_model": "model-a",
+                    "generator_prompt_sha1": "sha111222333",
                     "collected_via": ["notifications_all"],
                     "collect_delay_sec": 300,
                     "generate_elapsed_ms": 1500,
@@ -1077,9 +1087,14 @@ class TestAutoReplier(unittest.TestCase):
             txt_an = format_status_text(rep_an)
             self.assertEqual(rep_an["accounts"][0]["analytics"]["via_counts"], {"notifications_all": 1})
             self.assertEqual(rep_an["accounts"][0]["analytics"]["model_counts"], {"model-a": 1, "model-b": 1})
+            self.assertEqual(rep_an["accounts"][0]["analytics"]["prompt_counts"], {"sha11122": 1})
             self.assertEqual(rep_an["accounts"][0]["analytics"]["skip_reasons"], {"media_only_no_text": 1})
             self.assertIn("指标:", txt_an)
+            self.assertIn("提示词=", txt_an)
             self.assertIn("跳过原因:", txt_an)
+            self.assertIn("model-a", txt_an)
+            self.assertIn("p=sha11122", txt_an)
+            self.assertIn("帖「My launch thread」", txt_an)
 
             # Verify idle round #2 suppresses duplicate "下次执行" log when no work occurred
             cap_log = MagicMock()

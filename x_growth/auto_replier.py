@@ -84,8 +84,8 @@ RUN_MODE: str = "daemon"
 ACCOUNTS: List[Dict[str, Any]] = [
     {
         "name": "x_dahao",               # 数据库分账号隔离标识（建议保持唯一英文短名）
-        "user_data_dir": resolve_session_dir("x_dahao_browser_session_dir", "x_myself"),  # 已登录该 X 账号的浏览器数据目录路径
-        "screen_name": str(get_config("x_dahao_screen_name", "peterzhu1003") or "peterzhu1003").strip().lstrip("@"),  # 账号 @用户名（不带 @；可留空，打开浏览器后会自动识别）
+        "user_data_dir": resolve_session_dir("x_dahao_browser_session_dir", "x_dahao"),  # 已登录该 X 账号的浏览器数据目录路径
+        "screen_name": str(get_config("x_dahao_screen_name", "") or "").strip().lstrip("@"),  # 账号 @用户名（不带 @；可留空，打开浏览器后会自动识别）
         "enabled": True,                  # True=启用该账号；False=临时停用（不删配置）
     },
     # 如需追加其他已登录账号，按下方模板复制一段即可（screen_name 可留空自动识别）：
@@ -1664,6 +1664,7 @@ def generate_replies_from_db(
         schema_attempts = safe_int(trace.get("schema_attempt"), 1)
         trace_id = str(trace.get("trace_id") or "")
         gen_cost_s = round(elapsed_ms / 1000.0, 1)
+        prompt_tag = prompt_sha1[:8] or "na"
 
         if parsed.get("skip"):
             reason = str(parsed.get("skip_reason") or "").strip() or "model_skipped"
@@ -1689,8 +1690,8 @@ def generate_replies_from_db(
             )
             skipped_cnt += 1
             log.info(
-                f"⏭️ [模块2/安全跳过 | {acc_name}] @{reply_author}({rid}) [{model_used}|{gen_cost_s}s] "
-                f"reason={reason} | 评「{_clip_log_text(reply_text, 28)}」"
+                f"⏭️ [模块2/安全跳过 | {acc_name}] @{reply_author}({rid}) [{model_used}|p={prompt_tag}|{gen_cost_s}s] "
+                f"帖「{_clip_log_text(post_text, 20)}」 | 评「{_clip_log_text(reply_text, 28)}」 | reason={reason}"
             )
             continue
 
@@ -1723,8 +1724,8 @@ def generate_replies_from_db(
         ready_cnt += 1
         log.info(
             f"✍️ [模块2/生成就绪 | {acc_name}] @{reply_author}({rid}) "
-            f"[{gen_lang}|{w_len}w|{model_used}|{gen_cost_s}s] "
-            f"评「{_clip_log_text(reply_text, 28)}」 -> 回「{reply_out}」"
+            f"[{gen_lang}|{w_len}w|{model_used}|p={prompt_tag}|{gen_cost_s}s] "
+            f"帖「{_clip_log_text(post_text, 20)}」 | 评「{_clip_log_text(reply_text, 28)}」 -> 回「{reply_out}」"
         )
 
     batch_sec = round(time.monotonic() - batch_t0, 1)
@@ -2178,6 +2179,7 @@ def build_status_report(
         sent_24h = 0
         via_counts: Counter = Counter()
         model_counts: Counter = Counter()
+        prompt_counts: Counter = Counter()
         skip_reasons: Counter = Counter()
         collect_delays: List[int] = []
         e2e_delays: List[int] = []
@@ -2198,6 +2200,9 @@ def build_status_report(
             g_model = str(d.get("generator_model") or "").strip()
             if g_model:
                 model_counts[g_model] += 1
+            g_prompt_sha = str(d.get("generator_prompt_sha1") or "").strip()[:8]
+            if g_prompt_sha:
+                prompt_counts[g_prompt_sha] += 1
             if st in ("skipped", "unavailable") and d.get("skip_reason"):
                 skip_reasons[str(d["skip_reason"])] += 1
 
@@ -2227,6 +2232,7 @@ def build_status_report(
         analytics = {
             "via_counts": dict(via_counts),
             "model_counts": dict(model_counts),
+            "prompt_counts": dict(prompt_counts),
             "skip_reasons": dict(skip_reasons),
             "avg_collect_delay_sec": (round(sum(collect_delays) / len(collect_delays)) if collect_delays else None),
             "avg_e2e_delay_sec": (round(sum(e2e_delays) / len(e2e_delays)) if e2e_delays else None),
@@ -2244,9 +2250,11 @@ def build_status_report(
                     {
                         "status": d.get("status"),
                         "reply_author": f"@{d.get('reply_author') or ''}",
+                        "post_text": _clip_log_text(d.get("post_text") or "", 24),
                         "reply_text": (d.get("reply_text") or "")[:60],
                         "generated_reply": (d.get("generated_reply") or d.get("replied_text") or "")[:80],
                         "model": d.get("generator_model") or "",
+                        "prompt_sha1": str(d.get("generator_prompt_sha1") or "").strip()[:8],
                         "collected_via": list(d.get("collected_via") or []),
                     }
                     for d in recent_docs
@@ -2271,6 +2279,8 @@ def format_status_text(report: Dict[str, Any]) -> str:
             metric_parts.append(f"来源={an['via_counts']}")
         if an.get("model_counts"):
             metric_parts.append(f"模型={an['model_counts']}")
+        if an.get("prompt_counts"):
+            metric_parts.append(f"提示词={an['prompt_counts']}")
         delay_parts = []
         if an.get("avg_collect_delay_sec") is not None:
             delay_parts.append(f"采集={_format_duration_brief(an['avg_collect_delay_sec'])}")
@@ -2285,8 +2295,14 @@ def format_status_text(report: Dict[str, Any]) -> str:
         if an.get("skip_reasons"):
             lines.append(f"   跳过原因: {an['skip_reasons']}")
         for item in a["recent"]:
+            meta_tags = [str(item.get("status") or "")]
+            if item.get("model"):
+                meta_tags.append(str(item["model"]))
+            if item.get("prompt_sha1"):
+                meta_tags.append(f"p={item['prompt_sha1']}")
+            post_prefix = f"帖「{item['post_text']}」 | " if item.get("post_text") else ""
             lines.append(
-                f"   - [{item['status']}] {item['reply_author']}: {item['reply_text']} -> {item['generated_reply']}"
+                f"   - [{'|'.join(meta_tags)}] {item['reply_author']}: {post_prefix}{item['reply_text']} -> {item['generated_reply']}"
             )
     lines.append("=" * 76)
     return "\n".join(lines)

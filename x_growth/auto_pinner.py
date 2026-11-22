@@ -68,8 +68,8 @@ RUN_MODE: str = "daemon"
 ACCOUNTS: List[Dict[str, Any]] = [
     {
         "name": "x_dahao",               # 数据库分账号隔离标识
-        "user_data_dir": resolve_session_dir("x_dahao_browser_session_dir", "x_myself"),  # 已登录该 X 账号的浏览器数据目录
-        "screen_name": str(get_config("x_dahao_screen_name", "peterzhu1003") or "peterzhu1003").strip().lstrip("@"),  # 账号 @用户名（不带 @；可留空自动识别）
+        "user_data_dir": resolve_session_dir("x_dahao_browser_session_dir", "x_dahao"),  # 已登录该 X 账号的浏览器数据目录
+        "screen_name": str(get_config("x_dahao_screen_name", "") or "").strip().lstrip("@"),  # 账号 @用户名（不带 @；可留空自动识别）
         "enabled": True,                  # True=启用该账号；False=临时停用
     },
     # 如需追加其他账号，按下方模板复制一段即可：
