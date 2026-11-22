@@ -91,6 +91,9 @@ MEDIUM_MODEL_LIST = [
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
+    {"model_name": "antigravity-3.8-flash-high", "权重": 5,
+     "备注": "来源antigravity 本地客户端"},
+
     # {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
     # {"model_name": "gpt-6-codex-sol-max", "权重": 5, "备注": "来源codex 付费"},
     {"model_name": "gpt-6-codex-luna-max", "权重": 5, "备注": "来源codex 付费 (占组内总权重 80%，其余启用项合计=20)"},
@@ -118,7 +121,7 @@ LOW_MODEL_LIST = [
 
 
 
-    # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。

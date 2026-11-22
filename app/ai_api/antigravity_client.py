@@ -59,7 +59,7 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 # - 每个小号独立限制并发=2（当前 2 个白名单小号总并发 = 2 * 2 = 4）。
 # ==============================================================================
 SUB_ACCOUNT_POOL: List[str] = [
-    "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
+    "just4mike@usa.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
     # "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
 ]
 
@@ -1133,7 +1133,7 @@ class AntigravityClient:
                         "WaitForConversationFullyIdle",
                         {
                             "conversationId": cascade_id,
-                            "inactivityTimeoutSeconds": max(15, int(req_timeout)),
+                            "inactivityTimeoutSeconds": 0,
                             "returnOnExecutorError": True,
                         },
                         timeout=req_timeout + 15.0,
