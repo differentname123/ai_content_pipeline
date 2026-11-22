@@ -9,7 +9,7 @@ Antigravity Official Local Client (Multi-Account Sandbox Pool + High Concurrency
    - 池子中的每个小号都会在 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\` 下启动各自物理隔离的
      官方 `language_server.exe` 进程（独立进程、独立端口、独立登录态文件、独立设备 UUID）；
    - 桌面端大号（`EXCLUDED_MAIN_ACCOUNTS`）被严格排除在账号池之外，100% 绝不触碰大号；
-   - 每个小号独立享有 `max_concurrency_per_account=2` 的跨进程并发锁与独立错峰锁（6 个小号即支持最高 12 并发）；
+   - 每个小号独立享有 `max_concurrency_per_account=4` 的跨进程并发锁与独立错峰锁（单个小号支持最高 4 并发）；
    - 调用方只需指定模型名（如 `antigravity-3.8-flash-high` 或 `antigravity-argon-high`），内部路由器会自动
      识别哪些小号拥有该模型的调用权限与剩余额度，并从当前空闲槽位的小号中【随机选择】一个执行；
    - 每次调用（无论成功或异常重试）均会返回并记录实际使用的小号邮箱与沙箱端口，方便溯源与成功率复盘。
@@ -56,8 +56,10 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 # ==============================================================================
 # 【核心配置 2】小号沙箱白名单账号池（SUB_ACCOUNT_POOL）
 # - 严格采用白名单策略：仅使用下列显式配置的可用小号，不做自动探测扫描；
-# - 每个小号独立限制并发=2（当前 2 个白名单小号总并发 = 2 * 2 = 4）。
+# - 每个小号独立限制并发=4（单个小号支持最高 4 并发）。
 # ==============================================================================
+DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 4
+
 SUB_ACCOUNT_POOL: List[str] = [
     "just4mike@usa.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
     # "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
@@ -349,7 +351,7 @@ class AntigravityClient:
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
         auto_start: bool = True,
-        max_concurrency: int = 2,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
         min_stagger_seconds: float = 0.8,
         max_stagger_seconds: float = 1.8,
         sub_account_email: Optional[str] = SUB_ACCOUNT_EMAIL,
@@ -436,7 +438,7 @@ class AntigravityClient:
         queue_timeout: Optional[float] = None,
     ):
         """
-        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=2 个跨进程并发槽位）：
+        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=4 个跨进程并发槽位）：
         - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
         - 否则最多等待 `queue_timeout` 秒（默认 5 秒），若槽位仍全忙则立即抛出 `AntigravityQueueBusyError`。
         """
@@ -1296,13 +1298,13 @@ class AntigravityPoolClient:
          拥有该模型权限且有剩余额度的小号集合；
        - 将候选小号集合随机打乱（`random.shuffle`），优先抢占当前并发槽位空闲的小号立即执行；
        - 若某个小号报错触发外层重试，下一轮尝试会自动避开刚刚失败的小号，切换到池中其他小号！
-    3. 总并发能力随小号数量线性叠加：每个小号限制并发=2，N 个小号即可提供 N*2 的总并发度。
+    3. 总并发能力随小号数量线性叠加：每个小号限制并发=4，N 个小号即可提供 N*4 的总并发度。
     """
 
     def __init__(
         self,
         account_pool: Optional[List[str]] = None,
-        max_concurrency_per_account: int = 2,
+        max_concurrency_per_account: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
         queue_timeout: Optional[float] = DEFAULT_QUEUE_TIMEOUT_SECONDS,
