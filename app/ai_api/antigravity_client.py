@@ -1523,7 +1523,7 @@ _default_client: Optional[Any] = None
 
 
 def get_client(
-    max_concurrency: int = 2,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
     sub_account_email: Optional[str] = None,
 ) -> Any:
     """
@@ -1554,7 +1554,7 @@ def get_client(
     return _default_client
 
 
-def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> Any:
+def set_sub_account(email: Optional[str], max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT) -> Any:
     """
     - 传入具体邮箱（如 `set_sub_account("guardianriedel689@gmail.com")`）：锁定只使用该小号；
     - 传入 `None` 或 `""`（如 `set_sub_account(None)`）：恢复使用 `SUB_ACCOUNT_POOL` 多小号随机池。
@@ -1566,7 +1566,7 @@ def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> Any:
     return get_client(max_concurrency=max_concurrency, sub_account_email=SUB_ACCOUNT_EMAIL)
 
 
-def set_sub_account_pool(emails: List[str], max_concurrency_per_account: int = 2) -> AntigravityPoolClient:
+def set_sub_account_pool(emails: List[str], max_concurrency_per_account: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT) -> AntigravityPoolClient:
     """动态设置小号账号池列表并启用多小号随机路由池。"""
     global SUB_ACCOUNT_POOL, SUB_ACCOUNT_EMAIL, _default_client
     SUB_ACCOUNT_POOL = [e.strip().lower() for e in emails if e and e.strip()]
