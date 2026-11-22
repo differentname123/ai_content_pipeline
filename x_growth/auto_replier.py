@@ -146,7 +146,7 @@ DRY_RUN: bool = False                     # True=仅预览待发内容，绝不�
 BROWSER_VISIBLE: bool = False             # False=后台静默运行不弹窗（推荐挂机）；True=弹出 Chrome 窗口方便观察过程
 LIKE_COMMENT_BEFORE_REPLY: bool = True    # 回复对方评论前是否顺手给对方那条评论点赞
 MAX_REPLIES_PER_RUN: int = 5              # 【保留过滤原因说明】单轮最多真实发出 5 条回复，分散行为节奏防高频刷评风控
-MAX_REPLIES_PER_DAY: int = 30             # 【保留过滤原因说明】单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
+MAX_REPLIES_PER_DAY: int = 300             # 【保留过滤原因说明】单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
 ACTION_DELAY_RANGE: Tuple[int, int] = (12, 25)  # 同一轮发多条回复时，每两条之间随机停顿多少秒 (最小秒, 最大秒)
 # 【保留过滤原因说明】`platforms/playwright_base.py` 跨进程目录锁超时为 300s；单次持锁满 150s 主动收手放锁，确保与采集/发帖/互关共存不超时
 SESSION_MAX_HOLD_SECONDS: int = 150       # 单次打开浏览器的最长持锁秒数（到点自动收手放锁，下轮再继续）
