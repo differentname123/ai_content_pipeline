@@ -14,7 +14,7 @@ X (Twitter) 帖子评论全自动回复系统 (`x_growth/auto_replier.py`)
   扫描 `x_reply_inbox` 中 `status="ready_to_reply"` 的已生成回复，打开真实浏览器导航至对应评论页，
   二次实时查重确认线上未回复后精准点击回复并落库标记 `status="replied"`，做到不重复、不遗漏。
 - 【并行调度 (`run_parallel_daemon`)】：
-  三个模块各自在独立线程中并行定时运行（默认每 1 小时一次），只通过 MongoDB 状态流转协同；
+  三个模块各自在独立线程中并行定时运行（默认每 10 分钟一次），只通过 MongoDB 状态流转协同；
   模块 1 与模块 3 共用同一浏览器目录时自动由底层 `persistent_browser_session` 跨进程/跨线程锁安全排队。
 """
 from collections import Counter
@@ -97,21 +97,21 @@ ACCOUNTS: List[Dict[str, Any]] = [
     # },
 ]
 
-# 2. 三个独立工人的并行调度开关与运行周期（单位：秒；默认 3600 秒 = 每 1 小时各独立运行一轮）
+# 2. 三个独立工人的并行调度开关与运行周期（单位：秒；默认 600 秒 = 每 10 分钟各独立运行一轮）
 ENABLE_COLLECTOR: bool = True             # 是否启动【工人 1 · 收集评论】（False=不采集）
-COLLECT_INTERVAL_SECONDS: int = 600      # 工人 1 基础执行间隔（秒；3600=1 小时，改小如 1800 即半小时一轮）
-COLLECT_JITTER_SECONDS: Tuple[int, int] = (60, 240)  # 每轮额外附加的随机延迟范围 (最小秒, 最大秒)，防止整点机械规律
+COLLECT_INTERVAL_SECONDS: int = 600       # 工人 1 基础执行间隔（秒；600=10 分钟；想改回半小时/1小时可调为 1800/3600）
+COLLECT_JITTER_SECONDS: Tuple[int, int] = (15, 45)   # 每轮额外附加的随机延迟范围 (最小秒, 最大秒)，防止整点机械规律
 COLLECT_INITIAL_DELAY_SECONDS: int = 0    # 启动后工人 1 首次等待多少秒再开跑（0=启动立即运行）
 
 ENABLE_GENERATOR: bool = True             # 是否启动【工人 2 · AI 生成回复】（纯查库不开浏览器）
-GENERATE_INTERVAL_SECONDS: int = 600     # 工人 2 基础执行间隔（秒；3600=1 小时）
-GENERATE_JITTER_SECONDS: Tuple[int, int] = (15, 60)  # 工人 2 轮次随机抖动范围（秒）
-GENERATE_INITIAL_DELAY_SECONDS: int = 30  # 启动后工人 2 延迟几秒运行（默认错开 30 秒，刚好接住工人 1 刚采到的数据）
+GENERATE_INTERVAL_SECONDS: int = 600      # 工人 2 基础执行间隔（秒；600=10 分钟）
+GENERATE_JITTER_SECONDS: Tuple[int, int] = (5, 15)   # 工人 2 轮次随机抖动范围（秒）
+GENERATE_INITIAL_DELAY_SECONDS: int = 60  # 启动后工人 2 延迟 60 秒运行，确保接住工人 1 首轮展开详情后的完整入库数据
 
 ENABLE_REPLIER: bool = True               # 是否启动【工人 3 · 精准执行回复】（开浏览器发回复）
-REPLY_INTERVAL_SECONDS: int = 600        # 工人 3 基础执行间隔（秒；3600=1 小时）
-REPLY_JITTER_SECONDS: Tuple[int, int] = (60, 240)    # 工人 3 轮次随机抖动范围（秒）
-REPLY_INITIAL_DELAY_SECONDS: int = 60     # 启动后工人 3 延迟几秒运行（默认错开 60 秒，避免与工人 1 同时抢占同一浏览器目录）
+REPLY_INTERVAL_SECONDS: int = 600         # 工人 3 基础执行间隔（秒；600=10 分钟）
+REPLY_JITTER_SECONDS: Tuple[int, int] = (15, 45)     # 工人 3 轮次随机抖动范围（秒）
+REPLY_INITIAL_DELAY_SECONDS: int = 120    # 启动后工人 3 延迟 120 秒运行，避开工人 1 抢锁并接住工人 2 刚生成的回复
 
 # 3. 【模块 1 · 收集评论】监控范围、扫描深度与防重复过滤参数
 # 互动监控范围开关（最常用）：
@@ -151,7 +151,7 @@ ACTION_DELAY_RANGE: Tuple[int, int] = (12, 25)  # 同一轮发多条回复时，
 # 【保留过滤原因说明】`platforms/playwright_base.py` 跨进程目录锁超时为 300s；单次持锁满 150s 主动收手放锁，确保与采集/发帖/互关共存不超时
 SESSION_MAX_HOLD_SECONDS: int = 150       # 单次打开浏览器的最长持锁秒数（到点自动收手放锁，下轮再继续）
 MAX_REPLY_RETRIES: int = 3                # 单条评论发送失败最多重试几次（超限标为 failed）
-RETRY_COOLDOWN_SECONDS: int = 1800        # 单条生成或发送临时失败后的重试退避秒数（1800=30 分钟后再试）
+RETRY_COOLDOWN_SECONDS: int = 600         # 单条生成或发送临时失败后的重试退避秒数（600=10 分钟后下轮再试）
 RISK_COOLDOWN_SECONDS: int = 21600        # 遇安全验证、登录失效或业务风控拦截时，该账号自动静默冷却秒数（21600=6 小时）
 
 # 6. 独立 MongoDB 集合名（物理隔离历史旧表与采集评论池，一般无需修改）
@@ -201,6 +201,24 @@ def _get_logger() -> Any:
 def _now_iso(now_ts: Optional[int] = None) -> str:
     dt = datetime.fromtimestamp(int(now_ts), tz=TZ_CN) if now_ts is not None else datetime.now(TZ_CN)
     return dt.isoformat(timespec="seconds")
+
+
+def _format_duration_brief(sec: Optional[int]) -> str:
+    if sec is None or sec < 0:
+        return "?"
+    s = int(sec)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{round(s / 60, 1):g}m"
+    return f"{round(s / 3600, 1):g}h"
+
+
+def _clip_log_text(text: Any, max_len: int = 36) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max(1, max_len - 1)] + "…"
 
 
 def _clean_handle(handle: Any) -> str:
@@ -649,12 +667,32 @@ class XReplyInboxSniffer:
         self.mention_tweets_by_id: Dict[str, Dict[str, Any]] = {}
         self.profile_own_posts_by_id: Dict[str, Dict[str, Any]] = {}
         self.detail_threads_by_focal: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self.current_source: str = ""
+        self.reply_sources_by_id: Dict[str, List[str]] = {}
+
+    def set_source(self, source: str) -> None:
+        self.current_source = str(source or "").strip()
+
+    def _record_reply_source(self, tweet_id: str, source_tag: str) -> None:
+        if not source_tag:
+            return
+        tags = self.reply_sources_by_id.setdefault(tweet_id, [])
+        if source_tag not in tags:
+            tags.append(source_tag)
 
     def _register_tweet(self, tw: Dict[str, Any]) -> None:
         tid = tw["tweet_id"]
         prev = self.tweets_by_id.get(tid)
-        if prev is None or (len(tw.get("text") or "") >= len(prev.get("text") or "")):
+        if prev is None:
             self.tweets_by_id[tid] = tw
+            return
+        merged_rc = max(safe_int(prev.get("reply_count"), 0), safe_int(tw.get("reply_count"), 0))
+        if len(tw.get("text") or "") >= len(prev.get("text") or ""):
+            self.tweets_by_id[tid] = (
+                {**tw, "reply_count": merged_rc} if merged_rc != safe_int(tw.get("reply_count"), 0) else tw
+            )
+        elif merged_rc > safe_int(prev.get("reply_count"), 0):
+            prev["reply_count"] = merged_rc
 
     def ingest_payload(self, op: str, payload: Any, *, resp_url: str = "") -> None:
         if not isinstance(payload, dict):
@@ -671,9 +709,13 @@ class XReplyInboxSniffer:
             self._register_tweet(p)
 
         if op in ("NotificationsTimeline", "NotificationsMentions", "RestNotifications"):
+            src_tag = self.current_source or (
+                "notifications_mentions" if op == "NotificationsMentions" else "notifications"
+            )
             for p in parsed_list:
                 if (not p["is_retweet"]) and p["in_reply_to_status_id"]:
                     self.mention_tweets_by_id[p["tweet_id"]] = p
+                    self._record_reply_source(p["tweet_id"], src_tag)
 
         elif op in ("UserTweets", "UserOriginalsTimeline", "UserTweetsAndReplies"):
             for p in parsed_list:
@@ -695,6 +737,8 @@ class XReplyInboxSniffer:
             for p in parsed_list:
                 if not p["is_retweet"]:
                     bucket[p["tweet_id"]] = p
+                    if p["in_reply_to_status_id"]:
+                        self._record_reply_source(p["tweet_id"], "tweet_detail")
 
     def on_response(self, resp: Any) -> None:
         try:
@@ -803,6 +847,8 @@ def upsert_collected_replies(
     max_reply_age_hours: int = MAX_REPLY_AGE_HOURS,
     max_replies_per_user_per_post: int = MAX_REPLIES_PER_USER_PER_POST,
     now_ts: Optional[int] = None,
+    reply_sources_by_id: Optional[Dict[str, Sequence[str]]] = None,
+    logger: Any = None,
 ) -> Dict[str, int]:
     """
     幂等落库捕获到的他人评论（仅写入 `x_reply_inbox`）：
@@ -924,6 +970,8 @@ def upsert_collected_replies(
         reply_author_low = str(rep.get("author_handle_lower") or reply_author.lower()).strip()
         reply_body = str(rep.get("reply_body_text") or "").strip()
         unreplyable_reason = _classify_unreplyable_text(reply_body, bool(rep.get("has_media")))
+        collected_via = list((reply_sources_by_id or {}).get(rid) or [])
+        collect_delay_sec: Optional[int] = max(0, now - pub_ts) if pub_ts > 0 else None
 
         doc: Dict[str, Any] = {
             "account_name": account_name,
@@ -939,6 +987,8 @@ def upsert_collected_replies(
             "reply_has_media": bool(rep.get("has_media")),
             "reply_publish_ts": pub_ts,
             "reply_publish_at": _now_iso(pub_ts) if pub_ts > 0 else None,
+            "collected_via": collected_via,
+            "collect_delay_sec": collect_delay_sec,
             "post_id": post_id,
             "post_url": post_url,
             "post_text": post_text,
@@ -952,6 +1002,11 @@ def upsert_collected_replies(
             "generated_lang": None,
             "generated_weighted_len": None,
             "generator_model": None,
+            "generator_prompt_file": None,
+            "generator_prompt_sha1": None,
+            "generate_elapsed_ms": None,
+            "generate_schema_attempts": None,
+            "generate_trace_id": None,
             "generated_at": None,
             "generated_at_ts": 0,
             "generate_attempts": 0,
@@ -961,6 +1016,8 @@ def upsert_collected_replies(
             "replied_url": None,
             "replied_text": None,
             "replied_source": None,
+            "liked_before_reply": None,
+            "end_to_end_delay_sec": None,
             "replied_at": None,
             "replied_at_ts": 0,
             "reply_attempts": 0,
@@ -1007,6 +1064,21 @@ def upsert_collected_replies(
 
         col.update_one({"account_name": account_name, "reply_id": rid}, {"$set": doc}, upsert=True)
         stats["total_inserted"] += 1
+
+        if logger is not None:
+            via_txt = "+".join(collected_via) if collected_via else "unknown"
+            acct_tag = self_handle_low or account_name
+            if doc["status"] == "pending_generate":
+                delay_txt = _format_duration_brief(collect_delay_sec)
+                logger.info(
+                    f"📥 [模块1/新评论入库 | @{acct_tag}] @{reply_author}({rid}) via={via_txt} 延迟={delay_txt} | "
+                    f"「{_clip_log_text(reply_body, 40)}」 -> 帖{post_id}"
+                )
+            elif doc["status"] == "skipped":
+                logger.info(
+                    f"⏭️ [模块1/入库跳过 | @{acct_tag}] @{reply_author}({rid}) reason={doc.get('skip_reason')} | "
+                    f"「{_clip_log_text(reply_body, 30)}」"
+                )
 
     return dict(stats)
 
@@ -1062,6 +1134,7 @@ def collect_replies_for_account(
             try:
                 # 第 1a 站：优先浏览「全部通知」页（绕开 /mentions 对新号/小号的静默折叠过滤）
                 mentions_scrolls = max(0, safe_int(cfg.get("mentions_scroll_rounds"), MENTIONS_SCROLL_ROUNDS))
+                sniffer.set_source("notifications_all")
                 prev_all = sum(sniffer.op_counts.get(op_k, 0) for op_k in _NOTIF_OPS)
                 page.goto(X_NOTIFICATIONS_URL, timeout=45000, wait_until="domcontentloaded")
                 sniffer.wait_for_ops(page, _NOTIF_OPS, prev_all, timeout_ms=10000)
@@ -1088,6 +1161,7 @@ def collect_replies_for_account(
 
                 # 第 1b 站：补充浏览「提及」页（全部通知刷屏极多时兜底早先的 @ 提及）
                 if time.monotonic() - lock_t0 < hold_limit:
+                    sniffer.set_source("notifications_mentions")
                     prev_m = sum(sniffer.op_counts.get(op_k, 0) for op_k in _NOTIF_OPS)
                     page.goto(X_MENTIONS_URL, timeout=45000, wait_until="domcontentloaded")
                     sniffer.wait_for_ops(page, _NOTIF_OPS, prev_m, timeout_ms=10000)
@@ -1105,6 +1179,7 @@ def collect_replies_for_account(
                         page.wait_for_timeout(random.randint(1000, 1600))
 
                 # 第 2 站：浏览己方个人主页，发现最近原创/引用主帖及其 reply_count
+                sniffer.set_source("profile")
                 prev_u = sum(sniffer.op_counts.get(op_k, 0) for op_k in _PROFILE_OPS)
                 page.goto(f"https://x.com/{eff_handle}", timeout=45000, wait_until="domcontentloaded")
                 sniffer.wait_for_ops(page, _PROFILE_OPS, prev_u, timeout_ms=12000)
@@ -1292,6 +1367,7 @@ def collect_replies_for_account(
                 details_opened = 0
                 halt_status: Optional[str] = None
                 halt_warning: Optional[str] = None
+                sniffer.set_source("tweet_detail")
                 for target_id, target_url, _kind in targets_to_open[:max_details]:
                     if time.monotonic() - lock_t0 >= hold_limit:
                         log.info(f"⏹️ [模块1/持锁止损 | {acc_name}] 已达持锁上限 {hold_limit}s，安全提前放锁。")
@@ -1336,6 +1412,8 @@ def collect_replies_for_account(
                     max_reply_age_hours=max_age_h,
                     max_replies_per_user_per_post=max_per_user,
                     now_ts=int(time.time()),
+                    reply_sources_by_id=sniffer.reply_sources_by_id,
+                    logger=log,
                 )
 
                 # 更新已打开详情的根帖检查点（仅当确实捕获到该根帖本体时才写入根帖信息，避免子回复误标根帖归属）
@@ -1498,6 +1576,7 @@ def generate_replies_from_db(
     ready_cnt = 0
     skipped_cnt = 0
     failed_cnt = 0
+    batch_t0 = time.monotonic()
 
     for doc in pending_docs:
         rid = str(doc.get("reply_id") or "")
@@ -1579,6 +1658,13 @@ def generate_replies_from_db(
             continue
 
         model_used = str(trace.get("model_used") or f"group:{model_group}")
+        prompt_file = str(trace.get("prompt_file") or prompt_meta.get("prompt_file") or PROMPT_TEMPLATE_FILENAME)
+        prompt_sha1 = str(trace.get("prompt_sha1") or prompt_meta.get("prompt_sha1") or "")
+        elapsed_ms = safe_int(trace.get("elapsed_ms"), 0)
+        schema_attempts = safe_int(trace.get("schema_attempt"), 1)
+        trace_id = str(trace.get("trace_id") or "")
+        gen_cost_s = round(elapsed_ms / 1000.0, 1)
+
         if parsed.get("skip"):
             reason = str(parsed.get("skip_reason") or "").strip() or "model_skipped"
             col.update_one(
@@ -1588,6 +1674,11 @@ def generate_replies_from_db(
                         "status": "skipped",
                         "skip_reason": f"ai_safety:{reason}",
                         "generator_model": model_used,
+                        "generator_prompt_file": prompt_file,
+                        "generator_prompt_sha1": prompt_sha1,
+                        "generate_elapsed_ms": elapsed_ms,
+                        "generate_schema_attempts": schema_attempts,
+                        "generate_trace_id": trace_id,
                         "generated_at": step_iso,
                         "generated_at_ts": step_ts,
                         "generate_last_error": None,
@@ -1597,7 +1688,10 @@ def generate_replies_from_db(
                 },
             )
             skipped_cnt += 1
-            log.info(f"⏭️ [模块2/安全跳过 | {acc_name}] @{reply_author} reply_id={rid} | reason={reason}")
+            log.info(
+                f"⏭️ [模块2/安全跳过 | {acc_name}] @{reply_author}({rid}) [{model_used}|{gen_cost_s}s] "
+                f"reason={reason} | 评「{_clip_log_text(reply_text, 28)}」"
+            )
             continue
 
         reply_out = _clean_generated_reply_text(parsed.get("reply_text"), reply_author)
@@ -1613,6 +1707,11 @@ def generate_replies_from_db(
                     "generated_lang": gen_lang,
                     "generated_weighted_len": w_len,
                     "generator_model": model_used,
+                    "generator_prompt_file": prompt_file,
+                    "generator_prompt_sha1": prompt_sha1,
+                    "generate_elapsed_ms": elapsed_ms,
+                    "generate_schema_attempts": schema_attempts,
+                    "generate_trace_id": trace_id,
                     "generated_at": step_iso,
                     "generated_at_ts": step_ts,
                     "generate_last_error": None,
@@ -1622,10 +1721,15 @@ def generate_replies_from_db(
             },
         )
         ready_cnt += 1
-        log.info(f"✍️ [模块2/生成就绪 | {acc_name}] @{reply_author} reply_id={rid} ({gen_lang}|{w_len}w) -> {reply_out}")
+        log.info(
+            f"✍️ [模块2/生成就绪 | {acc_name}] @{reply_author}({rid}) "
+            f"[{gen_lang}|{w_len}w|{model_used}|{gen_cost_s}s] "
+            f"评「{_clip_log_text(reply_text, 28)}」 -> 回「{reply_out}」"
+        )
 
+    batch_sec = round(time.monotonic() - batch_t0, 1)
     log.info(
-        f"✅ [模块2-生成 | {acc_name}] 待生成={len(pending_docs)} -> 就绪={ready_cnt} | 跳过={skipped_cnt} | 失败={failed_cnt}"
+        f"✅ [模块2-生成 | {acc_name}] 待生成={len(pending_docs)} -> 就绪={ready_cnt} | 跳过={skipped_cnt} | 失败={failed_cnt} | 耗时={batch_sec}s"
     )
     return {
         "account_name": acc_name,
@@ -1641,18 +1745,21 @@ def generate_replies_from_db(
 # 五、模块 3：精准防重执行回复 (`publish_replies_for_account`)
 # ==============================================================================
 
-def _like_focal_comment_on_page(page: Any, reply_id: str, logger: Any) -> None:
+def _like_focal_comment_on_page(page: Any, reply_id: str, logger: Any) -> bool:
     try:
         focal = _locate_focal_tweet(page, post_id=reply_id)
         unlike_btn = focal.locator('button[data-testid="unlike"]').first
         if unlike_btn.count() > 0 and unlike_btn.is_visible():
-            return
+            return True
         like_btn = focal.locator('button[data-testid="like"]').first
         if like_btn.count() > 0 and like_btn.is_visible():
             _robust_click(like_btn)
             page.wait_for_timeout(random.randint(400, 900))
+            return True
+        return False
     except Exception as exc:
         logger.debug(f"[模块3/点赞略过] reply_id={reply_id}: {exc}")
+        return False
 
 
 def publish_replies_for_account(
@@ -1827,6 +1934,9 @@ def publish_replies_for_account(
                                 },
                             )
                             skipped_cnt += 1
+                            log.info(
+                                f"⏭️ [模块3/跳过 | {acc_name}] @{fresh.get('reply_author')}({rid}) reason=max_replies_per_user_per_post_reached"
+                            )
                             continue
 
                     if live_actions > 0:
@@ -1852,6 +1962,7 @@ def publish_replies_for_account(
                             {"$set": {"status": "unavailable", "skip_reason": f"http_{resp.status}", "updated_at": _now_iso(), "updated_at_ts": int(time.time())}},
                         )
                         skipped_cnt += 1
+                        log.info(f"⏭️ [模块3/跳过 | {acc_name}] @{fresh.get('reply_author')}({rid}) reason=http_{resp.status}")
                         continue
 
                     post_gone = False
@@ -1869,6 +1980,9 @@ def publish_replies_for_account(
                             {"$set": {"status": "unavailable", "skip_reason": "reply_deleted_or_unavailable", "updated_at": _now_iso(), "updated_at_ts": int(time.time())}},
                         )
                         skipped_cnt += 1
+                        log.info(
+                            f"⏭️ [模块3/跳过 | {acc_name}] @{fresh.get('reply_author')}({rid}) reason=reply_deleted_or_unavailable"
+                        )
                         continue
 
                     # 防重层 2：检查实时抓到的 TweetDetail 中是否已有己方回复（防止人工已回复或历史重复）
@@ -1907,11 +2021,15 @@ def publish_replies_for_account(
                                 {"$set": {"status": "unavailable", "skip_reason": "reply_restricted", "updated_at": _now_iso(), "updated_at_ts": int(time.time())}},
                             )
                             skipped_cnt += 1
+                            log.info(
+                                f"⏭️ [模块3/跳过 | {acc_name}] @{fresh.get('reply_author')}({rid}) reason=reply_restricted"
+                            )
                             continue
 
+                    liked_ok: Optional[bool] = None
                     try:
                         if like_before:
-                            _like_focal_comment_on_page(page, rid, log)
+                            liked_ok = bool(_like_focal_comment_on_page(page, rid, log))
                         reply_container = _locate_x_reply_box(page, post_id=rid)
                         new_reply_id = _submit_x_post(
                             page,
@@ -1966,6 +2084,8 @@ def publish_replies_for_account(
 
                     done_ts = int(time.time())
                     done_iso = _now_iso(done_ts)
+                    pub_ts = safe_int(fresh.get("reply_publish_ts"), 0)
+                    e2e_delay: Optional[int] = max(0, done_ts - pub_ts) if pub_ts > 0 else None
                     replied_url = f"https://x.com/{eff_handle or 'i'}/status/{new_reply_id}" if new_reply_id else None
                     col.update_one(
                         {"account_name": acc_name, "reply_id": rid},
@@ -1976,6 +2096,8 @@ def publish_replies_for_account(
                                 "replied_url": replied_url,
                                 "replied_text": reply_text,
                                 "replied_source": "auto_replier",
+                                "liked_before_reply": liked_ok,
+                                "end_to_end_delay_sec": e2e_delay,
                                 "replied_at": done_iso,
                                 "replied_at_ts": done_ts,
                                 "reply_last_error": None,
@@ -1993,9 +2115,10 @@ def publish_replies_for_account(
                             "replied_url": replied_url,
                         }
                     )
+                    like_txt = "是" if liked_ok else ("否" if liked_ok is False else "关")
                     log.info(
                         f"💬 [模块3/精准回复成功 | @{eff_handle or acc_name}] 对 @{fresh.get('reply_author')}({rid}) -> "
-                        f"new_id={new_reply_id} | {reply_text}"
+                        f"new_id={new_reply_id} | 赞={like_txt} | 总延迟={_format_duration_brief(e2e_delay)} | {reply_text}"
                     )
 
                 hold_sec = round(time.monotonic() - lock_t0, 1)
@@ -2047,26 +2170,68 @@ def build_status_report(
     acc_reports: List[Dict[str, Any]] = []
     for acc in accounts:
         name = str(acc["name"])
+        all_docs = list(col.find({"account_name": name}, {"_id": 0}))
         counts = {
-            st: int(col.count_documents({"account_name": name, "status": st}))
+            st: 0
             for st in ("pending_generate", "ready_to_reply", "replied", "skipped", "unavailable", "failed")
         }
-        sent_24h = int(
-            col.count_documents(
-                {
-                    "account_name": name,
-                    "status": "replied",
-                    "replied_source": "auto_replier",
-                    "replied_at_ts": {"$gte": eff_now - 86400},
-                }
-            )
-        )
+        sent_24h = 0
+        via_counts: Counter = Counter()
+        model_counts: Counter = Counter()
+        skip_reasons: Counter = Counter()
+        collect_delays: List[int] = []
+        e2e_delays: List[int] = []
+        gen_ms_list: List[int] = []
+
+        for d in all_docs:
+            st = str(d.get("status") or "")
+            if st in counts:
+                counts[st] += 1
+            pub_ts = safe_int(d.get("reply_publish_ts"), 0)
+            col_ts = safe_int(d.get("collected_at_ts"), 0)
+            rep_ts = safe_int(d.get("replied_at_ts"), 0)
+            if st == "replied" and d.get("replied_source") == "auto_replier" and rep_ts >= eff_now - 86400:
+                sent_24h += 1
+            for src in (d.get("collected_via") or []):
+                if src:
+                    via_counts[str(src)] += 1
+            g_model = str(d.get("generator_model") or "").strip()
+            if g_model:
+                model_counts[g_model] += 1
+            if st in ("skipped", "unavailable") and d.get("skip_reason"):
+                skip_reasons[str(d["skip_reason"])] += 1
+
+            c_delay = d.get("collect_delay_sec")
+            if isinstance(c_delay, (int, float)) and c_delay >= 0:
+                collect_delays.append(int(c_delay))
+            elif pub_ts > 0 and col_ts >= pub_ts:
+                collect_delays.append(col_ts - pub_ts)
+
+            g_ms = safe_int(d.get("generate_elapsed_ms"), 0)
+            if g_ms > 0:
+                gen_ms_list.append(g_ms)
+
+            if st == "replied" and d.get("replied_source") == "auto_replier":
+                e_delay = d.get("end_to_end_delay_sec")
+                if isinstance(e_delay, (int, float)) and e_delay >= 0:
+                    e2e_delays.append(int(e_delay))
+                elif pub_ts > 0 and rep_ts >= pub_ts:
+                    e2e_delays.append(rep_ts - pub_ts)
+
         checkpoints = int(cp_col.count_documents({"account_name": name, "is_own_post": True}))
         recent_docs = sorted(
-            list(col.find({"account_name": name, "status": {"$in": ["ready_to_reply", "replied"]}}, {"_id": 0})),
+            (d for d in all_docs if d.get("status") in ("ready_to_reply", "replied")),
             key=lambda d: max(safe_int(d.get("replied_at_ts"), 0), safe_int(d.get("updated_at_ts"), 0)),
             reverse=True,
         )[:5]
+        analytics = {
+            "via_counts": dict(via_counts),
+            "model_counts": dict(model_counts),
+            "skip_reasons": dict(skip_reasons),
+            "avg_collect_delay_sec": (round(sum(collect_delays) / len(collect_delays)) if collect_delays else None),
+            "avg_e2e_delay_sec": (round(sum(e2e_delays) / len(e2e_delays)) if e2e_delays else None),
+            "avg_gen_ms": (round(sum(gen_ms_list) / len(gen_ms_list)) if gen_ms_list else None),
+        }
         acc_reports.append(
             {
                 "account_name": name,
@@ -2074,12 +2239,15 @@ def build_status_report(
                 "checkpoints": checkpoints,
                 "sent_24h": sent_24h,
                 "counts": counts,
+                "analytics": analytics,
                 "recent": [
                     {
                         "status": d.get("status"),
                         "reply_author": f"@{d.get('reply_author') or ''}",
                         "reply_text": (d.get("reply_text") or "")[:60],
                         "generated_reply": (d.get("generated_reply") or d.get("replied_text") or "")[:80],
+                        "model": d.get("generator_model") or "",
+                        "collected_via": list(d.get("collected_via") or []),
                     }
                     for d in recent_docs
                 ],
@@ -2097,6 +2265,25 @@ def format_status_text(report: Dict[str, Any]) -> str:
             f"待生成={c['pending_generate']} | 待发送={c['ready_to_reply']} | 已回复={c['replied']} | "
             f"跳过={c['skipped']} | 失效={c['unavailable']} | 失败={c['failed']}"
         )
+        an = a.get("analytics") or {}
+        metric_parts = []
+        if an.get("via_counts"):
+            metric_parts.append(f"来源={an['via_counts']}")
+        if an.get("model_counts"):
+            metric_parts.append(f"模型={an['model_counts']}")
+        delay_parts = []
+        if an.get("avg_collect_delay_sec") is not None:
+            delay_parts.append(f"采集={_format_duration_brief(an['avg_collect_delay_sec'])}")
+        if an.get("avg_e2e_delay_sec") is not None:
+            delay_parts.append(f"端到端={_format_duration_brief(an['avg_e2e_delay_sec'])}")
+        if an.get("avg_gen_ms") is not None:
+            delay_parts.append(f"生成={an['avg_gen_ms']}ms")
+        if delay_parts:
+            metric_parts.append(f"均值延迟({', '.join(delay_parts)})")
+        if metric_parts:
+            lines.append(f"   指标: {' | '.join(metric_parts)}")
+        if an.get("skip_reasons"):
+            lines.append(f"   跳过原因: {an['skip_reasons']}")
         for item in a["recent"]:
             lines.append(
                 f"   - [{item['status']}] {item['reply_author']}: {item['reply_text']} -> {item['generated_reply']}"
@@ -2150,11 +2337,11 @@ def run_parallel_daemon(
     collect_cooldown_until: Dict[str, float] = {}
     reply_cooldown_until: Dict[str, float] = {}
 
-    collect_interval = max(60, safe_int(cfg.get("collect_interval_seconds"), 3600))
+    collect_interval = max(60, safe_int(cfg.get("collect_interval_seconds"), COLLECT_INTERVAL_SECONDS))
     collect_jitter = _parse_jitter_pair(cfg.get("collect_jitter_seconds"))
-    generate_interval = max(60, safe_int(cfg.get("generate_interval_seconds"), 3600))
+    generate_interval = max(60, safe_int(cfg.get("generate_interval_seconds"), GENERATE_INTERVAL_SECONDS))
     generate_jitter = _parse_jitter_pair(cfg.get("generate_jitter_seconds"))
-    reply_interval = max(60, safe_int(cfg.get("reply_interval_seconds"), 3600))
+    reply_interval = max(60, safe_int(cfg.get("reply_interval_seconds"), REPLY_INTERVAL_SECONDS))
     reply_jitter = _parse_jitter_pair(cfg.get("reply_jitter_seconds"))
 
     def _schedule_next_sleep(
@@ -2165,10 +2352,11 @@ def run_parallel_daemon(
         *,
         override_base: Optional[int] = None,
         reason: str = "",
+        did_work: bool = False,
     ) -> Dict[str, Any]:
         eff_base = override_base if override_base is not None else base_sec
         sleep_sec = int(round(compute_jittered_interval(eff_base, additive_jitter_range=jitter_pair)))
-        if max_rounds == 0 or round_no < max_rounds:
+        if (max_rounds == 0 or round_no < max_rounds) and (round_no == 1 or did_work or bool(reason)):
             next_at = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%H:%M:%S")
             mins_txt = f"{round(sleep_sec / 60, 1):g}分钟" if sleep_sec >= 60 else f"{sleep_sec}秒"
             reason_txt = f" | {reason}" if reason else ""
@@ -2178,6 +2366,7 @@ def run_parallel_daemon(
     def _collector_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
         any_empty = False
+        any_work = False
         for acc in pool:
             acc_dir, acc_name = acc["user_data_dir"], acc["name"]
             rem = collect_cooldown_until.get(acc_dir, 0.0) - time.time()
@@ -2186,6 +2375,15 @@ def run_parallel_daemon(
                 continue
             res = collect_replies_for_account(acc, db=db, config=cfg, logger=log)
             st = str(res.get("status") or "ok")
+            if (
+                safe_int(res.get("details_opened"), 0) > 0
+                or safe_int(res.get("new_pending"), 0) > 0
+                or safe_int(res.get("new_skipped"), 0) > 0
+                or safe_int(res.get("new_already_replied"), 0) > 0
+                or safe_int(res.get("upgraded_replied_on_x"), 0) > 0
+                or st != "ok"
+            ):
+                any_work = True
             if st in _RISK_HALT_STATUSES:
                 collect_cooldown_until[acc_dir] = time.time() + risk_cd_sec
                 log.error(f"⏳ [工人1-采集 | {acc_name}] 触发独立风控冷却 {risk_cd_sec}s | status={st}")
@@ -2201,6 +2399,7 @@ def run_parallel_daemon(
                 collect_jitter,
                 override_base=min(collect_interval, 600),
                 reason="空采重试",
+                did_work=True,
             )
         active_rems = [max(0.0, collect_cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
         if pool and all(r > 0 for r in active_rems):
@@ -2211,17 +2410,22 @@ def run_parallel_daemon(
                 collect_jitter,
                 override_base=max(collect_interval, int(min(active_rems))),
                 reason="风控冷却",
+                did_work=True,
             )
-        return _schedule_next_sleep("工人1-采集", round_no, collect_interval, collect_jitter)
+        return _schedule_next_sleep("工人1-采集", round_no, collect_interval, collect_jitter, did_work=any_work)
 
     def _generator_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
+        any_work = False
         for acc in pool:
-            generate_replies_from_db(acc, db=db, config=cfg, logger=log)
-        return _schedule_next_sleep("工人2-生成", round_no, generate_interval, generate_jitter)
+            res = generate_replies_from_db(acc, db=db, config=cfg, logger=log)
+            if safe_int(res.get("pending_found"), 0) > 0:
+                any_work = True
+        return _schedule_next_sleep("工人2-生成", round_no, generate_interval, generate_jitter, did_work=any_work)
 
     def _replier_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
+        any_work = False
         for acc in pool:
             acc_dir, acc_name = acc["user_data_dir"], acc["name"]
             rem = reply_cooldown_until.get(acc_dir, 0.0) - time.time()
@@ -2230,6 +2434,8 @@ def run_parallel_daemon(
                 continue
             res = publish_replies_for_account(acc, db=db, config=cfg, logger=log)
             st = str(res.get("status") or "ok")
+            if bool(res.get("browser_opened")) or safe_int(res.get("candidates_found"), 0) > 0 or st != "ok":
+                any_work = True
             if st in _RISK_HALT_STATUSES:
                 reply_cooldown_until[acc_dir] = time.time() + risk_cd_sec
                 log.error(f"⏳ [工人3-回复 | {acc_name}] 触发独立风控冷却 {risk_cd_sec}s | status={st}")
@@ -2244,15 +2450,16 @@ def run_parallel_daemon(
                 reply_jitter,
                 override_base=max(reply_interval, int(min(active_rems))),
                 reason="风控冷却",
+                did_work=True,
             )
-        return _schedule_next_sleep("工人3-回复", round_no, reply_interval, reply_jitter)
+        return _schedule_next_sleep("工人3-回复", round_no, reply_interval, reply_jitter, did_work=any_work)
 
     worker_specs = []
     if bool(cfg.get("enable_collector", True)):
         worker_specs.append(
             (
                 "ReplyCollector",
-                max(0, safe_int(cfg.get("collect_initial_delay_seconds"), 0)),
+                max(0, safe_int(cfg.get("collect_initial_delay_seconds"), COLLECT_INITIAL_DELAY_SECONDS)),
                 collect_interval,
                 collect_jitter,
                 _collector_step,
@@ -2262,7 +2469,7 @@ def run_parallel_daemon(
         worker_specs.append(
             (
                 "ReplyGenerator",
-                max(0, safe_int(cfg.get("generate_initial_delay_seconds"), 30)),
+                max(0, safe_int(cfg.get("generate_initial_delay_seconds"), GENERATE_INITIAL_DELAY_SECONDS)),
                 generate_interval,
                 generate_jitter,
                 _generator_step,
@@ -2272,7 +2479,7 @@ def run_parallel_daemon(
         worker_specs.append(
             (
                 "ReplyPublisher",
-                max(0, safe_int(cfg.get("reply_initial_delay_seconds"), 60)),
+                max(0, safe_int(cfg.get("reply_initial_delay_seconds"), REPLY_INITIAL_DELAY_SECONDS)),
                 reply_interval,
                 reply_jitter,
                 _replier_step,
