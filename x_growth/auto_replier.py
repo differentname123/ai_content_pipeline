@@ -43,7 +43,7 @@ from common.common_utils import (
     safe_int,
     setup_logger,
 )
-from common.daemon import interruptible_sleep, run_daemon_loop
+from common.daemon import compute_jittered_interval, interruptible_sleep, run_daemon_loop
 from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
 from common.x_text import calc_x_weighted_length
@@ -66,12 +66,12 @@ from platforms.x_playwright import (
 )
 
 # ==============================================================================
-# 一、运维配置区（直接修改这里并重启即可生效，无需任何命令行参数）
+# 一、运维配置区（直接修改下方变量并重启即可生效，无需任何命令行参数）
 # ==============================================================================
 
-# 0. 运行模式开关：
+# 0. 运行模式开关（按需把 RUN_MODE 改成下面任一字符串即可）：
 #   "daemon"        -> 【默认挂机】并行启动 3 个独立工人线程（采集 / 生成 / 回复，各自按周期独立运行）
-#   "once_all"      -> 【全流程跑一轮】顺序执行 1 次「采集 -> 生成 -> 回复」后退出
+#   "once_all"      -> 【全流程跑一轮】顺序执行 1 次「采集 -> 生成 -> 回复」后退出（适合手动测试完整链路）
 #   "collect_once"  -> 【仅采一轮】只运行模块 1 收集评论入库后退出
 #   "generate_once" -> 【仅生一轮】只运行模块 2 查库生成回复后退出（不开浏览器）
 #   "reply_once"    -> 【仅回一轮】只运行模块 3 精准执行回复后退出
@@ -80,81 +80,83 @@ from platforms.x_playwright import (
 #   "login"         -> 【人工登录】打开可见 Chrome 供手动登录并固化浏览器目录会话
 RUN_MODE: str = "daemon"
 
-# 1. 需要自动监控并回复评论的账号列表（只需要填写浏览器目录；默认使用 x_myself）
+# 1. 需要自动监控并回复评论的账号列表（核心必填项：user_data_dir 浏览器会话目录；默认使用 x_myself）
 ACCOUNTS: List[Dict[str, Any]] = [
     {
-        "name": "x_myself",
-        "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
-        "screen_name": str(get_config("x_myself_screen_name", "peterzhu1003") or "peterzhu1003").strip().lstrip("@"),
-        "enabled": True,
+        "name": "x_myself",               # 数据库分账号隔离标识（建议保持唯一英文短名）
+        "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),  # 已登录该 X 账号的浏览器数据目录路径
+        "screen_name": str(get_config("x_myself_screen_name", "peterzhu1003") or "peterzhu1003").strip().lstrip("@"),  # 账号 @用户名（不带 @；可留空，打开浏览器后会自动识别）
+        "enabled": True,                  # True=启用该账号；False=临时停用（不删配置）
     },
-    # 如需追加其他已登录账号，按下方模板复制一段即可（screen_name 可省略，浏览器打开后会自动识别）：
+    # 如需追加其他已登录账号，按下方模板复制一段即可（screen_name 可留空自动识别）：
     # {
     #     "name": "x_account_2",
-    #     "user_data_dir": resolve_session_dir("x_account_2_browser_session_dir", "x_account_2"),
+    #     "user_data_dir": r"W:\temp\x_account_2",
     #     "screen_name": "",
     #     "enabled": True,
     # },
 ]
 
-# 2. 三个独立工人的并行调度开关与间隔配置（默认每 3600 秒 = 1 小时各跑一轮）
-ENABLE_COLLECTOR: bool = True
-COLLECT_INTERVAL_SECONDS: int = 3600
-COLLECT_JITTER_SECONDS: Tuple[int, int] = (60, 240)
-COLLECT_INITIAL_DELAY_SECONDS: int = 0
+# 2. 三个独立工人的并行调度开关与运行周期（单位：秒；默认 3600 秒 = 每 1 小时各独立运行一轮）
+ENABLE_COLLECTOR: bool = True             # 是否启动【工人 1 · 收集评论】（False=不采集）
+COLLECT_INTERVAL_SECONDS: int = 600      # 工人 1 基础执行间隔（秒；3600=1 小时，改小如 1800 即半小时一轮）
+COLLECT_JITTER_SECONDS: Tuple[int, int] = (60, 240)  # 每轮额外附加的随机延迟范围 (最小秒, 最大秒)，防止整点机械规律
+COLLECT_INITIAL_DELAY_SECONDS: int = 0    # 启动后工人 1 首次等待多少秒再开跑（0=启动立即运行）
 
-ENABLE_GENERATOR: bool = True
-GENERATE_INTERVAL_SECONDS: int = 3600
-GENERATE_JITTER_SECONDS: Tuple[int, int] = (15, 60)
-GENERATE_INITIAL_DELAY_SECONDS: int = 30
+ENABLE_GENERATOR: bool = True             # 是否启动【工人 2 · AI 生成回复】（纯查库不开浏览器）
+GENERATE_INTERVAL_SECONDS: int = 600     # 工人 2 基础执行间隔（秒；3600=1 小时）
+GENERATE_JITTER_SECONDS: Tuple[int, int] = (15, 60)  # 工人 2 轮次随机抖动范围（秒）
+GENERATE_INITIAL_DELAY_SECONDS: int = 30  # 启动后工人 2 延迟几秒运行（默认错开 30 秒，刚好接住工人 1 刚采到的数据）
 
-ENABLE_REPLIER: bool = True
-REPLY_INTERVAL_SECONDS: int = 3600
-REPLY_JITTER_SECONDS: Tuple[int, int] = (60, 240)
-REPLY_INITIAL_DELAY_SECONDS: int = 60
+ENABLE_REPLIER: bool = True               # 是否启动【工人 3 · 精准执行回复】（开浏览器发回复）
+REPLY_INTERVAL_SECONDS: int = 600        # 工人 3 基础执行间隔（秒；3600=1 小时）
+REPLY_JITTER_SECONDS: Tuple[int, int] = (60, 240)    # 工人 3 轮次随机抖动范围（秒）
+REPLY_INITIAL_DELAY_SECONDS: int = 60     # 启动后工人 3 延迟几秒运行（默认错开 60 秒，避免与工人 1 同时抢占同一浏览器目录）
 
-# 3. 【模块 1 · 收集评论】扫描与防爆窗/防重复参数
-# True=只回复别人对我自己发出的主帖（及其下多轮追评）的评论；False=也回复别人在他人帖下对我评论的回复
+# 3. 【模块 1 · 收集评论】监控范围、扫描深度与防重复过滤参数
+# 互动监控范围开关（最常用）：
+#   True  -> 只收集【你自己发出去的原创/引用主帖】下面别人的评论（以及你在自己帖下继续的追评）
+#   False -> 除了自己主帖，也同时收集【你在别人帖子下发表评论后，别人回复你评论的消息】
 ONLY_MY_ROOT_POSTS: bool = True
 # 【保留过滤原因说明】单轮仅扫描本人主页最新 N 条原创/引用主帖，避免翻阅陈年旧帖引发无意义的浏览器滚屏风控
-MAX_OWN_POSTS_TO_SCAN: int = 20
+MAX_OWN_POSTS_TO_SCAN: int = 20           # 每次访问自己主页最多检查最新多少条主帖
 # 【保留过滤原因说明】单轮最多打开 N 个帖子详情页做深度抓评，配合持锁上限控制单次浏览耗时
-MAX_POST_DETAILS_PER_RUN: int = 8
-PROFILE_SCROLL_ROUNDS: int = 2
-MENTIONS_SCROLL_ROUNDS: int = 2
-DETAIL_SCROLL_ROUNDS: int = 2
+MAX_POST_DETAILS_PER_RUN: int = 8         # 单轮最多点开几条有评论/新提及的帖子详情页抓取完整评论树
+PROFILE_SCROLL_ROUNDS: int = 2            # 浏览自己主页时向下滚屏次数（想扫更早的主帖可适当调大如 3~4）
+MENTIONS_SCROLL_ROUNDS: int = 2           # 浏览通知页（全部通知 + 提及）时向下滚屏次数
+DETAIL_SCROLL_ROUNDS: int = 2             # 点开单个帖子详情页后向下滚屏加载评论的次数
 # 【保留过滤原因说明】对于 48h 内已产生评论的活跃主帖，即便回复总数未变（防删一条增一条），满 4 小时仍低频复查一次
-POST_RECHECK_SECONDS: int = 14400
+POST_RECHECK_SECONDS: int = 14400         # 活跃主帖强制复查周期（秒；14400=4 小时）
 # 【保留过滤原因说明】防止首次上线翻出数月前陈年旧评论批量回复引发扰民与风控；设为 0 表示不限制时间窗
-MAX_REPLY_AGE_HOURS: int = 72
+MAX_REPLY_AGE_HOURS: int = 72             # 只收集最近多少小时内发表的评论（72=只看近 3 天；0=历史全收）
 # 【保留过滤原因说明】同一主帖下对同一用户最多回复次数（默认 1 次，彻底杜绝遇到其他自动回复机器人时无限对刷死循环）
-MAX_REPLIES_PER_USER_PER_POST: int = 1
+MAX_REPLIES_PER_USER_PER_POST: int = 1    # 同一帖内对同一个用户最多自动回复几次（想支持来回追评可改为 2，0=不限）
 
-# 4. 【模块 2 · 生成回复】AI 模型组与长度安全门禁
-PROMPT_TEMPLATE_FILENAME: str = "auto_reply_comment.md"
-GENERATOR_MODEL_GROUP: str = "low"     # 严格走 common/llm_gateway 负载均衡，严禁硬编码具体模型名
-MAX_GENERATE_PER_RUN: int = 30
-MAX_REPLY_WEIGHTED_CHARS: int = 240
+# 4. 【模块 2 · 生成回复】AI 模型组与回复安全长度参数
+PROMPT_TEMPLATE_FILENAME: str = "auto_reply_comment.md"  # 使用的提示词文件名（位于 prompt/x_growth/ 目录）
+GENERATOR_MODEL_GROUP: str = "low"        # AI 模型组路由（"low"=普通低成本模型 / "medium"=中等模型；严禁硬编码具体模型名）
+MAX_GENERATE_PER_RUN: int = 30            # 单轮最多批量生成多少条待回复评论
+MAX_REPLY_WEIGHTED_CHARS: int = 240       # 生成回复的最大 X 加权字符长度（中文约 120 字、英文约 240 字母，硬上限 <= 280）
 # 【保留过滤原因说明】短文本回复生成场景，120s 超时可快速触发网关容灾切换模型，避免单次卡死拖垮整轮队列
-LLM_TIMEOUT_SECONDS: int = 120
-MAX_GENERATE_RETRIES: int = 3
+LLM_TIMEOUT_SECONDS: int = 120            # 单次 AI 生成超时时间（秒）
+MAX_GENERATE_RETRIES: int = 3             # 单条评论 AI 生成失败最多重试几次（超限标为 failed）
 
-# 5. 【模块 3 · 执行回复】浏览器、限流与防封安全参数
-DRY_RUN: bool = False                  # True=仅查库预览待回复内容，绝不打开浏览器或实际发送
-BROWSER_VISIBLE: bool = False          # False=--headless=new 后台静默运行；True=显示 Chrome 窗口方便观察
-LIKE_COMMENT_BEFORE_REPLY: bool = True # 回复前顺手给对方评论点赞
-MAX_REPLIES_PER_RUN: int = 5           # 【保留过滤原因说明】单轮最多真实发出 5 条回复，分散行为节奏防高频刷评风控
-MAX_REPLIES_PER_DAY: int = 30          # 【保留过滤原因说明】单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
-ACTION_DELAY_RANGE: Tuple[int, int] = (12, 25)
+# 5. 【模块 3 · 执行回复】浏览器可见性、频率控制与风控冷却参数
+DRY_RUN: bool = False                     # True=仅预览待发内容，绝不打开浏览器或真发；False=真实发送回复
+BROWSER_VISIBLE: bool = False             # False=后台静默运行不弹窗（推荐挂机）；True=弹出 Chrome 窗口方便观察过程
+LIKE_COMMENT_BEFORE_REPLY: bool = True    # 回复对方评论前是否顺手给对方那条评论点赞
+MAX_REPLIES_PER_RUN: int = 5              # 【保留过滤原因说明】单轮最多真实发出 5 条回复，分散行为节奏防高频刷评风控
+MAX_REPLIES_PER_DAY: int = 30             # 【保留过滤原因说明】单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
+ACTION_DELAY_RANGE: Tuple[int, int] = (12, 25)  # 同一轮发多条回复时，每两条之间随机停顿多少秒 (最小秒, 最大秒)
 # 【保留过滤原因说明】`platforms/playwright_base.py` 跨进程目录锁超时为 300s；单次持锁满 150s 主动收手放锁，确保与采集/发帖/互关共存不超时
-SESSION_MAX_HOLD_SECONDS: int = 150
-MAX_REPLY_RETRIES: int = 3
-RETRY_COOLDOWN_SECONDS: int = 1800     # 单条生成或发送临时失败后的重试退避秒数（30 分钟）
-RISK_COOLDOWN_SECONDS: int = 21600     # 遇安全验证、登录失效或业务风控拦截时，该账号自动静默冷却 6 小时
+SESSION_MAX_HOLD_SECONDS: int = 150       # 单次打开浏览器的最长持锁秒数（到点自动收手放锁，下轮再继续）
+MAX_REPLY_RETRIES: int = 3                # 单条评论发送失败最多重试几次（超限标为 failed）
+RETRY_COOLDOWN_SECONDS: int = 1800        # 单条生成或发送临时失败后的重试退避秒数（1800=30 分钟后再试）
+RISK_COOLDOWN_SECONDS: int = 21600        # 遇安全验证、登录失效或业务风控拦截时，该账号自动静默冷却秒数（21600=6 小时）
 
-# 6. 独立 MongoDB 集合名（物理隔离历史旧表与采集评论池）
-REPLY_INBOX_COLLECTION: str = "x_reply_inbox"
-POST_CHECKPOINTS_COLLECTION: str = "x_reply_post_checkpoints"
+# 6. 独立 MongoDB 集合名（物理隔离历史旧表与采集评论池，一般无需修改）
+REPLY_INBOX_COLLECTION: str = "x_reply_inbox"              # 评论收件箱与生成/发送状态表
+POST_CHECKPOINTS_COLLECTION: str = "x_reply_post_checkpoints"  # 主帖检查点表（记录回复数变化与根帖归属）
 
 # ==============================================================================
 # 二、基础工具、数据库索引与 X 接口旁路嗅探器
@@ -162,8 +164,12 @@ POST_CHECKPOINTS_COLLECTION: str = "x_reply_post_checkpoints"
 
 TZ_CN = timezone(timedelta(hours=8))
 X_HOME_URL = "https://x.com/home"
+X_NOTIFICATIONS_URL = "https://x.com/notifications"
 X_MENTIONS_URL = "https://x.com/notifications/mentions"
 AUTO_REPLIER_PROMPT_DIR: Path = _PROJECT_ROOT / "prompt" / "x_growth"
+
+_NOTIF_OPS = ("NotificationsTimeline", "NotificationsMentions", "RestNotifications")
+_PROFILE_OPS = ("UserTweets", "UserOriginalsTimeline", "UserTweetsAndReplies")
 
 _RE_INBOX_GQL = re.compile(
     r"/graphql/[^/]+/(NotificationsTimeline|NotificationsMentions|UserTweets|UserOriginalsTimeline|UserTweetsAndReplies|TweetDetail|UserByScreenName)(?:\?|$)",
@@ -612,6 +618,28 @@ def _is_same_account(
     return False
 
 
+def _is_reply_targeting_me(
+    tweet: Dict[str, Any],
+    *,
+    my_tweet_ids: Set[str],
+    self_handle_lower: str,
+    self_uid: str = "",
+) -> bool:
+    """判断推文是否为他人发来的、明确回复我方推文/评论的目标回复。"""
+    if tweet.get("is_retweet"):
+        return False
+    if _is_same_account(tweet, self_handle_lower=self_handle_lower, self_uid=self_uid):
+        return False
+    parent_id = str(tweet.get("in_reply_to_status_id") or "").strip()
+    if not parent_id:
+        return False
+    return (
+        (parent_id in my_tweet_ids)
+        or (bool(self_handle_lower) and str(tweet.get("in_reply_to_screen_name") or "").lower() == self_handle_lower)
+        or (bool(self_uid) and str(tweet.get("in_reply_to_user_id") or "") == self_uid)
+    )
+
+
 class XReplyInboxSniffer:
     """只读旁路嗅探器：从浏览器正常加载的 GraphQL / 通知接口提取推文、主帖与对话回复树。"""
 
@@ -820,22 +848,16 @@ def upsert_collected_replies(
             continue
         seen_rids.add(rid)
 
-        if _is_same_account(rep, self_handle_lower=self_handle_low, self_uid=self_uid):
+        if not _is_reply_targeting_me(
+            rep,
+            my_tweet_ids=my_tweet_ids,
+            self_handle_lower=self_handle_low,
+            self_uid=self_uid,
+        ):
             continue
 
         parent_id = str(rep.get("in_reply_to_status_id") or "").strip()
-        if not parent_id:
-            continue
-
-        # 确认该回复确实是指向我方的推文或回复
         parent_tweet = all_tweets.get(parent_id)
-        targets_me = (parent_id in my_tweet_ids) or (
-            bool(self_handle_low) and str(rep.get("in_reply_to_screen_name") or "").lower() == self_handle_low
-        ) or (
-            bool(self_uid) and str(rep.get("in_reply_to_user_id") or "") == self_uid
-        )
-        if not targets_me:
-            continue
 
         post_id = str(rep.get("conversation_id") or "").strip() or parent_id
         root_tweet = all_tweets.get(post_id)
@@ -1038,14 +1060,13 @@ def collect_replies_for_account(
             lock_t0 = time.monotonic()
             page.on("response", sniffer.on_response)
             try:
-                # 第 1 站：浏览通知提及页
-                prev_m = sum(sniffer.op_counts.values())
-                page.goto(X_MENTIONS_URL, timeout=45000, wait_until="domcontentloaded")
-                sniffer.wait_for_ops(
-                    page, ("NotificationsTimeline", "NotificationsMentions", "RestNotifications"), prev_m, timeout_ms=10000
-                )
+                # 第 1a 站：优先浏览「全部通知」页（绕开 /mentions 对新号/小号的静默折叠过滤）
+                mentions_scrolls = max(0, safe_int(cfg.get("mentions_scroll_rounds"), MENTIONS_SCROLL_ROUNDS))
+                prev_all = sum(sniffer.op_counts.get(op_k, 0) for op_k in _NOTIF_OPS)
+                page.goto(X_NOTIFICATIONS_URL, timeout=45000, wait_until="domcontentloaded")
+                sniffer.wait_for_ops(page, _NOTIF_OPS, prev_all, timeout_ms=10000)
                 page.wait_for_timeout(random.randint(1500, 2600))
-                _dismiss_overlays(page, aggressive=False, desc="x-reply-mentions")
+                _dismiss_overlays(page, aggressive=False, desc="x-reply-notifications")
                 check_for_crash(page)
 
                 acc_st, acc_msg = inspect_x_account_status(page)
@@ -1059,20 +1080,34 @@ def collect_replies_for_account(
                     log.error(f"🚨 [模块1/身份缺失 | {acc_name}] {msg}")
                     return {"account_name": acc_name, "status": "not_logged_in", "warning": msg, "browser_opened": True}
 
-                for _ in range(max(0, safe_int(cfg.get("mentions_scroll_rounds"), MENTIONS_SCROLL_ROUNDS))):
+                for _ in range(mentions_scrolls):
                     if time.monotonic() - lock_t0 >= hold_limit:
                         break
                     page.mouse.wheel(0, random.randint(1400, 2200))
                     page.wait_for_timeout(random.randint(1200, 2000))
 
+                # 第 1b 站：补充浏览「提及」页（全部通知刷屏极多时兜底早先的 @ 提及）
+                if time.monotonic() - lock_t0 < hold_limit:
+                    prev_m = sum(sniffer.op_counts.get(op_k, 0) for op_k in _NOTIF_OPS)
+                    page.goto(X_MENTIONS_URL, timeout=45000, wait_until="domcontentloaded")
+                    sniffer.wait_for_ops(page, _NOTIF_OPS, prev_m, timeout_ms=10000)
+                    page.wait_for_timeout(random.randint(1000, 1800))
+                    _dismiss_overlays(page, aggressive=False, desc="x-reply-mentions")
+                    check_for_crash(page)
+                    acc_st_m, acc_msg_m = inspect_x_account_status(page)
+                    if acc_st_m != "ok":
+                        log.error(f"🚨 [模块1/提及阻断 | {acc_name}] status={acc_st_m} | {acc_msg_m}")
+                        return {"account_name": acc_name, "status": acc_st_m, "warning": acc_msg_m, "browser_opened": True}
+                    for _ in range(min(1, mentions_scrolls)):
+                        if time.monotonic() - lock_t0 >= hold_limit:
+                            break
+                        page.mouse.wheel(0, random.randint(1400, 2200))
+                        page.wait_for_timeout(random.randint(1000, 1600))
+
                 # 第 2 站：浏览己方个人主页，发现最近原创/引用主帖及其 reply_count
-                prev_u = sum(
-                    sniffer.op_counts.get(op_k, 0) for op_k in ("UserTweets", "UserOriginalsTimeline", "UserTweetsAndReplies")
-                )
+                prev_u = sum(sniffer.op_counts.get(op_k, 0) for op_k in _PROFILE_OPS)
                 page.goto(f"https://x.com/{eff_handle}", timeout=45000, wait_until="domcontentloaded")
-                sniffer.wait_for_ops(
-                    page, ("UserTweets", "UserOriginalsTimeline", "UserTweetsAndReplies"), prev_u, timeout_ms=12000
-                )
+                sniffer.wait_for_ops(page, _PROFILE_OPS, prev_u, timeout_ms=12000)
                 page.wait_for_timeout(random.randint(1500, 2600))
                 _dismiss_overlays(page, aggressive=False, desc="x-reply-profile")
                 check_for_crash(page)
@@ -1091,9 +1126,7 @@ def collect_replies_for_account(
                 # 显式空采防护：重载主页一次，仍无任何接口响应绝不伪装正常 0 条
                 if sum(sniffer.op_counts.values()) == 0:
                     page.reload(timeout=45000, wait_until="domcontentloaded")
-                    sniffer.wait_for_ops(
-                        page, ("UserTweets", "UserOriginalsTimeline", "UserTweetsAndReplies"), 0, timeout_ms=10000
-                    )
+                    sniffer.wait_for_ops(page, _PROFILE_OPS, 0, timeout_ms=10000)
                     page.wait_for_timeout(2000)
                 if sum(sniffer.op_counts.values()) == 0:
                     msg = f"账号 @{eff_handle} 未捕获到任何 X 接口响应 (op_counts={{}})，疑似网络或页面异常。"
@@ -1111,11 +1144,46 @@ def collect_replies_for_account(
                 own_posts = own_posts[:max_own_posts]
 
                 own_posts_map = {p["tweet_id"]: p for p in own_posts}
-                mention_conv_ids: Set[str] = {
-                    str(m.get("conversation_id") or "")
-                    for m in sniffer.mention_tweets_by_id.values()
-                    if m.get("conversation_id")
+                my_tweet_ids: Set[str] = {
+                    tw["tweet_id"]
+                    for tw in sniffer.tweets_by_id.values()
+                    if (not tw.get("is_retweet")) and _is_same_account(tw, self_handle_lower=eff_handle, self_uid=self_uid)
                 }
+
+                # 从全部通知 + 提及通知中精准筛选出指向我方推文的他人未入库回复（剔除己方被赞回复及无关第三方回复）
+                mentions_captured = 0
+                mentions_skip_other_root = 0
+                mentions_skip_old = 0
+                mentions_already_in_db = 0
+                fresh_mention_replies: List[Dict[str, Any]] = []
+                fresh_mention_conv_ids: Set[str] = set()
+
+                for rep in sorted(
+                    sniffer.mention_tweets_by_id.values(),
+                    key=lambda x: safe_int(x.get("publish_ts"), 0),
+                    reverse=True,
+                ):
+                    if not _is_reply_targeting_me(
+                        rep,
+                        my_tweet_ids=my_tweet_ids,
+                        self_handle_lower=eff_handle,
+                        self_uid=self_uid,
+                    ):
+                        continue
+                    mentions_captured += 1
+                    rid = rep["tweet_id"]
+                    pub_ts = safe_int(rep.get("publish_ts"), 0)
+                    if age_cutoff_ts > 0 and pub_ts > 0 and pub_ts < age_cutoff_ts:
+                        mentions_skip_old += 1
+                        continue
+                    if inbox_col.find_one({"account_name": acc_name, "reply_id": rid}):
+                        mentions_already_in_db += 1
+                        continue
+                    conv_id = str(rep.get("conversation_id") or rep.get("in_reply_to_status_id") or "").strip()
+                    if not conv_id:
+                        continue
+                    fresh_mention_replies.append(rep)
+                    fresh_mention_conv_ids.add(conv_id)
 
                 # 选出需要打开详情页的帖子/评论链接
                 targets_to_open: List[Tuple[str, str, str]] = []  # (target_id, target_url, kind)
@@ -1141,40 +1209,37 @@ def collect_replies_for_account(
                         },
                         upsert=True,
                     )
-                    if rcount <= 0 and pid not in mention_conv_ids:
+                    if rcount <= 0 and pid not in fresh_mention_conv_ids:
                         continue
                     last_rc = safe_int((cp or {}).get("last_reply_count"), -1)
                     last_chk = safe_int((cp or {}).get("last_checked_ts"), 0)
+                    last_captured = safe_int((cp or {}).get("last_captured_replies"), -1)
                     pub_ts = safe_int(post.get("publish_ts"), 0)
                     is_recent_48h = (pub_ts <= 0) or ((now_ts - pub_ts) <= 48 * 3600)
+                    missing_replies_retry = (
+                        rcount > 0
+                        and last_captured == 0
+                        and is_recent_48h
+                        and (now_ts - last_chk) >= min(recheck_sec, 1800)
+                    )
                     need_open = (
                         cp is None
                         or last_chk <= 0
                         or rcount != last_rc
-                        or (pid in mention_conv_ids)
+                        or (pid in fresh_mention_conv_ids)
+                        or missing_replies_retry
                         or (is_recent_48h and (now_ts - last_chk) >= recheck_sec)
                     )
                     if need_open and pid not in queued_ids:
                         targets_to_open.append((pid, post["url"], "own_post"))
                         queued_ids.add(pid)
 
-                # 处理 Mentions 中发现的未入库回复（尤其是早于主页前 20 条的帖子或嵌套追评）
-                for rep in sorted(
-                    sniffer.mention_tweets_by_id.values(),
-                    key=lambda x: safe_int(x.get("publish_ts"), 0),
-                    reverse=True,
-                ):
-                    if _is_same_account(rep, self_handle_lower=eff_handle, self_uid=self_uid):
-                        continue
+                # 处理通知中发现的未入库回复（尤其是早于主页前 20 条的帖子或嵌套追评）
+                own_posts_with_replies = sum(1 for p in own_posts if safe_int(p.get("reply_count"), 0) > 0)
+
+                for rep in fresh_mention_replies:
                     rid = rep["tweet_id"]
-                    pub_ts = safe_int(rep.get("publish_ts"), 0)
-                    if age_cutoff_ts > 0 and pub_ts > 0 and pub_ts < age_cutoff_ts:
-                        continue
-                    if inbox_col.find_one({"account_name": acc_name, "reply_id": rid}):
-                        continue
                     conv_id = str(rep.get("conversation_id") or rep.get("in_reply_to_status_id") or "").strip()
-                    if not conv_id:
-                        continue
 
                     if conv_id in own_posts_map:
                         # 如果是追评或主帖需要打开，确保主帖或该评论在待查队列中
@@ -1188,6 +1253,7 @@ def collect_replies_for_account(
 
                     cp = cp_col.find_one({"account_name": acc_name, "post_id": conv_id}) or {}
                     if only_own_roots and cp.get("is_own_post") is False:
+                        mentions_skip_other_root += 1
                         continue
                     if only_own_roots and cp.get("is_own_post") is None:
                         owned_info = _resolve_root_post_ownership_zero_auth(
@@ -1214,6 +1280,7 @@ def collect_replies_for_account(
                                 upsert=True,
                             )
                             if not is_own:
+                                mentions_skip_other_root += 1
                                 continue
 
                     open_id = rid if rep.get("in_reply_to_status_id") != conv_id else conv_id
@@ -1273,6 +1340,11 @@ def collect_replies_for_account(
 
                 # 更新已打开详情的根帖检查点（仅当确实捕获到该根帖本体时才写入根帖信息，避免子回复误标根帖归属）
                 chk_now = int(time.time())
+                all_my_tweet_ids: Set[str] = {
+                    tw["tweet_id"]
+                    for tw in sniffer.tweets_by_id.values()
+                    if (not tw.get("is_retweet")) and _is_same_account(tw, self_handle_lower=eff_handle, self_uid=self_uid)
+                }
                 for focal_id, bucket in sniffer.detail_threads_by_focal.items():
                     focal_tw = sniffer.tweets_by_id.get(focal_id) or bucket.get(focal_id)
                     if not focal_tw:
@@ -1285,6 +1357,17 @@ def collect_replies_for_account(
                         else:
                             continue
                     is_own_root = _is_same_account(root_tw, self_handle_lower=eff_handle, self_uid=self_uid)
+                    detail_reply_cnt = sum(
+                        1
+                        for tw in bucket.values()
+                        if _is_reply_targeting_me(
+                            tw,
+                            my_tweet_ids=all_my_tweet_ids,
+                            self_handle_lower=eff_handle,
+                            self_uid=self_uid,
+                        )
+                    )
+                    inbox_cnt = inbox_col.count_documents({"account_name": acc_name, "post_id": conv_id})
                     cp_col.update_one(
                         {"account_name": acc_name, "post_id": conv_id},
                         {
@@ -1295,6 +1378,7 @@ def collect_replies_for_account(
                                 "post_text": root_tw["text"],
                                 "is_own_post": is_own_root,
                                 "last_reply_count": safe_int(root_tw.get("reply_count"), 0),
+                                "last_captured_replies": max(detail_reply_cnt, inbox_cnt),
                                 "last_checked_ts": chk_now,
                                 "last_checked_at": _now_iso(chk_now),
                                 "updated_at": _now_iso(chk_now),
@@ -1305,10 +1389,20 @@ def collect_replies_for_account(
                     )
 
                 hold_sec = round(time.monotonic() - lock_t0, 1)
+                m_parts = []
+                if mentions_skip_other_root:
+                    m_parts.append(f"非己帖跳过={mentions_skip_other_root}")
+                if mentions_skip_old:
+                    m_parts.append(f"过旧跳过={mentions_skip_old}")
+                if mentions_already_in_db:
+                    m_parts.append(f"已在库={mentions_already_in_db}")
+                m_suffix = f"({','.join(m_parts)})" if m_parts else ""
+                replied_on_x = upsert_stats.get("new_already_replied", 0) + upsert_stats.get("upgraded_replied_on_x", 0)
+                skip_suffix = f" | 过滤跳过={upsert_stats['new_skipped']}" if upsert_stats.get("new_skipped") else ""
                 log.info(
-                    f"✅ [模块1/采集完成 | @{eff_handle}] 扫主帖={len(own_posts)} | 展详情={details_opened} | "
-                    f"新入库待生成={upsert_stats.get('new_pending', 0)} | 线上已回识别={upsert_stats.get('new_already_replied', 0) + upsert_stats.get('upgraded_replied_on_x', 0)} | "
-                    f"过滤跳过={upsert_stats.get('new_skipped', 0)} | 持锁={hold_sec}s"
+                    f"✅ [模块1-采集 | @{eff_handle}] 主帖={len(own_posts)}(有评={own_posts_with_replies}) | "
+                    f"通知回复={mentions_captured}{m_suffix} | 展详情={details_opened} | "
+                    f"新增待生成={upsert_stats.get('new_pending', 0)} | 线上已回={replied_on_x}{skip_suffix} | 持锁={hold_sec}s"
                 )
                 return {
                     "account_name": acc_name,
@@ -1317,6 +1411,11 @@ def collect_replies_for_account(
                     "warning": halt_warning,
                     "browser_opened": True,
                     "own_posts_scanned": len(own_posts),
+                    "own_posts_with_replies": own_posts_with_replies,
+                    "mentions_captured": mentions_captured,
+                    "mentions_skip_other_root": mentions_skip_other_root,
+                    "mentions_skip_old": mentions_skip_old,
+                    "mentions_already_in_db": mentions_already_in_db,
                     "details_opened": details_opened,
                     "hold_seconds": hold_sec,
                     **upsert_stats,
@@ -1346,9 +1445,11 @@ def _clean_generated_reply_text(raw_text: Any, reply_author: str = "") -> str:
 def _build_parent_context_block(doc: Dict[str, Any]) -> str:
     post_id = str(doc.get("post_id") or "").strip()
     parent_id = str(doc.get("parent_tweet_id") or "").strip()
+    parent_txt = str(doc.get("parent_tweet_text") or "").strip() or "（上一层回复正文未捕获）"
+    if doc.get("is_own_root_post") is False:
+        return f"上述原帖由其他博主发布，你此前在该帖下发表了评论，对方正在回复你的评论：\n{parent_txt}"
     if not parent_id or parent_id == post_id:
         return "该评论直接回复你的上述原帖。"
-    parent_txt = str(doc.get("parent_tweet_text") or "").strip() or "（上一层回复正文未捕获）"
     return f"该评论是对你此前一条回复的追评，你上一条回复内容为：\n{parent_txt}"
 
 
@@ -1389,6 +1490,9 @@ def generate_replies_from_db(
     )
 
     if not pending_docs:
+        ready_in_db = int(col.count_documents({"account_name": acc_name, "status": "ready_to_reply"}))
+        replied_in_db = int(col.count_documents({"account_name": acc_name, "status": "replied"}))
+        log.info(f"ℹ️ [模块2-生成 | {acc_name}] 待生成=0（空闲 | 库内待发={ready_in_db}, 已回={replied_in_db}）")
         return {"account_name": acc_name, "status": "ok", "pending_found": 0, "ready_count": 0, "skipped_count": 0, "failed_count": 0}
 
     ready_cnt = 0
@@ -1520,6 +1624,9 @@ def generate_replies_from_db(
         ready_cnt += 1
         log.info(f"✍️ [模块2/生成就绪 | {acc_name}] @{reply_author} reply_id={rid} ({gen_lang}|{w_len}w) -> {reply_out}")
 
+    log.info(
+        f"✅ [模块2-生成 | {acc_name}] 待生成={len(pending_docs)} -> 就绪={ready_cnt} | 跳过={skipped_cnt} | 失败={failed_cnt}"
+    )
     return {
         "account_name": acc_name,
         "status": "ok",
@@ -1625,6 +1732,9 @@ def publish_replies_for_account(
         ]
         if eff_dry:
             log.info(f"[模块3/DRY_RUN | {acc_name}] 待发队列={len(candidates)}条 (本轮预览 {len(preview)} 条)")
+        else:
+            cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
+            log.info(f"ℹ️ [模块3-回复 | {acc_name}] 待发送=0（空闲未开浏览器 | 24h已回={today_sent}/{cap_txt}）")
         return {
             "account_name": acc_name,
             "status": "ok",
@@ -1889,6 +1999,11 @@ def publish_replies_for_account(
                     )
 
                 hold_sec = round(time.monotonic() - lock_t0, 1)
+                cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
+                log.info(
+                    f"✅ [模块3-回复 | @{eff_handle or acc_name}] 候选={len(candidates)} -> 已回={len(sent_items)} | "
+                    f"跳过={skipped_cnt} | 失败={failed_cnt} | 24h累计={today_sent + len(sent_items)}/{cap_txt} | 持锁={hold_sec}s"
+                )
                 return {
                     "account_name": acc_name,
                     "screen_name": eff_handle,
@@ -2035,6 +2150,31 @@ def run_parallel_daemon(
     collect_cooldown_until: Dict[str, float] = {}
     reply_cooldown_until: Dict[str, float] = {}
 
+    collect_interval = max(60, safe_int(cfg.get("collect_interval_seconds"), 3600))
+    collect_jitter = _parse_jitter_pair(cfg.get("collect_jitter_seconds"))
+    generate_interval = max(60, safe_int(cfg.get("generate_interval_seconds"), 3600))
+    generate_jitter = _parse_jitter_pair(cfg.get("generate_jitter_seconds"))
+    reply_interval = max(60, safe_int(cfg.get("reply_interval_seconds"), 3600))
+    reply_jitter = _parse_jitter_pair(cfg.get("reply_jitter_seconds"))
+
+    def _schedule_next_sleep(
+        worker_label: str,
+        round_no: int,
+        base_sec: int,
+        jitter_pair: Tuple[int, int],
+        *,
+        override_base: Optional[int] = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        eff_base = override_base if override_base is not None else base_sec
+        sleep_sec = int(round(compute_jittered_interval(eff_base, additive_jitter_range=jitter_pair)))
+        if max_rounds == 0 or round_no < max_rounds:
+            next_at = (datetime.now(TZ_CN) + timedelta(seconds=sleep_sec)).strftime("%H:%M:%S")
+            mins_txt = f"{round(sleep_sec / 60, 1):g}分钟" if sleep_sec >= 60 else f"{sleep_sec}秒"
+            reason_txt = f" | {reason}" if reason else ""
+            log.info(f"⏰ [{worker_label} | #{round_no}] 下次执行 {next_at} (约{mins_txt}后{reason_txt})")
+        return {"next_sleep_seconds": sleep_sec}
+
     def _collector_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
         any_empty = False
@@ -2054,19 +2194,31 @@ def run_parallel_daemon(
             elif st == "ok":
                 collect_cooldown_until.pop(acc_dir, None)
         if any_empty:
-            return {"next_sleep_seconds": min(safe_int(cfg["collect_interval_seconds"], 3600), 600)}
-        return {}
+            return _schedule_next_sleep(
+                "工人1-采集",
+                round_no,
+                collect_interval,
+                collect_jitter,
+                override_base=min(collect_interval, 600),
+                reason="空采重试",
+            )
+        active_rems = [max(0.0, collect_cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
+        if pool and all(r > 0 for r in active_rems):
+            return _schedule_next_sleep(
+                "工人1-采集",
+                round_no,
+                collect_interval,
+                collect_jitter,
+                override_base=max(collect_interval, int(min(active_rems))),
+                reason="风控冷却",
+            )
+        return _schedule_next_sleep("工人1-采集", round_no, collect_interval, collect_jitter)
 
     def _generator_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
         for acc in pool:
-            res = generate_replies_from_db(acc, db=db, config=cfg, logger=log)
-            if res.get("pending_found", 0) > 0:
-                log.info(
-                    f"✅ [工人2-生成 | #{round_no} | {acc['name']}] 待处理={res['pending_found']} | "
-                    f"就绪={res['ready_count']} | 跳过={res['skipped_count']} | 失败={res['failed_count']}"
-                )
-        return {}
+            generate_replies_from_db(acc, db=db, config=cfg, logger=log)
+        return _schedule_next_sleep("工人2-生成", round_no, generate_interval, generate_jitter)
 
     def _replier_step(round_no: int) -> Dict[str, Any]:
         db = gen_db_object()
@@ -2083,7 +2235,17 @@ def run_parallel_daemon(
                 log.error(f"⏳ [工人3-回复 | {acc_name}] 触发独立风控冷却 {risk_cd_sec}s | status={st}")
             elif st == "ok":
                 reply_cooldown_until.pop(acc_dir, None)
-        return {}
+        active_rems = [max(0.0, reply_cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
+        if pool and all(r > 0 for r in active_rems):
+            return _schedule_next_sleep(
+                "工人3-回复",
+                round_no,
+                reply_interval,
+                reply_jitter,
+                override_base=max(reply_interval, int(min(active_rems))),
+                reason="风控冷却",
+            )
+        return _schedule_next_sleep("工人3-回复", round_no, reply_interval, reply_jitter)
 
     worker_specs = []
     if bool(cfg.get("enable_collector", True)):
@@ -2091,8 +2253,8 @@ def run_parallel_daemon(
             (
                 "ReplyCollector",
                 max(0, safe_int(cfg.get("collect_initial_delay_seconds"), 0)),
-                max(60, safe_int(cfg.get("collect_interval_seconds"), 3600)),
-                _parse_jitter_pair(cfg.get("collect_jitter_seconds")),
+                collect_interval,
+                collect_jitter,
                 _collector_step,
             )
         )
@@ -2101,8 +2263,8 @@ def run_parallel_daemon(
             (
                 "ReplyGenerator",
                 max(0, safe_int(cfg.get("generate_initial_delay_seconds"), 30)),
-                max(60, safe_int(cfg.get("generate_interval_seconds"), 3600)),
-                _parse_jitter_pair(cfg.get("generate_jitter_seconds")),
+                generate_interval,
+                generate_jitter,
                 _generator_step,
             )
         )
@@ -2111,15 +2273,16 @@ def run_parallel_daemon(
             (
                 "ReplyPublisher",
                 max(0, safe_int(cfg.get("reply_initial_delay_seconds"), 60)),
-                max(60, safe_int(cfg.get("reply_interval_seconds"), 3600)),
-                _parse_jitter_pair(cfg.get("reply_jitter_seconds")),
+                reply_interval,
+                reply_jitter,
                 _replier_step,
             )
         )
 
+    scope_desc = "仅本人主帖" if bool(cfg.get("only_my_root_posts", ONLY_MY_ROOT_POSTS)) else "本人主帖+他帖追评"
     log.info(
         f"🚀 [AutoReplier/三工人并行启动] 账号={[a['name'] + '(@' + (a['screen_name'] or '自动') + ')' for a in pool]} | "
-        f"启动工人={[w[0] for w in worker_specs]} | 各自独立并行周期="
+        f"范围={scope_desc} | 启动工人={[w[0] for w in worker_specs]} | 各自独立并行周期="
         f"[{', '.join(f'{w[0]}:{w[2]}s(延迟{w[1]}s)' for w in worker_specs)}]"
     )
 

@@ -29,6 +29,7 @@ from x_growth.auto_replier import (
     RUN_MODE,
     SESSION_MAX_HOLD_SECONDS,
     XReplyInboxSniffer,
+    _build_parent_context_block,
     build_status_report,
     collect_replies_for_account,
     format_status_text,
@@ -581,6 +582,18 @@ class TestAutoReplier(unittest.TestCase):
         self.assertEqual(d_fail["status"], "failed")
         self.assertEqual(d_fail["generate_attempts"], 3)
 
+        # Verify _build_parent_context_block covers direct, follow-up, and other-root cases
+        self.assertIn("直接回复你的上述原帖", _build_parent_context_block({"post_id": "1", "parent_tweet_id": "1", "is_own_root_post": True}))
+        self.assertIn("追评", _build_parent_context_block({"post_id": "1", "parent_tweet_id": "2", "parent_tweet_text": "my prev", "is_own_root_post": True}))
+        self.assertIn("其他博主发布", _build_parent_context_block({"post_id": "9", "parent_tweet_id": "10", "parent_tweet_text": "my cmt", "is_own_root_post": False}))
+
+        # Verify empty queue still logs 1 concise informational line for Module 2
+        mock_log = MagicMock()
+        empty_db = _FakeDB()
+        res_idle_gen = generate_replies_from_db({"name": "x_myself", "screen_name": "peterzhu1003"}, db=empty_db, logger=mock_log, now_ts=now)
+        self.assertEqual(res_idle_gen["pending_found"], 0)
+        self.assertTrue(any("待生成=0" in str(c.args[0]) for c in mock_log.info.call_args_list))
+
     def test_publish_replies_dry_run_daily_cap_live_dedup_and_hold_limit(self):
         db = _FakeDB()
         now = int(time.time())
@@ -589,10 +602,12 @@ class TestAutoReplier(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             acc = {"name": "x_myself", "screen_name": "peterzhu1003", "user_data_dir": tmp}
 
-            # 1. Empty queue opens zero browsers
-            res_empty = publish_replies_for_account(acc, db=db, now_ts=now)
+            # 1. Empty queue opens zero browsers and logs concise idle status
+            pub_log = MagicMock()
+            res_empty = publish_replies_for_account(acc, db=db, logger=pub_log, now_ts=now)
             self.assertFalse(res_empty["browser_opened"])
             self.assertEqual(res_empty["candidates_found"], 0)
+            self.assertTrue(any("待发送=0" in str(c.args[0]) for c in pub_log.info.call_args_list))
 
             col.docs.extend([
                 {"account_name": "x_myself", "reply_id": "r_send", "reply_url": "https://x.com/alice/status/r_send", "reply_author": "alice", "reply_author_lower": "alice", "post_id": "1001", "status": "ready_to_reply", "generated_reply": "Thanks Alice!", "reply_publish_ts": now - 400, "reply_next_retry_ts": 0, "reply_attempts": 0},
@@ -729,7 +744,9 @@ class TestAutoReplier(unittest.TestCase):
 
             def _goto(u, **_kw2):
                 page.url = u
-                if "mentions" in u:
+                if u.rstrip("/").endswith("/notifications"):
+                    _emit("NotificationsTimeline", {"items": []}, "https://x.com/i/api/graphql/x/NotificationsTimeline")
+                elif "mentions" in u:
                     m_own = _gql_tweet(
                         "2101", "alice", uid="u_a", full_text="@peterzhu1003 Great post!",
                         display_text_range=[14, 25], in_reply_to_status_id="1101", in_reply_to_user_id="u_me",
@@ -780,6 +797,10 @@ class TestAutoReplier(unittest.TestCase):
                 res = collect_replies_for_account(acc, db=db)
 
         self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["own_posts_scanned"], 1)
+        self.assertEqual(res["own_posts_with_replies"], 1)
+        self.assertEqual(res["mentions_captured"], 2)
+        self.assertEqual(res["mentions_skip_other_root"], 1)
         self.assertEqual(res["details_opened"], 1)
         self.assertEqual(res["new_pending"], 1)
         inbox = db.get_collection(REPLY_INBOX_COLLECTION)
@@ -788,6 +809,142 @@ class TestAutoReplier(unittest.TestCase):
         self.assertIsNone(inbox.find_one({"reply_id": "2201"}))
         self.assertTrue(cp.find_one({"post_id": "1101"})["is_own_post"])
         self.assertFalse(cp.find_one({"post_id": "9900"})["is_own_post"])
+
+    def test_collect_replies_all_notifications_captures_detail_hidden_replies_and_filters_noise(self):
+        db = _FakeDB()
+        clock = {"now": 1_800_000_000}
+        visited = []
+
+        @contextlib.contextmanager
+        def _all_notif_session(*_a, **_kw):
+            page = _make_fake_page(url="https://x.com/notifications", visible_selectors=("AppTabBar_Profile_Link",))
+            listeners = {}
+
+            def _on(ev, fn):
+                listeners[ev] = fn
+
+            def _emit(payload, url):
+                resp = MagicMock()
+                resp.status = 200
+                resp.url = url
+                resp.json.return_value = payload
+                if "response" in listeners:
+                    listeners["response"](resp)
+
+            def _goto(u, **_kw2):
+                visited.append(u)
+                page.url = u
+                cur_now = clock["now"]
+                ts_str = time.strftime("%a %b %d %H:%M:%S +0000 %Y", time.gmtime(cur_now - 120))
+                if u.rstrip("/").endswith("/notifications"):
+                    # X /notifications includes a test-account reply missed by /mentions, PLUS own liked reply & 3rd-party noise
+                    rep_hidden = _gql_tweet(
+                        "5101",
+                        "test_alt",
+                        uid="u_alt",
+                        full_text="@peterzhu1003 安全第一",
+                        display_text_range=[14, 18],
+                        in_reply_to_status_id="5001",
+                        in_reply_to_user_id="u_me",
+                        in_reply_to_screen_name="peterzhu1003",
+                        conversation_id="5001",
+                        created_at=ts_str,
+                    )
+                    my_liked_reply = _gql_tweet(
+                        "5102",
+                        "peterzhu1003",
+                        uid="u_me",
+                        full_text="@kol Nice point",
+                        in_reply_to_status_id="8001",
+                        in_reply_to_user_id="u_kol",
+                        in_reply_to_screen_name="kol",
+                        conversation_id="8001",
+                        created_at=ts_str,
+                    )
+                    third_party_noise = _gql_tweet(
+                        "5103",
+                        "stranger_a",
+                        uid="u_sa",
+                        full_text="@stranger_b unrelated",
+                        in_reply_to_status_id="8002",
+                        in_reply_to_user_id="u_sb",
+                        in_reply_to_screen_name="stranger_b",
+                        conversation_id="8002",
+                        created_at=ts_str,
+                    )
+                    _emit(
+                        {"items": [rep_hidden, my_liked_reply, third_party_noise]},
+                        "https://x.com/i/api/graphql/x/NotificationsTimeline",
+                    )
+                elif "mentions" in u:
+                    # /notifications/mentions silently drops @test_alt
+                    _emit({"items": []}, "https://x.com/i/api/graphql/x/NotificationsTimeline")
+                elif u.endswith("/peterzhu1003"):
+                    # Post 5001 has stale cached reply_count=0 on profile; Post 5002 shows reply_count=1
+                    p1 = _gql_tweet("5001", "peterzhu1003", uid="u_me", full_text="Post one context", reply_count=0, created_at=ts_str)
+                    p2 = _gql_tweet("5002", "peterzhu1003", uid="u_me", full_text="Post two context", reply_count=1, created_at=ts_str)
+                    _emit({"items": [p1, p2]}, "https://x.com/i/api/graphql/x/UserOriginalsTimeline")
+                elif "/status/5001" in u:
+                    # TweetDetail hides 5101 behind a bottom cursor (only returns root post with reply_count=1)
+                    p1 = _gql_tweet("5001", "peterzhu1003", uid="u_me", full_text="Post one context", reply_count=1, created_at=ts_str)
+                    _emit({"items": [p1]}, "https://x.com/i/api/graphql/x/TweetDetail?variables=%7B%22focalTweetId%22%3A%225001%22%7D")
+                elif "/status/5002" in u:
+                    # Post 5002 shows reply_count=1 on TweetDetail but 0 replies returned anywhere (lag/filtered)
+                    p2 = _gql_tweet("5002", "peterzhu1003", uid="u_me", full_text="Post two context", reply_count=1, created_at=ts_str)
+                    _emit({"items": [p2]}, "https://x.com/i/api/graphql/x/TweetDetail?variables=%7B%22focalTweetId%22%3A%225002%22%7D")
+                resp = MagicMock()
+                resp.status = 200
+                return resp
+
+            page.on.side_effect = _on
+            page.goto.side_effect = _goto
+            yield (MagicMock(), page)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            acc = {"name": "x_myself", "screen_name": "peterzhu1003", "user_data_dir": tmp}
+            with patch("x_growth.auto_replier.persistent_browser_session", side_effect=_all_notif_session), \
+                 patch("x_growth.auto_replier._dismiss_overlays"), \
+                 patch("x_growth.auto_replier.check_for_crash"), \
+                 patch("x_growth.auto_replier._wait_x_post_detail_ready"), \
+                 patch("x_growth.auto_replier._resolve_session_identity", return_value=("u_me", "peterzhu1003")), \
+                 patch("x_growth.auto_replier.time.time", side_effect=lambda: float(clock["now"])), \
+                 patch.object(XReplyInboxSniffer, "wait_for_ops", return_value=True):
+                res1 = collect_replies_for_account(acc, db=db)
+
+                self.assertEqual(res1["status"], "ok")
+                # Only 5101 targets me (5102 is own liked reply, 5103 is 3rd-party noise)
+                self.assertEqual(res1["mentions_captured"], 1)
+                self.assertEqual(res1["new_pending"], 1)
+                self.assertEqual(res1["details_opened"], 2)
+
+                inbox = db.get_collection(REPLY_INBOX_COLLECTION)
+                cp = db.get_collection(POST_CHECKPOINTS_COLLECTION)
+                doc_5101 = inbox.find_one({"reply_id": "5101"})
+                self.assertIsNotNone(doc_5101)
+                self.assertEqual(doc_5101["status"], "pending_generate")
+                self.assertEqual(doc_5101["reply_text"], "安全第一")
+                self.assertEqual(doc_5101["post_text"], "Post one context")
+                self.assertIsNone(inbox.find_one({"reply_id": "5102"}))
+                self.assertIsNone(inbox.find_one({"reply_id": "5103"}))
+                self.assertEqual(cp.find_one({"post_id": "5001"})["last_captured_replies"], 1)
+                self.assertEqual(cp.find_one({"post_id": "5002"})["last_captured_replies"], 0)
+
+                # Run 2 (60s later): neither 5001 (mention already in DB) nor 5002 (cooldown < 1800s) re-opens detail
+                visited.clear()
+                clock["now"] += 60
+                res2 = collect_replies_for_account(acc, db=db)
+                self.assertEqual(res2["mentions_already_in_db"], 1)
+                self.assertEqual(res2["details_opened"], 0)
+                self.assertFalse(any("/status/" in u for u in visited))
+
+                # Run 3 (1800s later): 5002 retries early because reply_count=1 > last_captured_replies=0; 5001 stays skipped
+                visited.clear()
+                clock["now"] += 1800
+                res3 = collect_replies_for_account(acc, db=db)
+                self.assertEqual(res3["details_opened"], 1)
+                detail_urls = [u for u in visited if "/status/" in u]
+                self.assertEqual(len(detail_urls), 1)
+                self.assertIn("/status/5002", detail_urls[0])
 
     def test_parallel_daemon_runs_three_workers_and_status_dashboard(self):
         db = _FakeDB()
