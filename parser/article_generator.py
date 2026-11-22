@@ -29,6 +29,7 @@ from common.daemon import run_daemon_loop
 from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
+from parser.config import ANALYSIS_GENERATION_INTERVAL_SECONDS
 from parser.mlu_pipeline import _resolve_prompt_pair, run_concurrent_screening_batches
 from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _log, get_hot_coin, logger
 from parser.post_ingestion import (
@@ -1323,12 +1324,14 @@ def _poll_generation(
     task: Callable[[], List[Dict[str, Any]]],
     action: str,
     *,
+    interval_seconds: int = ARTICLE_GENERATION_INTERVAL_SECONDS,
     stop_event: Optional[threading.Event] = None,
     max_rounds: int = 0,
 ) -> None:
     def _step(_round_idx: int) -> Dict[str, Any]:
         results = task()
-        return {"next_sleep_seconds": ARTICLE_GENERATION_INTERVAL_SECONDS if results else 60}
+        has_ok = any(isinstance(item, dict) and item.get("status") == "ok" for item in (results or []))
+        return {"next_sleep_seconds": interval_seconds if has_ok else 60}
 
     run_daemon_loop(
         _step,
@@ -1342,11 +1345,23 @@ def _poll_generation(
 
 
 def generate_analysis_articles(stop_event: Optional[threading.Event] = None, max_rounds: int = 0) -> None:
-    _poll_generation(generate_analysis_articles_once, "单币文章", stop_event=stop_event, max_rounds=max_rounds)
+    _poll_generation(
+        generate_analysis_articles_once,
+        "单币文章",
+        interval_seconds=ANALYSIS_GENERATION_INTERVAL_SECONDS,
+        stop_event=stop_event,
+        max_rounds=max_rounds,
+    )
 
 
 def generate_viral_articles(stop_event: Optional[threading.Event] = None, max_rounds: int = 0) -> None:
-    _poll_generation(generate_viral_articles_once, "高流量", stop_event=stop_event, max_rounds=max_rounds)
+    _poll_generation(
+        generate_viral_articles_once,
+        "高流量",
+        interval_seconds=ARTICLE_GENERATION_INTERVAL_SECONDS,
+        stop_event=stop_event,
+        max_rounds=max_rounds,
+    )
 
 
 __all__ = [

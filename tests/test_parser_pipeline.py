@@ -16,6 +16,8 @@ from parser.article_generator import (
     build_viral_article_task,
     execute_article_task,
     execute_viral_article_task,
+    generate_analysis_articles,
+    generate_viral_articles,
 )
 from parser.platform_adapters import (
     BinancePlatform,
@@ -348,6 +350,29 @@ class TestArticleGenerator(unittest.TestCase):
             self.assertEqual(v_saved["model_name"], "real-viral-model-v2")
             self.assertIsNone(mock_v_llm.call_args.kwargs["model"])
             self.assertEqual(mock_v_llm.call_args.kwargs["preset_model_group"], "medium")
+
+    def test_generation_polling_intervals_split_analysis_and_viral(self):
+        import parser.config as pcfg
+
+        self.assertEqual(pcfg.ANALYSIS_GENERATION_INTERVAL_SECONDS, 3 * 3600)
+        self.assertEqual(pcfg.ARTICLE_GENERATION_INTERVAL_SECONDS, 1200)
+
+        captured_sleeps = []
+
+        def _run_once(step_fn, **_kwargs):
+            captured_sleeps.append(step_fn(1)["next_sleep_seconds"])
+
+        with patch("parser.article_generator.run_daemon_loop", side_effect=_run_once):
+            with patch("parser.article_generator.generate_analysis_articles_once", return_value=[{"status": "ok"}]):
+                generate_analysis_articles(max_rounds=1)
+            with patch("parser.article_generator.generate_analysis_articles_once", return_value=[{"status": "skip"}]):
+                generate_analysis_articles(max_rounds=1)
+            with patch("parser.article_generator.generate_analysis_articles_once", return_value=[]):
+                generate_analysis_articles(max_rounds=1)
+            with patch("parser.article_generator.generate_viral_articles_once", return_value=[{"status": "ok"}]):
+                generate_viral_articles(max_rounds=1)
+
+        self.assertEqual(captured_sleeps, [3 * 3600, 60, 60, 1200])
 
 
 class TestPublisherArena(unittest.TestCase):
