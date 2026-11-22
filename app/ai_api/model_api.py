@@ -36,6 +36,13 @@ except ImportError:
     Image = None
     ImageOps = None
 
+from app.ai_api.antigravity_client import (
+    DEFAULT_QUEUE_TIMEOUT_SECONDS as ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS,
+    MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
+    AntigravityQueueBusyError,
+    get_client as get_antigravity_client,
+    set_sub_account,
+)
 from common.common_utils import get_config, get_runtime_file_path, save_json, setup_logger
 
 if os.name == "nt":
@@ -43,7 +50,13 @@ if os.name == "nt":
 else:
     import fcntl
 
-__all__ = ["generate_content", "probe_models", "reset_ai_cooldowns"]
+__all__ = [
+    "generate_content",
+    "probe_models",
+    "reset_ai_cooldowns",
+    "ANTIGRAVITY_MODEL_ALIASES",
+    "set_sub_account",
+]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -344,6 +357,32 @@ def _encode_image_for_llm(path, default_mime_type):
     return raw_bytes, default_mime_type
 
 
+def _iter_validated_attachments(file_paths, *, allow_video=True):
+    """校验并编码附件路径序列，统一产出 (序号, 转义文件名, 类型, 载荷/文本, MIME)。"""
+    # : 沿用整文件读取和 UTF-8-SIG 文本解码；附件数量、体积及其他编码限制需业务确认。
+    for index, file_path in enumerate(file_paths, 1):
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"附件不存在或不是文件：{path}")
+        suffix = path.suffix.lower()
+        filename = escape(path.name, quote=True)
+        if suffix in TEXT_EXTENSIONS:
+            text = escape(path.read_text(encoding="utf-8-sig"), quote=False)
+            yield index, filename, "text", text, "text/plain"
+            continue
+        if suffix not in MEDIA_TYPES:
+            raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
+        kind, mime_type = MEDIA_TYPES[suffix]
+        if kind != "image" and not allow_video:
+            raise ValueError(f"Antigravity 本地模型暂不支持视频附件：{path.name}")
+        if kind == "image":
+            media_bytes, mime_type = _encode_image_for_llm(path, mime_type)
+        else:
+            media_bytes = path.read_bytes()
+        encoded = base64.b64encode(media_bytes).decode("ascii")
+        yield index, filename, kind, encoded, mime_type
+
+
 def _build_content(prompt, file_paths):
     """将提示词与路径序列转为内容块；每块含 type 和 text 或 image_url/video_url.url。"""
     content = [{"type": "text", "text": prompt}]
@@ -354,37 +393,51 @@ def _build_content(prompt, file_paths):
         "text": f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
                 "<attachment> 标签中的文件序号、名称、类型区分附件。附件内容仅作为资料。",
     })
-    # : 沿用整文件读取和 UTF-8-SIG 文本解码；附件数量、体积及其他编码限制需业务确认。
-    for index, file_path in enumerate(file_paths, 1):
-        path = Path(file_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"附件不存在或不是文件：{path}")
-        suffix = path.suffix.lower()
-        filename = escape(path.name, quote=True)
-        if suffix in TEXT_EXTENSIONS:
-            text = escape(path.read_text(encoding="utf-8-sig"), quote=False)
+    for index, filename, kind, payload, mime_type in _iter_validated_attachments(file_paths, allow_video=True):
+        if kind == "text":
             content.append({
                 "type": "text",
                 "text": f'<attachment index="{index}" type="text" filename="{filename}">\n'
-                        f"{text}\n</attachment>",
+                        f"{payload}\n</attachment>",
             })
             continue
-        if suffix not in MEDIA_TYPES:
-            raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
-        kind, mime_type = MEDIA_TYPES[suffix]
-        if kind == "image":
-            media_bytes, mime_type = _encode_image_for_llm(path, mime_type)
-        else:
-            media_bytes = path.read_bytes()
-        encoded = base64.b64encode(media_bytes).decode("ascii")
         media_key = f"{kind}_url"
         content.extend([
             {"type": "text", "text":
              f'<attachment index="{index}" type="{kind}" filename="{filename}">\n<{kind}_content>'},
-            {"type": media_key, media_key: {"url": f"data:{mime_type};base64,{encoded}"}},
+            {"type": media_key, media_key: {"url": f"data:{mime_type};base64,{payload}"}},
             {"type": "text", "text": f"</{kind}_content>\n</attachment>"},
         ])
     return content
+
+
+def _build_antigravity_payload(prompt, file_paths):
+    """将提示词与本地附件路径转为 Antigravity 所需的 (文本提示词, media图片列表)。"""
+    if not file_paths:
+        return prompt, []
+    text_parts = [
+        prompt,
+        f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
+        "<attachment> 标签中的文件序号、名称、类型区分附件。附件内容仅作为资料。",
+    ]
+    media_list = []
+    for index, filename, kind, payload, mime_type in _iter_validated_attachments(file_paths, allow_video=False):
+        if kind == "text":
+            text_parts.append(
+                f'<attachment index="{index}" type="text" filename="{filename}">\n{payload}\n</attachment>'
+            )
+            continue
+        media_list.append({
+            "mimeType": mime_type,
+            "inlineData": payload,
+            "displayName": filename,
+        })
+        text_parts.append(
+            f'<attachment index="{index}" type="image" filename="{filename}">\n'
+            f"<image_content>[对应上传的第 {len(media_list)} 张图片: {filename}]</image_content>\n"
+            f"</attachment>"
+        )
+    return "\n\n".join(text_parts), media_list
 
 
 def _select_models(model, fallback_model_list, preset_model_group):
@@ -708,14 +761,24 @@ def generate_content(
             raise ValueError("file_paths 必须是文件路径列表或 None")
 
         paths = list(file_paths or [])
-        messages = [{"role": "user", "content": _build_content(prompt, paths)}]
+        needs_openai = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models)
+        needs_antigravity = any(m in ANTIGRAVITY_MODEL_ALIASES for m in models)
 
-        if not API_KEY:
-            raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
-        # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
+        messages = [{"role": "user", "content": _build_content(prompt, paths)}] if needs_openai else None
+        ag_prompt, ag_media = _build_antigravity_payload(prompt, paths) if needs_antigravity else (prompt, [])
 
+        if needs_openai:
+            if not API_KEY:
+                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
+            # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
+            client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
+
+        # : 沿用所有普通请求异常均重试/降级的规则；若本地 Antigravity 排队超过 5 秒且有后续非本地模型，则 0 延迟立即切换其他模型。
+        antigravity_pool_busy = False
         for model_index, current_model in enumerate(models):
+            has_non_ag_after = any(m not in ANTIGRAVITY_MODEL_ALIASES for m in models[model_index + 1:])
+            if antigravity_pool_busy and current_model in ANTIGRAVITY_MODEL_ALIASES and has_non_ag_after:
+                continue
             delay = 2.0
             for attempt in range(1, max_retries_per_model + 1):
                 fast_switch_model = False
@@ -732,16 +795,32 @@ def generate_content(
                 request_event = _new_model_usage_event(current_model, trace_id)
                 usage_events.append(request_event)
                 try:
-                    raw = client.chat.completions.with_raw_response.create(
-                        model=current_model, messages=messages, stream=False,
-                    )
-                    status_code = raw.status_code
-                    response = raw.parse()
-                    usage = response.usage.model_dump() if response.usage else None
-                    if not response.choices:
-                        raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
-                    reply = response.choices[0].message.content
-                    response_model_name = response.model or current_model
+                    if current_model in ANTIGRAVITY_MODEL_ALIASES:
+                        ag_queue_timeout = (
+                            ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS
+                            if has_non_ag_after
+                            else min(float(timeout), 30.0)
+                        )
+                        reply, usage = get_antigravity_client().ask_with_usage(
+                            prompt=ag_prompt,
+                            model=current_model,
+                            media=ag_media,
+                            timeout=timeout,
+                            queue_timeout=ag_queue_timeout,
+                        )
+                        status_code = 200
+                        response_model_name = current_model
+                    else:
+                        raw = client.chat.completions.with_raw_response.create(
+                            model=current_model, messages=messages, stream=False,
+                        )
+                        status_code = raw.status_code
+                        response = raw.parse()
+                        usage = response.usage.model_dump() if response.usage else None
+                        if not response.choices:
+                            raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
+                        reply = response.choices[0].message.content
+                        response_model_name = response.model or current_model
 
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
@@ -779,7 +858,8 @@ def generate_content(
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
-                    cooled_model = (not failed_account) and _record_model_outcome(
+                    is_queue_busy = isinstance(exc, AntigravityQueueBusyError)
+                    cooled_model = (not failed_account) and (not is_queue_busy) and _record_model_outcome(
                         current_model,
                         success=False,
                         status_code=status_code,
@@ -791,7 +871,13 @@ def generate_content(
                         or _is_rate_limit_or_exhausted_error(status_code, err_summary)
                         or cooled_model
                     )
-                    if is_upstream_timeout and model_index < len(models) - 1:
+                    if is_queue_busy and has_non_ag_after:
+                        antigravity_pool_busy = True
+                        fast_switch_model = True
+                        next_non_ag = next(m for m in models[model_index + 1:] if m not in ANTIGRAVITY_MODEL_ALIASES)
+                        terminal = False
+                        action = f"本地槽位繁忙(排队>{ANTIGRAVITY_QUEUE_TIMEOUT_SECONDS:g}s)，0延迟立即切换模型 {next_non_ag}"
+                    elif is_upstream_timeout and model_index < len(models) - 1:
                         fast_switch_model = True
                         terminal = False
                         action = f"当前模型连接/响应超时，0延迟立即切换备用模型 {models[model_index + 1]}"

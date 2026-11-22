@@ -8,9 +8,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ACTIVE_CODE_DIRS = ("app", "common", "content_pipeline", "parser", "platforms", "x_growth", "tests")
 
-RETIRED_IMPORTS = (
-    "antigravity_client",
-)
+RETIRED_IMPORTS = ()
 
 EXPECTED_ACTIVE_PROMPTS = {
     "prompt/内容生成方案_分析类MLU初筛.txt",

@@ -227,6 +227,65 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(tiny_mime, "image/png")
         self.assertEqual(tiny_out, tiny_raw)
 
+    def test_antigravity_dispatch_and_queue_busy_fast_switch(self):
+        tmp = Path(self._tmp.name)
+        tiny_path = tmp / "tiny.png"
+        Image.new("RGB", (16, 16), (10, 20, 30)).save(tiny_path, format="PNG")
+
+        ag_calls = []
+
+        class FakeAgClient:
+            def ask_with_usage(self, **kwargs):
+                ag_calls.append(dict(kwargs))
+                return "ok-from-ag", {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                    "account_email": "mock-sub@example.com",
+                    "sandbox_port": 12345,
+                }
+
+        with patch.object(model_api, "get_antigravity_client", return_value=FakeAgClient()), \
+             patch.object(model_api, "MODEL_USAGE_JSON_PATH", self._usage_path):
+            res_ag = model_api.generate_content(
+                "describe image",
+                model="antigravity-3.8-flash-high",
+                file_paths=[str(tiny_path)],
+                max_retries_per_model=1,
+            )
+            self.assertEqual(res_ag["status"], "✅ 成功")
+            self.assertEqual(res_ag["content"], "ok-from-ag")
+            self.assertEqual(res_ag["metrics"]["account_used"], "mock-sub@example.com")
+            self.assertEqual(len(ag_calls), 1)
+            self.assertEqual(len(ag_calls[0]["media"]), 1)
+            self.assertEqual(ag_calls[0]["media"][0]["mimeType"], "image/png")
+
+        busy_calls = []
+
+        class BusyAgClient:
+            def ask_with_usage(self, **kwargs):
+                busy_calls.append(kwargs["model"])
+                raise model_api.AntigravityQueueBusyError("busy")
+
+        FakeClient, _, openai_calls = _make_fake_openai_factory(lambda kw: (kw["model"], "fallback-ok"))
+        with patch.object(model_api, "get_antigravity_client", return_value=BusyAgClient()), \
+             patch.object(model_api, "API_KEY", "sk-test-key"), \
+             patch.object(model_api, "MODEL_USAGE_JSON_PATH", self._usage_path), \
+             patch.object(model_api, "OpenAI", FakeClient), \
+             patch.object(model_api.time, "sleep", return_value=None):
+            res_fb = model_api.generate_content(
+                "hello fallback",
+                model="antigravity-3.8-flash-high",
+                fallback_model_list=["antigravity-argon-high", "healthy-model"],
+                max_retries_per_model=3,
+            )
+            self.assertEqual(res_fb["status"], "✅ 成功")
+            self.assertEqual(res_fb["content"], "fallback-ok")
+            self.assertEqual(busy_calls, ["antigravity-3.8-flash-high"])
+            self.assertEqual([c["model"] for c in openai_calls], ["healthy-model"])
+            with model_api._MODEL_COOLDOWN_LOCK:
+                self.assertNotIn("antigravity-3.8-flash-high", model_api._MODEL_COOLDOWN_UNTIL)
+
 
 if __name__ == "__main__":
     unittest.main()
