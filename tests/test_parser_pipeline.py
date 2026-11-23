@@ -44,15 +44,32 @@ from parser.post_ingestion import (
 )
 from parser.publish_state import AccountPublishStateStore
 from parser.publisher_arena import (
+    _check_account_health_guard,
     _collect_publish_candidates,
     _publish_articles_for_platform,
     _select_and_polish_best_candidate,
 )
 
 
-def _create_tiny_png(directory: Path, name: str = "sample.png") -> str:
+def _create_tiny_png(directory: Path, name: str = "sample.png", color=(12, 120, 210)) -> str:
     p = directory / name
-    Image.new("RGB", (8, 8), color=(12, 120, 210)).save(p, format="PNG")
+    img = Image.new("RGB", (16, 16), color=color)
+    if color == (12, 120, 210):
+        # Generate distinct spatial luminance gradients per filename so 9x8 dHash differs reliably
+        hv = sum((idx + 1) * ord(ch) for idx, ch in enumerate(name))
+        mode = hv % 4
+        for y in range(16):
+            for x in range(16):
+                if mode == 0:
+                    v = (x * 16 + y * 5 + hv) % 256
+                elif mode == 1:
+                    v = ((15 - x) * 16 + y * 7 + hv) % 256
+                elif mode == 2:
+                    v = (y * 16 + x * 3 + hv) % 256
+                else:
+                    v = ((x ^ y) * 17 + hv) % 256
+                img.putpixel((x, y), (v, (v + 60) % 256, (255 - v) % 256))
+    img.save(p, format="PNG")
     return str(p)
 
 
@@ -189,11 +206,19 @@ class TestPlatformAdapters(unittest.TestCase):
     def test_has_rival_keyword(self):
         self.assertTrue(has_rival_keyword("binance", "我在 OKX 上交易"))
         self.assertTrue(has_rival_keyword("binance", "欧易最新公告"))
+        self.assertTrue(has_rival_keyword("binance", "欧意最新公告"))
+        self.assertTrue(has_rival_keyword("binance", "Bybit 跟单爆了"))
+        self.assertTrue(has_rival_keyword("binance", "在 Bitget 开多"))
+        self.assertTrue(has_rival_keyword("binance", "HTX 转出"))
+        self.assertTrue(has_rival_keyword("binance", "Gate.io 首发"))
+        self.assertTrue(has_rival_keyword("binance", "火币历史公告"))
         self.assertTrue(has_rival_keyword("binance", "$OKB 日线突破前高"))
         self.assertFalse(has_rival_keyword("binance", "lookbook 观察笔记"))
         self.assertFalse(has_rival_keyword("binance", "Binance BTC setup"))
+        self.assertFalse(has_rival_keyword("binance", "navigate this high volatility"))
         self.assertTrue(has_rival_keyword("okx", "在币安看到一个信号"))
         self.assertFalse(has_rival_keyword("okx", "OKX ETH setup"))
+        self.assertFalse(has_rival_keyword("okx", "$BNB 突破前高"))
 
     def test_normalize_and_has_rival_exchange_ui(self):
         self.assertEqual(normalize_exchange_ui(None), "")
@@ -274,6 +299,110 @@ class TestPlatformAdapters(unittest.TestCase):
 
         v_no_coin, _ = _format_viral_post_content({"post_text": "三十天账面蒸发四千万", "selected_images": [], "image_mapping": {}}, "")
         self.assertEqual(v_no_coin, "三十天账面蒸发四千万")
+
+        # 1-char coin (e.g. $H) must NOT auto-append $H to avoid prefix autocomplete misfire ($HYPE)
+        v_one_char, _ = _format_viral_post_content({"post_text": "这个行情真离谱", "selected_images": [], "image_mapping": {}}, "H")
+        self.assertEqual(v_one_char, "这个行情真离谱")
+        self.assertEqual(BinancePlatform().decorate_analysis("单字母走势", "H"), "单字母走势\n\n#H")
+        self.assertIn("BTC", BinancePlatform().hot_coins(for_publish=True))
+
+    def test_stage1_upstream_guardrails_and_health_circuit_breaker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img_bn = _create_tiny_png(Path(tmp), "bn.png")
+            img_okx = _create_tiny_png(Path(tmp), "okx.png")
+            img_clean = _create_tiny_png(Path(tmp), "clean.png")
+
+            now = time.time()
+            evidences = [
+                {
+                    "source": "binance",
+                    "source_post_id": "p_low_weight",
+                    "core_fact": "Low weight noise",
+                    "logic_link": "Weak",
+                    "raw_hook": "",
+                    "dimension": "K线形态",
+                    "shelf_life": "days",
+                    "impact_weight": 1,
+                    "target_coin": "BTC",
+                    "publish_time": now - 3600,
+                    "images": [],
+                },
+                *[
+                    {
+                        "source": "binance" if i != 1 else "okx",
+                        "source_post_id": f"p_hi_{i}",
+                        "core_fact": f"High catalyst {i}",
+                        "logic_link": f"Strong logic {i}",
+                        "raw_hook": "",
+                        "dimension": f"Dim{i}",
+                        "shelf_life": "days",
+                        "impact_weight": 5,
+                        "target_coin": "BTC",
+                        "publish_time": now - (i + 1) * 3600,
+                        "images": (
+                            [{"image_id": "[IMAGE_1]", "usable": True, "exchange_ui": "binance" if i == 0 else "okx", "context": "图"}]
+                            if i in (0, 1)
+                            else ([{"image_id": "[IMAGE_1]", "usable": True, "exchange_ui": "", "context": "普通图"}] if i == 2 else [])
+                        ),
+                        "source_image_mapping": {
+                            "[IMAGE_1]": {
+                                "original_placeholder": f"[插图: https://x/{i}.png]",
+                                "original_url": f"https://x/{i}.png",
+                                "local_path": img_bn if i == 0 else (img_okx if i == 1 else img_clean),
+                            }
+                        } if i <= 2 else {},
+                    }
+                    for i in range(5)
+                ],
+            ]
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.return_value = []
+            task = build_article_task("BTC", "看多", evidences, mock_mgr)
+            self.assertFalse(task["is_skip"])
+            # Low weight=1 noise excluded when >=5 high impact materials exist; metadata preserved
+            self.assertEqual(len(task["materials"]), 5)
+            self.assertTrue(all(m["impact_weight"] == 5 for m in task["materials"]))
+            self.assertTrue(all("age_hours" in m and "dimension" in m for m in task["materials"]))
+            # Rival UI mix prevention: cannot upload both img_bn and img_okx together
+            self.assertFalse(img_bn in task["file_paths"] and img_okx in task["file_paths"])
+            self.assertIn(img_clean, task["file_paths"])
+
+            # Empty comments stripped from viral task brief
+            v_post = {
+                "source": "binance",
+                "post_id": "v_nocmt",
+                "content": {"text_content": "爆仓图\n[插图: https://x/clean.png]"},
+                "media": {"local_mapping": {"https://x/clean.png": img_clean}},
+                "comments": [],
+                "viral_screen": {"event_key": "k"},
+            }
+            v_task = build_viral_article_task(v_post)
+            self.assertNotIn("comments", v_task["record"]["creation_brief"]["original_post"])
+
+            # Account health guard blocks lan != cn or >=2/3 penalized
+            bad_lan_mgr = MagicMock()
+            bad_lan_mgr.find_articles.return_value = [
+                {"publish_records": {"binance": {"lan": "en", "recommend": True, "content_status": 2}}}
+            ]
+            ok_lan, _ = _check_account_health_guard(bad_lan_mgr, "binance", "qiqi")
+            self.assertFalse(ok_lan)
+
+            bad_rec_mgr = MagicMock()
+            bad_rec_mgr.find_articles.return_value = [
+                {"publish_records": {"binance": {"lan": "cn", "recommend": False, "content_status": 2}}},
+                {"publish_records": {"binance": {"lan": "cn", "recommend": True, "content_status": 5}}},
+                {"publish_records": {"binance": {"lan": "cn", "recommend": True, "content_status": 2}}},
+            ]
+            ok_rec, _ = _check_account_health_guard(bad_rec_mgr, "binance", "myself")
+            self.assertFalse(ok_rec)
+
+            good_mgr = MagicMock()
+            good_mgr.find_articles.return_value = [
+                {"publish_records": {"binance": {"lan": "cn", "recommend": True, "content_status": 2}}},
+                {"publish_records": {"binance": {"lan": "cn", "recommend": True, "content_status": 2}}},
+            ]
+            ok_good, _ = _check_account_health_guard(good_mgr, "binance", "myself")
+            self.assertTrue(ok_good)
 
     def test_sync_published_metrics_refreshes_until_mature_and_marks_ramping(self):
         now = 1_800_000_000.0
@@ -646,7 +775,8 @@ class TestPublisherArena(unittest.TestCase):
                 "publish_records": {},
             }
             mock_mgr = MagicMock()
-            mock_mgr.find_articles.side_effect = [[], [art], []]
+            # Calls: 1) recent published image usage; 2) candidates; 3) health guard (ruru); 4) chief editor recent history
+            mock_mgr.find_articles.side_effect = [[], [art], [], []]
             mock_mgr.collection_name = "generated_articles"
 
             # Pre-claim "myself" as if another thread is publishing it concurrently
@@ -719,6 +849,69 @@ class TestPublisherArena(unittest.TestCase):
             self.assertEqual(stats["source_conflict"], 1)
             self.assertEqual(len(cands), 1)
             self.assertEqual(cands[0][0]["source"], "binance")
+
+    def test_ranking_favors_multi_img_and_no_18h_penalty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = _create_tiny_png(Path(tmp), "r1.png")
+            img2 = _create_tiny_png(Path(tmp), "r2.png")
+            now = time.time()
+            # Short 1-img viral (high base score 9.2, young post) vs 2-img narrative viral (lower base score 8.5, >20h old)
+            art_short_1img = {
+                "article_id": "v_short1",
+                "source": "binance",
+                "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "post_id_list": ["p_short"],
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "就离谱，刚买就跌了三十个点。",
+                    "selected_images": ["[IMAGE_1]"],
+                    "viral_score": 9.2,
+                    "bait_comments": ["笑死"],
+                    "image_mapping": {"[IMAGE_1]": {"local_path": img1, "original_url": "https://r/1.png", "content_id": "c1", "exchange_ui": ""}},
+                },
+                "publish_records": {},
+            }
+            art_multi_2img = {
+                "article_id": "v_multi2",
+                "source": "binance",
+                "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "post_id_list": ["p_multi"],
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "某项目创始人嘴上喊着生态建设，链上大额地址却连夜解锁转入交易所，前后对比实在太讽刺了，两张实锤图自己看细节。",
+                    "selected_images": ["[IMAGE_1]", "[IMAGE_2]"],
+                    "viral_score": 8.5,
+                    "bait_comments": ["太真实"],
+                    "image_mapping": {
+                        "[IMAGE_1]": {"local_path": img1, "original_url": "https://r/1.png", "content_id": "c1", "exchange_ui": ""},
+                        "[IMAGE_2]": {"local_path": img2, "original_url": "https://r/2.png", "content_id": "c2", "exchange_ui": ""},
+                    },
+                },
+                "publish_records": {},
+            }
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.return_value = [art_short_1img, art_multi_2img]
+            mock_mgr.db = MagicMock()
+            mock_post_col = MagicMock()
+            mock_post_col.find.return_value = [
+                {"post_id": "p_short", "publish_time": now - 3600, "engagement": {"view_count": 5000}},
+                {"post_id": "p_multi", "publish_time": now - 22 * 3600, "engagement": {"view_count": 5000}},
+            ]
+            mock_mgr.db.get_collection.return_value = mock_post_col
+
+            with patch("parser.publisher_arena.UniversalPostManager") as mock_upm:
+                mock_upm.return_value.find_posts.return_value = [
+                    {"post_id": "p_short", "publish_time": now - 3600, "engagement": {"view_count": 5000}},
+                    {"post_id": "p_multi", "publish_time": now - 22 * 3600, "engagement": {"view_count": 5000}},
+                ]
+                cands, _, _ = _collect_publish_candidates(mock_mgr, "binance", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
+            self.assertEqual([c[0]["article_id"] for c in cands], ["v_multi2", "v_short1"])
 
     def test_chief_editor_strips_scores_and_never_rewrites_draft(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -904,6 +1097,54 @@ class TestLazyMediaDownload(unittest.TestCase):
         _fetch_hot_posts(mock_mgr, ["BTC"], _fake_fetch_feed, "binance")
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(c.get("download_media") is False for c in calls))
+
+
+class TestPromptAbstractionHygiene(unittest.TestCase):
+    def test_prompts_are_abstract_and_free_of_legacy_case_anchors(self):
+        from common.llm_gateway import render_prompt_template
+        from parser.config import (
+            ANALYSIS_EDITOR_PROMPT_NAME,
+            ARTICLE_PROMPT_NAME,
+            MLU_EXTRACT_PROMPT_NAME,
+            PRE_SCREEN_PROMPT_NAME,
+            VIRAL_EDITOR_PROMPT_NAME,
+            VIRAL_STAGE1_PROMPT_NAME,
+            VIRAL_STAGE2_PROMPT_NAME,
+        )
+
+        prompt_names = (
+            PRE_SCREEN_PROMPT_NAME,
+            MLU_EXTRACT_PROMPT_NAME,
+            ARTICLE_PROMPT_NAME,
+            ANALYSIS_EDITOR_PROMPT_NAME,
+            VIRAL_STAGE1_PROMPT_NAME,
+            VIRAL_STAGE2_PROMPT_NAME,
+            VIRAL_EDITOR_PROMPT_NAME,
+        )
+        forbidden_case_anchors = (
+            "K-DOT Plot",
+            "主播假酒",
+            "大厂员工篡改代码",
+            "半场开香槟",
+            "某某预警",
+            "白捡钱感",
+            "强平劫后余生",
+            "大饼→",
+            "二饼→",
+            "破位就空",
+            "500 元挑战",
+            "再不上车就彻底晚了",
+            "卖盘比买盘多几倍",
+            "止损不丢人",
+            "散户看戏",
+            "巨鲸抢筹",
+            "带血筹码",
+        )
+        for pname in prompt_names:
+            text, _ = render_prompt_template(pname)
+            self.assertTrue(text.strip(), f"Empty prompt: {pname}")
+            for anchor in forbidden_case_anchors:
+                self.assertNotIn(anchor, text, f"Found legacy concrete anchor {anchor!r} in {pname}")
 
 
 if __name__ == "__main__":

@@ -622,7 +622,9 @@ ALL_POST_SOURCES = (
     PLATFORM_HACKERNEWS,
 )
 
-BINANCE_ACCOUNTS = ["myself", "qiqi", "ruru"]
+# 【账号安全隔离说明】qiqi (Square-Creator-ff5e108f93e48) 因 Binance 服务端 accountLang='en'，
+# 发文 100% 落入英文池锁死 <100 浏览并占用 7 天视觉图片去重池；在改回中文池且首帖验证 lan='cn' 前暂移出自动发帖名单。
+BINANCE_ACCOUNTS = ["myself", "ruru"]
 # OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
 OKX_ACCOUNTS = ["myself", "nana"]
 

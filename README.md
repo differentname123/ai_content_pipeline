@@ -3,7 +3,7 @@
 本项目是面向 **Binance 广场、OKX 星球 (Orbit) 与 X (Twitter)** 的自动化内容采集、多模态 AI 筛选创作、总编擂台选稿发布与高质量神评互动系统，支持 Windows / Linux / macOS 跨平台无人值守运行。
 
 > [!IMPORTANT]
-> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`AGENTS.md`](AGENTS.md) 中的核心安全与架构红线（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。涉及币安广场内容选品、账号风控、标签规则与发帖频控调整时，请同步查阅实证分析文档 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md)。
+> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`AGENTS.md`](AGENTS.md) 中的核心安全与架构红线（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。涉及币安广场运营调整请查阅 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md)；**涉及 X (Twitter) 内容运营、算法机制、风控红线与自动化执行规范，请务必先阅读实证守则 [`X_PLATFORM_OPERATIONS.md`](X_PLATFORM_OPERATIONS.md)**。
 
 ---
 
@@ -16,6 +16,7 @@ ai_content_pipeline/
 ├── PROJECT_PRINCIPLES.md             # 设计理念与维护红线
 ├── AGENTS.md                         # AI 协作者核心红线守则
 ├── BINANCE_SQUARE_OPERATIONS.md      # 币安广场实证流量诊断与运营守则
+├── X_PLATFORM_OPERATIONS.md          # X 平台实证机制、正负规则与自动化执行守则
 ├── requirements.txt                  # 运行时精准依赖清单
 ├── config/config.json                # MongoDB、模型网关权重、代理、会话目录配置
 │
@@ -31,12 +32,14 @@ ai_content_pipeline/
 │
 ├── app/ai_api/model_api.py           # OpenAI 兼容网关统一调度、多模型负载均衡与文件锁审计
 │
-├── platforms/                        # 平台接口、共享 Playwright 底座、五大平台采集与 X 中文爆款发帖
-│   ├── playwright_base.py            # `persistent_browser_session`、真实 Chrome 无头伪装、浮层看门狗、WAF识别、取证
+├── platforms/                        # 平台接口、共享浏览器底座、五大平台采集与 X 被动执行守护
+│   ├── playwright_base.py            # `persistent_browser_session`、真实 Chrome 会话与通用页面原语
+│   ├── x_browser.py                  # X 专用 Patchright + 本机正版有头 Chrome 引擎、全物理输入与 48h 熔断器
 │   ├── binance_api.py / binance_playwright.py
 │   ├── okx_api.py / okx_playwright.py
 │   ├── x_api.py                      # X 历史抓取、`fxtwitter` + `syndication` 双通道免登查询、小号防主号隔离
-│   ├── x_playwright.py               # X 发帖/回复/关注（含媒体上传就绪守卫与零重发安全重试）
+│   ├── x_playwright.py               # X 原子页动作（发帖/回复/关注/置顶/只读通知嗅探 + 响应级风控拦截）
+│   ├── x_ops_daemon.py               # X 纯被动单 Chrome 任务执行守护（`enqueue_x_action` / `wait_x_action` / 配额顺延）
 │   ├── external_link_extractor.py    # 站外长文正文与头图通用抓取提取器
 │   ├── harvesters/                   # 五大平台采集器（`binance` / `okx` / `x` / `reddit` / `hackernews` + `base_harvester.py`）
 │   ├── harvester_runner.py           # 【五大平台采集总控】广谱每小时定时全量采集与按关键词定向深挖统一入口

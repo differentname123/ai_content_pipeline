@@ -358,31 +358,80 @@ def _collect_publish_candidates(
             likes = int(eng.get("like_count", 0) or 0)
             comments = int(eng.get("comment_count", 0) or 0)
             hot_energy = views + likes * 30 + comments * 80
-            fresh_bonus = 0.0
-            raw_spt = src_pub_time_map.get(pid_str)
-            if raw_spt:
-                try:
-                    spt_val = float(raw_spt)
-                    spt_s = spt_val / 1000.0 if spt_val > 1e11 else spt_val
-                    age_h = (now_ts - spt_s) / 3600.0
-                    # 【保留过滤原因说明】不硬删旧帖防冷清期断供，仅按原帖新鲜度做温和优先级加权（<=12h 优先，>18h 降权）
-                    if age_h <= 12.0:
-                        fresh_bonus = 0.5
-                    elif age_h > 18.0:
-                        fresh_bonus = -1.0
-                except (TypeError, ValueError):
-                    pass
-            return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + fresh_bonus
+            # 【保留过滤/加权原因说明】实证检验已证伪 >18h 延迟低流量假设，故移除高延迟惩罚；
+            # 按大盘 30,000 篇与自有健康帖统计规律：>=2 图且避开单图 <100 字死亡谷予以明显加权。
+            img_cnt = len(info.get(rule["images"]) or [])
+            clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
+            form_bonus = 1.0 if img_cnt >= 2 else (-1.0 if clean_len < 100 else 0.0)
+            return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + form_bonus
 
         candidates.sort(key=_viral_rank_key, reverse=True)
     else:
-        candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
+        def _analysis_rank_key(item: Tuple[Dict[str, Any], Set[str], str]) -> float:
+            art = item[0]
+            info = art["article_info"]
+            score = float(info.get(rule["score"], 0.0))
+            img_cnt = len(info.get(rule["images"]) or [])
+            clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
+            # 【保留过滤/加权原因说明】实证表明 2~3 张图 + >=140 字实质叙事显著提高分析帖曝光中位数与均评
+            form_bonus = 0.8 if (img_cnt >= 2 and clean_len >= 140) else 0.0
+            return score + form_bonus
+
+        candidates.sort(key=_analysis_rank_key, reverse=True)
     return candidates, len(raw), stats
 
 
 # ==============================================================================
 # 总编横向擂台与发布回写
 # ==============================================================================
+def _check_account_health_guard(
+    article_manager: Any,
+    platform: str,
+    account: str,
+    *,
+    lookback: int = 3,
+) -> Tuple[bool, str]:
+    """
+    基于已同步落库的风控与语言指标检查账号健康度（零网络请求）：
+    - Binance 中文发布号最新已同步帖子 `lan != "cn"` -> 立即拦截（语言池错配）；
+    - Binance 最近 `lookback` 篇已同步帖中有 >=2 篇 `recommend is False` 或 `content_status == 5` -> 熔断暂停。
+    """
+    if platform != PLATFORM_BINANCE or not hasattr(article_manager, "find_articles"):
+        return True, ""
+    try:
+        docs = (
+            article_manager.find_articles(
+                query={
+                    "status": "ok",
+                    f"publish_records.{platform}.status": "success",
+                    f"publish_records.{platform}.published_by": account,
+                    f"publish_records.{platform}.metrics_synced_at": {"$exists": True, "$ne": None},
+                },
+                sort=[(f"publish_records.{platform}.publish_time", -1)],
+                limit=lookback,
+            )
+            or []
+        )
+    except Exception:
+        return True, ""
+    if not docs:
+        return True, ""
+
+    latest_rec = (docs[0].get("publish_records") or {}).get(platform) or {}
+    latest_lan = latest_rec.get("lan")
+    if isinstance(latest_lan, str) and latest_lan.strip() and latest_lan.strip().lower() != "cn":
+        return False, f"账号最新帖子语言池异常(lan={latest_lan}!=cn)，请先核查账号语区设置"
+
+    penalized = 0
+    for doc in docs:
+        rec = (doc.get("publish_records") or {}).get(platform) or {}
+        if rec.get("recommend") is False or rec.get("content_status") == 5:
+            penalized += 1
+    if penalized >= 2:
+        return False, f"账号近{len(docs)}篇已同步帖子中有{penalized}篇受限(recommend=False或content_status=5)，触发健康熔断"
+    return True, ""
+
+
 def _get_recent_published_history_with_metrics(
     article_manager: Any,
     platform: str,
@@ -466,19 +515,25 @@ def _select_and_polish_best_candidate(
                 for img in (info.get("image_semantics") or [])
                 if isinstance(img, dict) and img.get("keep")
             ]
+            post_txt = info.get("post_text", "") or ""
+            sel_imgs = info.get("selected_images") or []
             # 严格剔除内部打分，避免干扰总编审美判断
             arena_items.append(
                 {
                     "candidate_no": rank_no,
                     "topic": art.get("topic") or m_coin,
+                    "source_platform": art.get("source") or "",
+                    "image_count": len(sel_imgs),
+                    "char_count": len("".join(post_txt.split())),
                     "kept_images_desc": img_roles,
-                    "draft_text": info.get("post_text", ""),
+                    "draft_text": post_txt,
                     "draft_comments": info.get("bait_comments", []),
                 }
             )
         else:
             brief_mats = (art.get("creation_brief") or {}).get("materials") or []
-            selected_phs = set(info.get("image_placeholders") or [])
+            selected_phs = list(info.get("image_placeholders") or [])
+            selected_phs_set = set(selected_phs)
             img_descs = []
             for m in brief_mats:
                 if not isinstance(m, dict):
@@ -486,16 +541,19 @@ def _select_and_polish_best_candidate(
                 vis = m.get("visual_evidence")
                 vis_list = vis if isinstance(vis, list) else ([vis] if isinstance(vis, dict) else [])
                 for v in vis_list:
-                    if isinstance(v, dict) and v.get("placeholder") in selected_phs and v.get("what_it_shows"):
+                    if isinstance(v, dict) and v.get("placeholder") in selected_phs_set and v.get("what_it_shows"):
                         img_descs.append(v["what_it_shows"])
+            draft_txt = info.get("text", "") or ""
             # 严格剔除内部打分，仅保留客观盘面初稿与配图描述
             arena_items.append(
                 {
                     "candidate_no": rank_no,
                     "topic": art.get("topic"),
                     "stance": art.get("stance"),
+                    "image_count": len(selected_phs),
+                    "char_count": len("".join(draft_txt.split())),
                     "kept_images_desc": img_descs,
-                    "draft_text": info.get("text", ""),
+                    "draft_text": draft_txt,
                     "draft_comments": info.get("god_comments", []),
                 }
             )
@@ -763,6 +821,18 @@ def _publish_articles_for_platform(
     for account in eligible_accounts:
         if not candidates:
             break
+        healthy, health_reason = _check_account_health_guard(article_manager, platform, account)
+        if not healthy:
+            _log(
+                f"{rule['action']}/账号熔断",
+                "账号健康检查未通过，自动暂停本轮发布",
+                level="error",
+                平台=platform,
+                账号=account,
+                原因=health_reason,
+                排查="核对账号主页语言设置、最近帖子推荐状态与简介合规性",
+            )
+            continue
         claimed, claim_reason = store.try_claim_account(
             platform,
             account,
@@ -942,6 +1012,7 @@ def auto_publish_viral_articles(stop_event: Optional[threading.Event] = None, ma
 
 
 __all__ = [
+    "_check_account_health_guard",
     "_collect_publish_candidates",
     "_extract_article_image_addresses",
     "_get_recent_published_history_with_metrics",

@@ -41,6 +41,8 @@ logger = setup_logger(app_name="media_format")
 BEIJING_TZ = timezone(timedelta(hours=8))
 COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
 _BINANCE_RIVAL_OKB_PATTERN = re.compile(r"(?<![a-z0-9])okb(?![a-z0-9])")
+_BINANCE_RIVAL_ENGLISH_BRANDS = re.compile(r"(?<![a-z0-9])(okx|bybit|bitget|htx|mexc|gate\.io)(?![a-z0-9])")
+BINANCE_CORE_ANALYSIS_COINS = ("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "FIL", "DOT")
 _EMPTY_EXCHANGE_UI_VALUES = {"none", "null", "unknown", "n/a", "na", "无", "无交易所", "未知"}
 _EXCHANGE_UI_ALIASES = {
     "binance": "binance",
@@ -147,7 +149,13 @@ def has_rival_keyword(platform: str, text: str) -> bool:
     """检查文本是否包含目标平台禁止提及的竞品关键词。"""
     lower = str(text or "").lower()
     if platform == PLATFORM_BINANCE:
-        return "okx" in lower or "欧易" in lower or bool(_BINANCE_RIVAL_OKB_PATTERN.search(lower))
+        return (
+            "欧易" in lower
+            or "欧意" in lower
+            or "火币" in lower
+            or bool(_BINANCE_RIVAL_ENGLISH_BRANDS.search(lower))
+            or bool(_BINANCE_RIVAL_OKB_PATTERN.search(lower))
+        )
     if platform == PLATFORM_OKX:
         return "binance" in lower or "币安" in lower
     return False
@@ -158,7 +166,8 @@ def add_hot_topic_to_article(text: str, topic: str, tag_count: int = 2) -> str:
     clean_topic = str(topic or "").strip().upper()
     if not clean_topic or clean_topic == "MARKET":
         return text
-    tags = [f"#{clean_topic}", f"${clean_topic} "]
+    # 1 字符超短代币（如 $H）停顿 2 秒键入极易被联想前缀错选，仅保留 #COIN 话题标签而不强加 $COIN
+    tags = [f"#{clean_topic}", f"${clean_topic} "] if len(clean_topic) >= 2 else [f"#{clean_topic}"]
     logger.info(f"[文章/标签] 精准标签已准备 | 主题: [{clean_topic}] | 标签: [{tags}]")
     return text + "\n\n" + "\n".join(tags)
 
@@ -190,7 +199,7 @@ class BinancePlatform:
     def hot_coins(self, for_publish: bool = False) -> List[str]:
         coins = list(get_hot_coin() or [])
         if for_publish:
-            return coins
+            return list(dict.fromkeys([*coins, *BINANCE_CORE_ANALYSIS_COINS]))
         return list(dict.fromkeys([*coins, "BTC", "ETH", "SOL"]))
 
     def fetch_feed(self, **kwargs: Any) -> List[Dict[str, Any]]:
@@ -331,7 +340,7 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
     """分析文章 -> `(最终发布正文, 有序本地图片路径列表)`。"""
     info = article["article_info"]
     topic, text = (article.get("topic") or "").strip(), info.get("text", "").strip()
-    has_coin_topic = bool(topic and topic.upper() != "MARKET")
+    has_coin_topic = bool(topic and topic.upper() != "MARKET" and len(topic) >= 2)
     if has_coin_topic:
         # 使用 ASCII 字符边界匹配（兼容如 "ZEC破800" 紧贴中文），避免与前缀叠加出 "$ZEC ZEC" 重复
         text = re.sub(
@@ -358,7 +367,9 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
 def _format_viral_post_content(info: Dict[str, Any], matched_coin: str) -> Tuple[str, List[str]]:
     """流量文章 `article_info` + 热币标签 -> `(最终发布正文, 有序本地图片路径列表)`。"""
     text = str(info.get("post_text") or "").strip()
-    prefix = f"${matched_coin}" if matched_coin else ""
+    clean_coin = str(matched_coin or "").strip().upper()
+    # 实证防误补全：1 字符超短代币（如 $H）在广场编辑器停顿 2 秒时极易被前缀联想自动补全错选（如变成 $HYPE），不主动追加
+    prefix = f"${clean_coin}" if len(clean_coin) >= 2 else ""
     if prefix:
         has_prefix = bool(
             re.search(rf"(?<![A-Za-z0-9]){re.escape(prefix)}(?![A-Za-z0-9])", text, re.IGNORECASE)

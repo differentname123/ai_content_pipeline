@@ -300,20 +300,31 @@ def _get_all_self_published_post_ids(article_manager: Optional[Any] = None) -> s
     return self_ids
 
 
-def transform_mlus(mlu_list: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def transform_mlus(mlu_list: Sequence[Dict[str, Any]], *, now_ts: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """将论据列表转为带 dHash 去重占位符 `[ASSET_IMG_n]` 的创作素材列表与图片溯源映射。"""
     materials, image_mapping, asset_by_source = [], {}, {}
+    cur_ts = time.time() if now_ts is None else float(now_ts)
     for index, evidence in enumerate(mlu_list, 1):
         coin = str(evidence.get("target_coin") or "").strip().upper()
-        material = {
+        material: Dict[str, Any] = {
             "id": f"M{index}",
             "coin": coin,
             "target_coin": coin,
+            "dimension": evidence.get("dimension") or "",
+            "impact_weight": evidence.get("impact_weight"),
+            "shelf_life": evidence.get("shelf_life") or "",
             "fact": evidence.get("core_fact", ""),
             "underlying_logic": evidence.get("logic_link", ""),
             "raw_hook": evidence.get("raw_hook", ""),
             "visual_evidence": None,
         }
+        raw_pt = evidence.get("publish_time")
+        if raw_pt is not None:
+            try:
+                pt_sec = _publish_time_seconds(raw_pt)
+                material["age_hours"] = round(max(0.0, cur_ts - pt_sec) / 3600.0, 1)
+            except ValueError:
+                pass
         materials.append(material)
         images = [image for image in evidence.get("images", []) if image.get("usable") is True]
         if not images:
@@ -364,7 +375,10 @@ def transform_mlus(mlu_list: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, A
                 }
             elif ex_ui and not image_mapping[placeholder].get("exchange_ui"):
                 image_mapping[placeholder]["exchange_ui"] = ex_ui
-            visual_items.append({"placeholder": placeholder, "what_it_shows": image["context"]})
+            vis_entry: Dict[str, Any] = {"placeholder": placeholder, "what_it_shows": image["context"]}
+            if image_mapping[placeholder].get("exchange_ui"):
+                vis_entry["exchange_ui"] = image_mapping[placeholder]["exchange_ui"]
+            visual_items.append(vis_entry)
         material["visual_evidence"] = visual_items[0] if len(visual_items) == 1 else visual_items
     return materials, image_mapping
 
@@ -642,19 +656,46 @@ def build_article_task(
         POST_SOURCES,
         list(dict.fromkeys(item["source_post_id"] for item in candidates)),
     )
+    under_limit = [
+        item for item in candidates
+        if usage.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
+    ]
+    high_impact = [
+        item for item in under_limit
+        if isinstance(item.get("impact_weight"), int) and item["impact_weight"] >= 3
+    ]
+    pool_items = high_impact if len(high_impact) >= ARTICLE_MIN_MATERIALS else under_limit
+
     groups = defaultdict(list)
-    for item in candidates:
-        if usage.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT:
-            groups[(item.get("dimension"), item.get("shelf_life"))].append(item)
+    for item in pool_items:
+        groups[(item.get("dimension"), item.get("shelf_life"))].append(item)
+
+    cur_ts = time.time()
 
     def _has_usable_img(ev: Dict[str, Any]) -> bool:
         return any(isinstance(img, dict) and img.get("usable") for img in (ev.get("images") or []))
+
+    def _freshness_bucket(ev: Dict[str, Any]) -> int:
+        raw_pt = ev.get("publish_time")
+        if raw_pt is None:
+            return 0
+        try:
+            age_h = max(0.0, cur_ts - _publish_time_seconds(raw_pt)) / 3600.0
+        except ValueError:
+            return 0
+        if age_h <= 12.0:
+            return 3
+        if age_h <= 24.0:
+            return 2
+        if age_h <= 72.0:
+            return 1
+        return 0
 
     grouped_queues = {
         key: deque(
             sorted(
                 items,
-                key=lambda item: (1 if _has_usable_img(item) else 0, item.get("impact_weight", 0), random.random()),
+                key=lambda item: (1 if _has_usable_img(item) else 0, item.get("impact_weight", 0), _freshness_bucket(item), random.random()),
                 reverse=True,
             )
         )
@@ -667,6 +708,7 @@ def build_article_task(
             key=lambda key: (
                 1 if _has_usable_img(grouped_queues[key][0]) else 0,
                 grouped_queues[key][0].get("impact_weight", 0),
+                _freshness_bucket(grouped_queues[key][0]),
                 random.random(),
             ),
             reverse=True,
@@ -703,15 +745,23 @@ def build_article_task(
             "selected_count": len(selected),
         }
 
-    materials, image_mapping = transform_mlus(selected)
+    materials, image_mapping = transform_mlus(selected, now_ts=cur_ts)
     file_paths, uploaded_images_desc = [], []
+    chosen_exchange_ui = ""
     for ph, meta in image_mapping.items():
         lp = meta.get("local_path") if isinstance(meta, dict) else None
-        if lp and _is_valid_image_file(lp):
-            file_paths.append(lp)
-            uploaded_images_desc.append(f"上传的第 {len(file_paths)} 张图片对应占位符 {ph}")
-            if len(file_paths) >= 4:
-                break
+        if not lp or not _is_valid_image_file(lp):
+            continue
+        img_ui = normalize_exchange_ui(meta.get("exchange_ui"))
+        # 避免单篇分析稿同时混入两个不同交易所 UI 图，导致 Binance 与 OKX 两端发布全被拦截
+        if img_ui:
+            if chosen_exchange_ui and img_ui != chosen_exchange_ui:
+                continue
+            chosen_exchange_ui = chosen_exchange_ui or img_ui
+        file_paths.append(lp)
+        uploaded_images_desc.append(f"上传的第 {len(file_paths)} 张图片对应占位符 {ph}")
+        if len(file_paths) >= 4:
+            break
 
     if not file_paths:
         reason = "选中论据中无有效本地实锤配图，跳过无图纯文字生成"
@@ -847,7 +897,9 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
         if not _is_valid_raw_post(post, require_local_media=False):
             continue
         hot_weight = view_count + like_count * 20 + comment_count * 50
-        candidates.append((post, hot_weight, publish_time))
+        # 实证大盘 >=2 图爆款率显著高于单图（30,000 篇大盘 2~3 图 vs 1 图），给予多图原帖温和优先权重
+        img_boost = 1.35 if len((post.get("media") or {}).get("images") or []) >= 2 else 1.0
+        candidates.append((post, hot_weight * img_boost, publish_time))
 
     candidate_ids = [item[0].get("post_id") for item in candidates if item[0].get("post_id") is not None]
     processed_ids = get_remodeled_viral_post_ids(article_manager, POST_SOURCES, candidate_ids)
@@ -1006,15 +1058,21 @@ def build_viral_article_task(post: Dict[str, Any]) -> Dict[str, Any]:
         for img_id, meta in source_mapping.items()
     }
 
-    comments = [comment_info.get("content", "") for comment_info in (post.get("comments") or []) if isinstance(comment_info, dict)][:20]
+    comments = [
+        comment_info.get("content", "")
+        for comment_info in (post.get("comments") or [])
+        if isinstance(comment_info, dict) and str(comment_info.get("content", "")).strip()
+    ][:20]
+    original_post_payload: Dict[str, Any] = {
+        "post_id": post_id_str,
+        "text_content": normalized_text.strip(),
+        "available_images": list(placeholders.keys()),
+    }
+    if comments:
+        original_post_payload["comments"] = comments
     brief = {
         "current_year": datetime.now(BEIJING_TZ).year,
-        "original_post": {
-            "post_id": post_id_str,
-            "text_content": normalized_text.strip(),
-            "comments": comments,
-            "available_images": list(placeholders.keys()),
-        },
+        "original_post": original_post_payload,
         "stage1_screen": {
             "event_key": screen.get("event_key", ""),
         },

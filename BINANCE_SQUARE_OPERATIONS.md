@@ -103,14 +103,43 @@
 
 ---
 
-## 五、策略到代码与提示词的落地映射
+## 五、全链路增长规律（30,000 帖实证）与多轮评测收敛基准
+
+### 1. 配图 × 篇幅二维矩阵与反问句反模式（30,000 条非蓝 V 原帖回归）
+- **配图张数带来单调曝光跃升**：`0 / 1 / 2 / 3 / 4+` 张配图达到 `>= 1,000` 曝光的比例依次为 **`6.6% / 13.4% / 19.5% / 23.6% / 30.5%`**。
+- **警惕“单图百字以下死亡谷”与超长篇衰减**：
+  - `1 图 + 50~99 字` 曝光中位数仅 **47**；高流娱乐原料中原始存在 `66.4%` 不足 100 字、`65.8%` 仅单图的历史短板，过去容易洗成“几十字的半截谜语单图帖”。
+  - `2+ 图` 在 **`<= 259 字`** 各档位均具备强自然流量表现（各分段曝光中位数 **`384 ~ 652`**），一旦超过 `260 字` 曝光中位数即回落至 **96**。因此分析生成聚焦 **`140~255 字 + 2~3 图`** 甜蜜区，娱乐洗稿严禁输出小于 100 字的半截单图谜语。
+- **禁止廉价设问/反问结尾**：带 `?` / `？` 的帖子曝光中位数为 **117**（平均评论 **1.3**），明显低于无问号帖子的中位数 **235**（平均评论 **1.7**）。全链路生成提示词已改用尖锐矛盾与明确可证伪分界点替代结尾反问。
+
+### 2. 上游架构与工程根因修复
+1. **异常账号隔离与健康熔断**：将异常限流账号 `qiqi` 移出 [common_utils.py](common/common_utils.py) 的 `BINANCE_ACCOUNTS`（现仅保留 `['myself', 'ruru']`）；[publisher_arena.py](parser/publisher_arena.py) 在总编选稿前执行零网络健康守卫，若 `lan != "cn"` 或近期样本 `>=2/3` 受限即静默暂停该号。
+2. **核心分析币池与 1 字符 `$SYMBOL` 防错绑**：`BinancePlatform.hot_coins(for_publish=True)` 固定纳入核心主流币池 `("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "FIL", "DOT")`；长度 `<= 1` 的单字母币种不自动拼接 `$SYMBOL`，避免平台输入联想误绑定。
+3. **分析上下文降噪与跨日图链对齐**：`transform_mlus` 透传 `dimension`、`impact_weight`、`shelf_life`、`age_hours` 与 `exchange_ui`；`build_article_task` 在高权重素材 `>= 5` 条时剔除 `impact_weight <= 1` 噪音，并阻止冲突的竞品与币安独占 UI 图混拼；保留 `ARTICLE_MATERIAL_LIMIT = 10` 以避免次级催化丢失（R2 曾试探收紧至 `7` 导致 `BNB` 篇幅跌破 100 字，已在 R3 回调）。
+4. **娱乐输入净化与总编形态加权**：移除全空 `comments` 字段（抽检 `500/500` 原帖均为空数组）以防幻觉提示，为 `>= 2 图` 娱乐候选施加 `1.35x` 排名加权；总编候选向提示词暴露 `image_count`、`char_count` 与 `source_platform`（分析/娱乐按图数与字数结构挑优，不靠猜测文本判断多图优势）。
+
+### 3. 提示词 100% 抽象化与 R0 → R5 基准评测演化
+所有 7 份提示词已重构为**零具体案例锚点、100% 抽象第一性原理**的精简指令，并在冻结基准集（18 组分析生成、60 条娱乐一阶段、22 条娱乐二阶段、40 条 MLU 初筛、12 条 MLU 提取、10 组总编擂台）上完成 6 轮客观指标 + 交换位置双盲评判：
+
+| 模块 | 基线 (R0) 核心指标 | R5（当前生产配置）核心指标 | 变化说明与盲测胜率（位置互换去偏） |
+| :--- | :--- | :--- | :--- |
+| **分析文章生成** | `140~255`字=`50.0%`，`>=2`图=`77.8%`，中位字数 `139.5` | `140~255`字=**`100.0%`**，`>=2`图=**`100.0%`**，中位字数 **`225.5`**，问号率 **`0.0%`** | vs R0 双盲胜率 **15W/3L (`83.3%`)**（R1 `66.7%` -> R2 `77.8%` -> R4/R5 **`83.3%`**） |
+| **娱乐一阶段初筛** | 正召回 `100.0%`，负拒 `90.0%`，红线 `92.3%`，安全聊天保留 `50.0%` | 正召回 **`95.0%`**，负拒 **`85.0%`**，红线 **`92.3%`**，安全聊天保留 **`75.0%`** | 修复 R1(`45%`) 与 R4(`60%`) 过杀，结合 `image_count` 豁免与抽象红线实现稳态高召回 |
+| **娱乐二阶段精改** | 红线 `66.7%`，死亡谷 `44.4%`，多图保留 `42.9%`，问号 `22.2%` | 红线 **`100.0%`**，死亡谷 **`0.0%`**，多图保留 **`87.5%`**，低流过滤/补全 **`100.0%`**，问号 **`0.0%`** | vs R0 决出胜负局胜率 **12W/2L/8T (`85.7%`)**（R1 `66.7%` -> R2 `66.7%` -> R4/R5 **`85.7%`**） |
+| **MLU 初筛** | 有证据通过 `66.7%`，噪音拒绝 `73.3%` | 有证据通过 **`66.7%`**，噪音拒绝 **`100.0%`** | 禁止无立场快讯靠“带图臆测可补全”过关 |
+| **MLU 提取** | Schema `100.0%`，独立自洽 `100.0%` | Schema **`100.0%`**，独立自洽 **`100.0%`** | 保持多模态客观 `exchange_ui` 标注与 100% 抽象原则 |
+| **发布前总编精选** | 富形态入选 **`80.0%`**，弱形态 `0.0%` | 富形态入选 **`100.0%`**，弱形态 **`0.0%`**，碰撞 `0.0%`，平均配图 `2.6` 张 | 候选显式注入图数与字数元数据并严禁总编私改文案 |
+
+---
+
+## 六、策略到代码与提示词的落地映射
 
 | 实证规则 | 落地代码 / 提示词位置 |
 | :--- | :--- |
 | 客观标注图片交易所界面但不上游封杀 | [内容生成方案_分析类MLU提取.txt](prompt/内容生成方案_分析类MLU提取.txt)、[内容生成方案_娱乐类_单帖洗稿和神评生成.txt](prompt/内容生成方案_娱乐类_单帖洗稿和神评生成.txt)、[mlu_pipeline.py](parser/mlu_pipeline.py)、[article_generator.py](parser/article_generator.py) |
-| 发布层按目标平台精准拦截竞品截图与 `$OKB` | [platform_adapters.py](parser/platform_adapters.py)（`normalize_exchange_ui` / `has_rival_exchange_ui` / `has_rival_keyword`）、[publisher_arena.py](parser/publisher_arena.py) |
-| 账号级合并冷却（`>= 3h`）+ 并发互斥占锁 | [config.py](parser/config.py)、[publish_state.py](parser/publish_state.py)（`can_publish` / `try_claim_account`）、[publisher_arena.py](parser/publisher_arena.py) |
-| 慎重拦截纯粹带单/赌博/未成年，不误杀正常聊天图 | [内容生成方案_娱乐类_单帖可用性筛选.txt](prompt/内容生成方案_娱乐类_单帖可用性筛选.txt)、[内容生成方案_娱乐类_单帖洗稿和神评生成.txt](prompt/内容生成方案_娱乐类_单帖洗稿和神评生成.txt) |
-| 精准标签（无准确币种就不给，不拼无关热词） | [platform_adapters.py](parser/platform_adapters.py)（`add_hot_topic_to_article` / `_format_analysis_post_content`）、[publisher_arena.py](parser/publisher_arena.py) |
-| 关闭矩阵互评互赞 | [article_format_logical.py](parser/article_format_logical.py)（`TASK_SWITCHES["hudong"] = False`） |
-| `content_status` / `recommend` / `lan` 诊断落库 | [platform_adapters.py](parser/platform_adapters.py)（`sync_published_metrics`） |
+| 发布层按目标平台精准拦截竞品截图与竞品词（含单字母 `$` 防错绑） | [platform_adapters.py](parser/platform_adapters.py)（`normalize_exchange_ui` / `has_rival_exchange_ui` / `has_rival_keyword`）、[publisher_arena.py](parser/publisher_arena.py) |
+| 异常号 `qiqi` 隔离与零网络健康守卫 + 账号级合并冷却 | [common_utils.py](common/common_utils.py)（`BINANCE_ACCOUNTS`）、[config.py](parser/config.py)、[publish_state.py](parser/publish_state.py)、[publisher_arena.py](parser/publisher_arena.py) |
+| 140~255 字 / `>=2` 图 / 禁反问 / 零幻觉全链路质量收敛 | [article_generator.py](parser/article_generator.py)（`transform_mlus` / `build_article_task` / `build_viral_article_task`）、[内容生成方案_分析类MLU初筛.txt](prompt/内容生成方案_分析类MLU初筛.txt)、[内容生成方案_分析类文章生成.txt](prompt/内容生成方案_分析类文章生成.txt)、[内容生成方案_分析类_发布前总编精选.txt](prompt/内容生成方案_分析类_发布前总编精选.txt)、[内容生成方案_娱乐类_发布前总编精选.txt](prompt/内容生成方案_娱乐类_发布前总编精选.txt) |
+| 慎重拦截纯粹带单/赌博/未成年/平台恶意攻击，不误杀正常聊天与合规讨论 | [内容生成方案_娱乐类_单帖可用性筛选.txt](prompt/内容生成方案_娱乐类_单帖可用性筛选.txt)、[内容生成方案_娱乐类_单帖洗稿和神评生成.txt](prompt/内容生成方案_娱乐类_单帖洗稿和神评生成.txt) |
+| 精准标签（核心分析币池、无准确币种就不给、不拼无关热词） | [platform_adapters.py](parser/platform_adapters.py)（`hot_coins` / `add_hot_topic_to_article` / `_format_analysis_post_content`）、[publisher_arena.py](parser/publisher_arena.py) |
+| 关闭矩阵互评互赞 & 诊断指标落库 | [article_format_logical.py](parser/article_format_logical.py)（`TASK_SWITCHES["hudong"] = False`）、[platform_adapters.py](parser/platform_adapters.py)（`sync_published_metrics`） |
