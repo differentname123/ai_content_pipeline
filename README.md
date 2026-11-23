@@ -3,7 +3,7 @@
 本项目是面向 **Binance 广场、OKX 星球 (Orbit) 与 X (Twitter)** 的自动化内容采集、多模态 AI 筛选创作、总编擂台选稿发布与高质量神评互动系统，支持 Windows / Linux / macOS 跨平台无人值守运行。
 
 > [!IMPORTANT]
-> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`AGENTS.md`](AGENTS.md) 中的核心安全与架构红线（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。
+> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`AGENTS.md`](AGENTS.md) 中的核心安全与架构红线（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。涉及币安广场内容选品、账号风控、标签规则与发帖频控调整时，请同步查阅实证分析文档 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md)。
 
 ---
 
@@ -15,6 +15,7 @@
 ai_content_pipeline/
 ├── PROJECT_PRINCIPLES.md             # 设计理念与维护红线
 ├── AGENTS.md                         # AI 协作者核心红线守则
+├── BINANCE_SQUARE_OPERATIONS.md      # 币安广场实证流量诊断与运营守则
 ├── requirements.txt                  # 运行时精准依赖清单
 ├── config/config.json                # MongoDB、模型网关权重、代理、会话目录配置
 │
@@ -53,13 +54,13 @@ ai_content_pipeline/
 │   └── pipeline_runner.py            # 全自动双环/人工指定方向/纯素材直通一键总控入口
 │
 ├── parser/                           # 【生产守护进程 1】Binance / OKX 内容采编发布流水线
-│   ├── config.py                     # 统一调参中心（提示词版本、冷却时长、阈值、互动开关、字数规则）
-│   ├── publish_state.py              # 线程安全账号发帖状态与间隔冷却中心（不启用失败退避阻塞）
-│   ├── platform_adapters.py          # 双平台发帖格式、热币缓存、竞品词检查、免登阅读/互动指标同步
+│   ├── config.py                     # 统一调参中心（提示词版本、账号级全局冷却、阈值、互动开关、字数规则）
+│   ├── publish_state.py              # 线程安全账号级全局冷却、并发占锁与状态中心（不启用失败退避阻塞）
+│   ├── platform_adapters.py          # 双平台发帖格式、竞品词与竞品UI分流检查、精准标签、免登阅读/风控指标同步
 │   ├── post_ingestion.py             # 双平台热榜/推荐流采集与原帖校验归一化
-│   ├── mlu_pipeline.py               # 分析帖纯文本初筛与多模态论据（MLU）精提
+│   ├── mlu_pipeline.py               # 分析帖纯文本初筛与多模态论据（MLU）精提（含 `exchange_ui` 客观标注）
 │   ├── article_generator.py          # 高流量一阶段粗筛、单币分析生成、高流量二阶段洗稿（记录真实 model_used）
-│   ├── publisher_arena.py            # 7 天 dHash 图片去重、发布前账号零成本预检、Top-50 总编擂台选稿发布
+│   ├── publisher_arena.py            # 7 天 dHash 图片去重、竞品UI跨平台分流、发布前账号并发锁与预检、Top-50 总编擂台
 │   ├── maintenance_tasks.py          # 评论区互评/点赞、按时间/行情删帖与人工抽样复盘工具
 │   └── article_format_logical.py     # 任务总开关（TASK_SWITCHES 首屏配置）与主控入口（`--once` / `--tasks` / `--dry-run`）
 │

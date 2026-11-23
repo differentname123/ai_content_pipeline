@@ -12,19 +12,26 @@ from unittest.mock import MagicMock, patch
 from PIL import Image
 
 from parser.article_generator import (
+    _convert_viral_article_info,
     build_article_task,
     build_viral_article_task,
+    check_viral_article_info,
     execute_article_task,
     execute_viral_article_task,
     generate_analysis_articles,
     generate_viral_articles,
+    transform_mlus,
 )
+from parser.mlu_pipeline import check_format_info
 from parser.platform_adapters import (
     BinancePlatform,
+    OkxPlatform,
     _build_publish_text_list,
     _format_analysis_post_content,
     _format_viral_post_content,
+    has_rival_exchange_ui,
     has_rival_keyword,
+    normalize_exchange_ui,
     sync_published_metrics,
 )
 from parser.post_ingestion import (
@@ -107,23 +114,55 @@ class TestPublishStateStore(unittest.TestCase):
             self.assertNotIn("viral_backoff_reason", snap_after_viral_fail)
             self.assertEqual(snap_after_viral_fail["viral_consecutive_failures"], 1)
 
-            # Success resets consecutive_failures, cleans legacy backoff keys, and enforces 6h cooldown + 2h topic cooldown
+            # Success resets consecutive_failures, cleans legacy backoff keys, and enforces 3h account-level cooldown + 2h topic cooldown
             t1 = t0 + 100
             store.record_success("binance", "ruru", is_viral=False, topic="BTC", now=t1)
             snap = store.get_account_state("binance", "ruru")
             self.assertNotIn("backoff_until", snap)
             self.assertNotIn("backoff_reason", snap)
             self.assertEqual(snap["consecutive_failures"], 0)
+            self.assertEqual(snap["account_last_publish_time"], t1)
+            self.assertEqual(snap["last_publish_type"], "analysis")
             self.assertTrue(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 3600))
             self.assertFalse(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 7201))
 
-            # Analysis cooldown is 6h, independent from viral eligibility
-            ok_before_6h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 5 * 3600)
-            ok_after_6h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 6 * 3600 + 1)
-            ok_viral, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 5 * 3600)
-            self.assertFalse(ok_before_6h)
-            self.assertTrue(ok_after_6h)
-            self.assertTrue(ok_viral)
+            # Analysis & viral share the same account-level global cooldown (3h)
+            ok_before_3h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 2 * 3600)
+            ok_viral_before_3h, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 2 * 3600)
+            ok_after_3h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 3 * 3600 + 1)
+            ok_viral_after_3h, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 3 * 3600 + 1)
+            self.assertFalse(ok_before_3h)
+            self.assertFalse(ok_viral_before_3h)
+            self.assertTrue(ok_after_3h)
+            self.assertTrue(ok_viral_after_3h)
+
+    def test_account_global_cooldown_legacy_compat_and_try_claim_concurrency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "legacy_state.json"
+            t0 = 1_700_000_000.0
+            # Legacy JSON with only viral_last_publish_time (no account_last_publish_time)
+            state_path.write_text(
+                json.dumps({"binance": {"myself": {"viral_last_publish_time": t0}}}),
+                encoding="utf-8",
+            )
+            store = AccountPublishStateStore(str(state_path))
+            ok_an, reason_an = store.can_publish("binance", "myself", is_viral=False, now=t0 + 1800)
+            self.assertFalse(ok_an)
+            self.assertIn("账号全局发布冷却中", reason_an)
+
+            # After cooldown passes, try_claim_account prevents concurrent claim across types
+            t_ready = t0 + 3 * 3600 + 5
+            claimed1, _ = store.try_claim_account("binance", "myself", is_viral=False, now=t_ready)
+            self.assertTrue(claimed1)
+            claimed2, reason2 = store.try_claim_account("binance", "myself", is_viral=True, now=t_ready + 1)
+            self.assertFalse(claimed2)
+            self.assertIn("正在执行中", reason2)
+            ok_while_claimed, _ = store.can_publish("binance", "myself", is_viral=True, now=t_ready + 1)
+            self.assertFalse(ok_while_claimed)
+
+            store.release_account("binance", "myself")
+            ok_after_release, _ = store.can_publish("binance", "myself", is_viral=True, now=t_ready + 1)
+            self.assertTrue(ok_after_release)
 
     def test_thread_safety_smoke(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,9 +189,31 @@ class TestPlatformAdapters(unittest.TestCase):
     def test_has_rival_keyword(self):
         self.assertTrue(has_rival_keyword("binance", "我在 OKX 上交易"))
         self.assertTrue(has_rival_keyword("binance", "欧易最新公告"))
+        self.assertTrue(has_rival_keyword("binance", "$OKB 日线突破前高"))
+        self.assertFalse(has_rival_keyword("binance", "lookbook 观察笔记"))
         self.assertFalse(has_rival_keyword("binance", "Binance BTC setup"))
         self.assertTrue(has_rival_keyword("okx", "在币安看到一个信号"))
         self.assertFalse(has_rival_keyword("okx", "OKX ETH setup"))
+
+    def test_normalize_and_has_rival_exchange_ui(self):
+        self.assertEqual(normalize_exchange_ui(None), "")
+        self.assertEqual(normalize_exchange_ui("  "), "")
+        self.assertEqual(normalize_exchange_ui("none"), "")
+        self.assertEqual(normalize_exchange_ui("无"), "")
+        self.assertEqual(normalize_exchange_ui("Binance"), "binance")
+        self.assertEqual(normalize_exchange_ui("币安"), "binance")
+        self.assertEqual(normalize_exchange_ui("OKEX"), "okx")
+        self.assertEqual(normalize_exchange_ui("欧易"), "okx")
+        self.assertEqual(normalize_exchange_ui("Bybit"), "bybit")
+        self.assertEqual(normalize_exchange_ui("某不知名App 界面"), "other")
+
+        self.assertFalse(has_rival_exchange_ui("binance", ["", "binance"]))
+        self.assertTrue(has_rival_exchange_ui("binance", ["binance", "okx"]))
+        self.assertTrue(has_rival_exchange_ui("binance", ["bybit"]))
+        self.assertFalse(has_rival_exchange_ui("okx", ["", "okx"]))
+        self.assertTrue(has_rival_exchange_ui("okx", ["binance"]))
+        # X 等非交易所平台不受竞品交易所 UI 限制
+        self.assertFalse(has_rival_exchange_ui("x", ["binance", "okx", "bybit"]))
 
     def test_build_publish_text_list_splits_coin_tags_with_newline(self):
         segments = _build_publish_text_list("$BTC 看多结构明确\n$ETH 同步放量")
@@ -164,14 +225,11 @@ class TestPlatformAdapters(unittest.TestCase):
 
     def test_binance_decorate_analysis(self):
         adapter = BinancePlatform()
-        with patch("parser.platform_adapters.fetch_binance_hot_hashtags", return_value=[{"hashtag": "#HotCrypto"}]), \
-             patch("parser.platform_adapters.fetch_binance_future_hot_coins", return_value=[{"symbol": "ETHUSDT"}]):
-            decorated = adapter.decorate_analysis("BTC 突破关键阻力", "BTC")
-        self.assertIn("#HotCrypto", decorated)
-        self.assertIn("#BTC", decorated)
-        self.assertIn("$BTC ", decorated)
-        self.assertIn("#ETH", decorated)
-        self.assertIn("$ETH ", decorated)
+        decorated = adapter.decorate_analysis("BTC 突破关键阻力", "BTC")
+        self.assertEqual(decorated, "BTC 突破关键阻力\n\n#BTC\n$BTC ")
+        self.assertEqual(adapter.decorate_analysis("宏观流动性承压", "MARKET"), "宏观流动性承压")
+        self.assertEqual(adapter.decorate_analysis("无明确币种正文", ""), "无明确币种正文")
+        self.assertEqual(OkxPlatform().decorate_analysis("宏观流动性承压", "MARKET"), "宏观流动性承压")
 
     def test_format_analysis_and_viral_post_content_fixes(self):
         an_art = {
@@ -182,25 +240,40 @@ class TestPlatformAdapters(unittest.TestCase):
                 "image_mapping": {},
             },
         }
-        with patch("parser.platform_adapters.fetch_binance_hot_hashtags", return_value=[{"hashtag": "#Hot"}]), \
-             patch("parser.platform_adapters.fetch_binance_future_hot_coins", return_value=[{"symbol": "BTCUSDT"}]):
-            bn_text, _ = _format_analysis_post_content(an_art, platform="binance")
+        bn_text, _ = _format_analysis_post_content(an_art, platform="binance")
         self.assertTrue(bn_text.startswith("$ZEC 破800"))
         self.assertNotIn("$ZEC ZEC", bn_text)
+        self.assertIn("#ZEC\n$ZEC ", bn_text)
         self.assertNotIn("\n\n\n\n\n\n👇", bn_text)
         self.assertIn("\n\n👇", bn_text)
+
+        market_art = {
+            "topic": "MARKET",
+            "article_info": {
+                "text": "宏观流动性收缩压制风险资产。",
+                "image_placeholders": [],
+                "image_mapping": {},
+            },
+        }
+        market_text, _ = _format_analysis_post_content(market_art, platform="binance")
+        self.assertTrue(market_text.startswith("宏观流动性收缩压制风险资产。"))
+        self.assertNotIn("$MARKET", market_text)
+        self.assertNotIn("#MARKET", market_text)
 
         okx_text, _ = _format_analysis_post_content(an_art, platform="okx")
         self.assertTrue(okx_text.startswith("$ZEC 破800"))
         self.assertNotIn("$ZEC ZEC", okx_text)
 
-        # Viral: existing $SYMBOL preserves opening hook; missing $SYMBOL appends cleanly at tail
+        # Viral: existing $SYMBOL preserves opening hook; missing $SYMBOL appends cleanly; empty coin keeps text clean
         v_with_tag, _ = _format_viral_post_content({"post_text": "凌晨暴跌，我的 $DOGE 多单扛不住了", "selected_images": [], "image_mapping": {}}, "BTC")
         self.assertTrue(v_with_tag.startswith("凌晨暴跌"))
         self.assertNotIn("$BTC", v_with_tag)
 
         v_no_tag, _ = _format_viral_post_content({"post_text": "三十天账面蒸发四千万", "selected_images": [], "image_mapping": {}}, "BTC")
         self.assertEqual(v_no_tag, "三十天账面蒸发四千万\n\n$BTC")
+
+        v_no_coin, _ = _format_viral_post_content({"post_text": "三十天账面蒸发四千万", "selected_images": [], "image_mapping": {}}, "")
+        self.assertEqual(v_no_coin, "三十天账面蒸发四千万")
 
     def test_sync_published_metrics_refreshes_until_mature_and_marks_ramping(self):
         now = 1_800_000_000.0
@@ -242,26 +315,40 @@ class TestPlatformAdapters(unittest.TestCase):
                     }
                 },
             },
+            {
+                "article_id": "a_blocked",
+                "topic": "BTC",
+                "stance": "看空",
+                "article_info": {"text": "被风控隐藏 status=5 的帖子"},
+                "publish_records": {"binance": {"post_id": "104", "published_by": "myself", "publish_time": now - 3600, "view_count": None}},
+            },
         ]
         mock_mgr = MagicMock(spec=["upsert_articles"])
 
         def _fake_detail(pid):
             if pid == "101":
-                return {"contentStatus": 2, "viewCount": 18, "likeCount": 0, "commentCount": 0}
+                return {"contentStatus": 2, "viewCount": 18, "likeCount": 0, "commentCount": 0, "recommend": True, "lan": "cn", "detectedLang": "zh-CN"}
             if pid == "102":
-                return {"contentStatus": 2, "viewCount": 680, "likeCount": 4, "commentCount": 2}
+                return {"contentStatus": 2, "viewCount": 680, "likeCount": 4, "commentCount": 2, "recommend": True, "lan": "en", "detectedLang": "zh-CN"}
+            if pid == "104":
+                return {"contentStatus": 5, "viewCount": None, "recommend": False, "lan": None, "detectedLang": None}
             raise AssertionError(f"settled post {pid} should not be re-fetched")
 
         with patch("parser.platform_adapters.fetch_binance_post_detail", side_effect=_fake_detail) as mock_fetch:
             hist = sync_published_metrics(mock_mgr, "binance", docs, now_ts=now)
 
-        self.assertEqual(mock_fetch.call_count, 2)
+        self.assertEqual(mock_fetch.call_count, 3)
         mock_mgr.upsert_articles.assert_called_once()
         self.assertEqual(hist[0]["views"], "爬坡中(发布<2h)")
         self.assertFalse(hist[0]["is_mature"])
         self.assertEqual(hist[1]["views"], 680)
         self.assertTrue(hist[1]["is_mature"])
         self.assertEqual(hist[2]["views"], 500)
+        self.assertEqual(docs[1]["publish_records"]["binance"]["lan"], "en")
+        self.assertEqual(docs[1]["publish_records"]["binance"]["recommend"], True)
+        self.assertEqual(docs[3]["publish_records"]["binance"]["content_status"], 5)
+        self.assertIs(docs[3]["publish_records"]["binance"]["recommend"], False)
+        self.assertIsNone(docs[3]["publish_records"]["binance"]["view_count"])
 
 
 class TestArticleGenerator(unittest.TestCase):
@@ -329,7 +416,7 @@ class TestArticleGenerator(unittest.TestCase):
             v_task = build_viral_article_task(viral_post)
             self.assertIsNone(v_task["record"]["model_name"])
             viral_resp = {
-                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "交易爆仓图", "keep": True}],
+                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "交易爆仓图", "exchange_ui": "", "keep": True}],
                 "selected_images": ["[IMAGE_1]"],
                 "global_truth": "人性总在极限杠杆后后悔",
                 "feasibility_audit": "画面直观，可独立传播",
@@ -348,8 +435,90 @@ class TestArticleGenerator(unittest.TestCase):
 
             self.assertEqual(v_saved["status"], "ok")
             self.assertEqual(v_saved["model_name"], "real-viral-model-v2")
+            self.assertEqual(v_saved["article_info"]["image_mapping"]["[IMAGE_1]"]["exchange_ui"], "")
             self.assertIsNone(mock_v_llm.call_args.kwargs["model"])
             self.assertEqual(mock_v_llm.call_args.kwargs["preset_model_group"], "medium")
+
+    def test_exchange_ui_validation_and_propagation(self):
+        mlu_bad = {
+            "evidences": [
+                {
+                    "target_coin": "BTC",
+                    "stance": "看多",
+                    "dimension": "资金流",
+                    "core_fact": "鲸鱼提币",
+                    "logic_link": "抛压减少",
+                    "raw_hook": "",
+                    "impact_reason": "直观",
+                    "impact_weight": 4,
+                    "shelf_life": "days",
+                    "images": [
+                        {
+                            "image_id": "[IMAGE_1]",
+                            "image_type": "收益截图",
+                            "context": "实盘",
+                            "usable": True,
+                            "unusable_reason": "",
+                        }
+                    ],
+                }
+            ]
+        }
+        ok_bad, _ = check_format_info(mlu_bad, ["[IMAGE_1]"])
+        self.assertFalse(ok_bad)
+
+        mlu_ok = json.loads(json.dumps(mlu_bad))
+        mlu_ok["evidences"][0]["images"][0]["exchange_ui"] = "欧易"
+        ok_good, err_good = check_format_info(mlu_ok, ["[IMAGE_1]"])
+        self.assertTrue(ok_good, err_good)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = _create_tiny_png(Path(tmp), "okx_ui.png")
+            ev_list = [
+                {
+                    **mlu_ok["evidences"][0],
+                    "source": "okx",
+                    "source_post_id": "p_okx_1",
+                    "source_image_mapping": {
+                        "[IMAGE_1]": {"original_placeholder": "[插图: https://x/okx.png]", "original_url": "https://x/okx.png", "local_path": img_path}
+                    },
+                }
+            ]
+            mats, mapping = transform_mlus(ev_list)
+            self.assertEqual(len(mats), 1)
+            self.assertEqual(mapping["[ASSET_IMG_1]"]["exchange_ui"], "okx")
+
+            # Viral schema validation & normalization
+            v_post = {
+                "source": "binance",
+                "post_id": "v_ex_1",
+                "content": {"text_content": "爆仓图\n[插图: https://x/okx.png]"},
+                "media": {"local_mapping": {"https://x/okx.png": img_path}},
+                "comments": [],
+                "viral_screen": {"event_key": "test_ui"},
+            }
+            v_task = build_viral_article_task(v_post)
+            v_bad = {
+                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "持仓图", "keep": True}],
+                "selected_images": ["[IMAGE_1]"],
+                "global_truth": "真实爆仓",
+                "feasibility_audit": "ok",
+                "usable": True,
+                "topic_tag": "搞钱与盈亏",
+                "expression_strategy": "保留",
+                "post_text": "直接爆了",
+                "bait_comments": ["笑死"],
+                "viral_score": 8.0,
+            }
+            v_ok_flag, _ = check_viral_article_info(v_bad, ["[IMAGE_1]"], 260)
+            self.assertFalse(v_ok_flag)
+
+            v_bad["image_semantics"][0]["exchange_ui"] = "币安"
+            v_ok_flag2, v_err2 = check_viral_article_info(v_bad, ["[IMAGE_1]"], 260)
+            self.assertTrue(v_ok_flag2, v_err2)
+            converted = _convert_viral_article_info(v_bad, v_task)
+            self.assertEqual(converted["image_semantics"][0]["exchange_ui"], "binance")
+            self.assertEqual(converted["image_mapping"]["[IMAGE_1]"]["exchange_ui"], "binance")
 
     def test_generation_polling_intervals_split_analysis_and_viral(self):
         import parser.config as pcfg
@@ -380,16 +549,120 @@ class TestPublisherArena(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = AccountPublishStateStore(str(Path(tmp) / "state.json"))
             now = time.time()
-            # Force all configured binance accounts into normal 6h publish cooldown
+            # Force all configured binance accounts into normal 3h account-level cooldown
             with patch("parser.publisher_arena.PLATFORM_ACCOUNTS", {"binance": ["myself", "ruru"]}):
                 store.record_success("binance", "myself", is_viral=False, now=now)
                 store.record_success("binance", "ruru", is_viral=False, now=now)
                 mock_mgr = MagicMock()
                 with patch("parser.publisher_arena.call_llm_json") as mock_llm:
                     _publish_articles_for_platform(mock_mgr, "binance", ["BTC"], ARTICLE_TYPE_ANALYSIS, state_store=store)
+                    # Analysis cooldown also blocks viral on the same accounts
+                    _publish_articles_for_platform(mock_mgr, "binance", ["BTC"], ARTICLE_TYPE_VIRAL, state_store=store)
 
                 mock_mgr.find_articles.assert_not_called()
                 mock_llm.assert_not_called()
+
+    def test_rival_image_ui_cross_platform_routing_and_accurate_viral_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img_okx = _create_tiny_png(Path(tmp), "ui_okx.png")
+            img_bn = _create_tiny_png(Path(tmp), "ui_bn.png")
+            img_clean = _create_tiny_png(Path(tmp), "ui_clean.png")
+            img_legacy = _create_tiny_png(Path(tmp), "ui_legacy.png")
+
+            def _make_viral(aid, img_path, ui, post_text, orig_text="原帖提到 $JCT", source="binance", include_ui_field=True):
+                meta = {"local_path": img_path, "original_url": f"https://img/{aid}.png", "content_id": f"cid_{aid}"}
+                sem = {"id": "[IMAGE_1]", "semantic_role": "截图", "keep": True}
+                if include_ui_field:
+                    meta["exchange_ui"] = ui
+                    sem["exchange_ui"] = ui
+                return {
+                    "article_id": aid,
+                    "source": source,
+                    "type": ARTICLE_TYPE_VIRAL,
+                    "prompt_version": prompt_version,
+                    "status": "ok",
+                    "creation_brief": {"original_post": {"text_content": orig_text}},
+                    "post_id_list": [aid],
+                    "article_info": {
+                        "status": "ok",
+                        "usable": True,
+                        "post_text": post_text,
+                        "selected_images": ["[IMAGE_1]"],
+                        "image_semantics": [sem],
+                        "viral_score": 8.5,
+                        "bait_comments": ["笑死"],
+                        "image_mapping": {"[IMAGE_1]": meta},
+                    },
+                    "publish_records": {},
+                }
+
+            arts = [
+                _make_viral("v_okx_ui", img_okx, "okx", "麻吉大哥昨晚又加仓爆掉 2000 万刀"),
+                _make_viral("v_bn_ui", img_bn, "binance", "SOL 跌破前低引发连环止损"),
+                _make_viral("v_clean", img_clean, "", "昨晚全网吃瓜现场"),
+                _make_viral("v_legacy", img_legacy, "", "$ETH 资金费率转负了", include_ui_field=False),
+            ]
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.return_value = arts
+            mock_mgr.db = MagicMock()
+
+            bn_cands, _, bn_stats = _collect_publish_candidates(mock_mgr, "binance", ["JCT"], set(), ARTICLE_TYPE_VIRAL)
+            self.assertEqual(bn_stats["rival_image_ui"], 1)
+            bn_by_id = {c[0]["article_id"]: c[2] for c in bn_cands}
+            self.assertEqual(set(bn_by_id.keys()), {"v_bn_ui", "v_clean", "v_legacy"})
+            # Original noisy JCT does NOT pollute clean post_text; SOL & ETH extracted cleanly; pure story keeps ""
+            self.assertEqual(bn_by_id["v_bn_ui"], "SOL")
+            self.assertEqual(bn_by_id["v_clean"], "")
+            self.assertEqual(bn_by_id["v_legacy"], "ETH")
+
+            okx_cands, _, okx_stats = _collect_publish_candidates(mock_mgr, "okx", ["JCT"], set(), ARTICLE_TYPE_VIRAL)
+            self.assertEqual(okx_stats["rival_image_ui"], 1)
+            okx_ids = {c[0]["article_id"] for c in okx_cands}
+            self.assertEqual(okx_ids, {"v_okx_ui", "v_clean", "v_legacy"})
+
+    def test_publish_articles_for_platform_skips_claimed_and_releases_on_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountPublishStateStore(str(Path(tmp) / "claim_state.json"))
+            img_p = _create_tiny_png(Path(tmp), "claim.png")
+            art = {
+                "_id": "mongo_1",
+                "article_id": "art_claim",
+                "source": "binance",
+                "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "creation_brief": {"original_post": {"text_content": "BTC 测试"}},
+                "post_id_list": ["p_claim"],
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "$BTC 波动剧烈",
+                    "selected_images": ["[IMAGE_1]"],
+                    "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "K线", "exchange_ui": "", "keep": True}],
+                    "viral_score": 8.5,
+                    "bait_comments": ["稳"],
+                    "image_mapping": {"[IMAGE_1]": {"local_path": img_p, "original_url": "https://x/c.png", "content_id": "cid_c", "exchange_ui": ""}},
+                },
+                "publish_records": {},
+            }
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.side_effect = [[], [art], []]
+            mock_mgr.collection_name = "generated_articles"
+
+            # Pre-claim "myself" as if another thread is publishing it concurrently
+            self.assertTrue(store.try_claim_account("binance", "myself", is_viral=False)[0])
+            try:
+                with patch("parser.publisher_arena.PLATFORM_ACCOUNTS", {"binance": ["myself", "ruru"]}), \
+                     patch("parser.publisher_arena.call_llm_json", return_value=({"selected_candidate_no": 1, "reason": "ok"}, {"ok": True, "model_used": "m1"})), \
+                     patch("parser.publisher_arena._execute_platform_post", side_effect=RuntimeError("boom")) as mock_exec:
+                    with self.assertRaises(RuntimeError):
+                        _publish_articles_for_platform(mock_mgr, "binance", ["BTC"], ARTICLE_TYPE_VIRAL, state_store=store)
+                    # Only "ruru" should have been attempted because "myself" was claimed
+                    self.assertEqual(mock_exec.call_count, 1)
+                # "ruru" must be released even after exception in finally block
+                self.assertTrue(store.can_publish("binance", "ruru", is_viral=True)[0])
+            finally:
+                store.release_account("binance", "myself")
 
     def test_okx_viral_skips_okx_sourced_articles(self):
         with tempfile.TemporaryDirectory() as tmp:

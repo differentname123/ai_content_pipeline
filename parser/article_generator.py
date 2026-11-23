@@ -31,7 +31,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 from parser.config import ANALYSIS_GENERATION_INTERVAL_SECONDS
 from parser.mlu_pipeline import _resolve_prompt_pair, run_concurrent_screening_batches
-from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _log, get_hot_coin, logger
+from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _log, get_hot_coin, logger, normalize_exchange_ui
 from parser.post_ingestion import (
     ARTICLE_CONCURRENCY,
     ARTICLE_GENERATION_INTERVAL_SECONDS,
@@ -348,6 +348,7 @@ def transform_mlus(mlu_list: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, A
             local_path = meta.get("local_path") or ""
             content_id = get_image_content_id(local_path)
             source_key = ("content_id", content_id) if content_id else (ev_source, evidence.get("source_post_id"), image_id)
+            ex_ui = normalize_exchange_ui(image.get("exchange_ui"))
             placeholder = asset_by_source.get(source_key)
             if placeholder is None:
                 placeholder = f"[ASSET_IMG_{len(asset_by_source) + 1}]"
@@ -358,8 +359,11 @@ def transform_mlus(mlu_list: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, A
                     "original_image_id": image_id,
                     "original_image_id_list": [image_id],
                     "content_id": content_id,
+                    "exchange_ui": ex_ui,
                     **meta,
                 }
+            elif ex_ui and not image_mapping[placeholder].get("exchange_ui"):
+                image_mapping[placeholder]["exchange_ui"] = ex_ui
             visual_items.append({"placeholder": placeholder, "what_it_shows": image["context"]})
         material["visual_evidence"] = visual_items[0] if len(visual_items) == 1 else visual_items
     return materials, image_mapping
@@ -896,11 +900,20 @@ def check_viral_article_info(raw_info: Any, placeholders: Sequence[str], max_cha
     for item in image_semantics:
         if not isinstance(item, dict):
             return False, "image_semantics 中的元素必须是字典对象"
-        img_id, role, keep = item.get("id"), item.get("semantic_role"), item.get("keep")
+        if "exchange_ui" not in item:
+            return False, f"图片 {item.get('id')!r} 缺少 exchange_ui 字段"
+        img_id, role, keep, ex_ui = (
+            item.get("id"),
+            item.get("semantic_role"),
+            item.get("keep"),
+            item.get("exchange_ui"),
+        )
         if not isinstance(img_id, str) or img_id not in placeholders:
             return False, f"image_semantics.id ({img_id!r}) 不在原帖真实图片占位符 {sorted(placeholders)} 中"
         if not isinstance(role, str) or not role.strip():
             return False, f"图片 {img_id} 的 semantic_role 必须是非空字符串"
+        if ex_ui is not None and not isinstance(ex_ui, str):
+            return False, f"图片 {img_id} 的 exchange_ui 必须是字符串或 null"
         if not isinstance(keep, bool):
             return False, f"图片 {img_id} 的 keep 必须是布尔值"
         parsed_ids.append(img_id)
@@ -1141,12 +1154,21 @@ def _convert_viral_article_info(raw: Dict[str, Any], task: Dict[str, Any]) -> Di
     record = task["record"]
     usable = raw["usable"]
     record["topic"] = raw["topic_tag"] if usable else "无效噪音"
+    normalized_semantics: List[Dict[str, Any]] = []
+    exchange_ui_by_id: Dict[str, str] = {}
+    for item in raw["image_semantics"]:
+        clean_item = dict(item)
+        ex_ui = normalize_exchange_ui(clean_item.get("exchange_ui"))
+        clean_item["exchange_ui"] = ex_ui
+        normalized_semantics.append(clean_item)
+        if clean_item.get("id"):
+            exchange_ui_by_id[clean_item["id"]] = ex_ui
     info: Dict[str, Any] = {
         "status": "ok" if usable else "skip",
         "usable": usable,
         "decision_reason": raw["feasibility_audit"].strip(),
         "viral_analysis": raw["global_truth"].strip(),
-        "image_semantics": raw["image_semantics"],
+        "image_semantics": normalized_semantics,
         "topic_tag": record["topic"],
         "selected_images": [],
         "image_role": "",
@@ -1165,7 +1187,10 @@ def _convert_viral_article_info(raw: Dict[str, Any], task: Dict[str, Any]) -> Di
         used_material_ids=["M1"],
         bait_comments=[comment.strip() for comment in raw["bait_comments"]],
         viral_score=round(float(raw["viral_score"]), 1),
-        image_mapping={key: dict(task["image_mapping"][key]) for key in selected},
+        image_mapping={
+            key: {**dict(task["image_mapping"][key]), "exchange_ui": exchange_ui_by_id.get(key, "")}
+            for key in selected
+        },
     )
     return info
 

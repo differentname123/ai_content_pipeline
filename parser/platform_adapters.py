@@ -23,7 +23,6 @@ from common.common_utils import (
 from platforms.binance_api import (
     fetch_binance_feed,
     fetch_binance_future_hot_coins,
-    fetch_binance_hot_hashtags,
     fetch_binance_post_detail,
     fetch_binance_spot_hot_coins,
     get_latest_crypto_price,
@@ -41,6 +40,18 @@ logger = setup_logger(app_name="media_format")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
+_BINANCE_RIVAL_OKB_PATTERN = re.compile(r"(?<![a-z0-9])okb(?![a-z0-9])")
+_EMPTY_EXCHANGE_UI_VALUES = {"none", "null", "unknown", "n/a", "na", "无", "无交易所", "未知"}
+_EXCHANGE_UI_ALIASES = {
+    "binance": "binance",
+    "币安": "binance",
+    "bn": "binance",
+    "okx": "okx",
+    "okex": "okx",
+    "欧易": "okx",
+    "欧意": "okx",
+}
+_VALID_EXCHANGE_UI_RE = re.compile(r"^[a-z0-9_-]+$")
 
 METRICS_FIRST_SYNC_MIN_AGE_SECONDS = 600
 METRICS_MATURE_AGE_SECONDS = 24 * 3600
@@ -102,26 +113,54 @@ def _normalize_hot_coins(hot_coins: Optional[Sequence[Any]]) -> List[str]:
     return coins
 
 
+def normalize_exchange_ui(value: Any) -> str:
+    """将图片识别到的交易平台界面标识归一化为标准小写平台名（无明显交易平台界面返回空串）。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    raw = str(value).strip().lower()
+    if not raw or raw in _EMPTY_EXCHANGE_UI_VALUES:
+        return ""
+    if raw in _EXCHANGE_UI_ALIASES:
+        return _EXCHANGE_UI_ALIASES[raw]
+    compact = re.sub(r"\s+", "", raw)
+    if compact in _EXCHANGE_UI_ALIASES:
+        return _EXCHANGE_UI_ALIASES[compact]
+    if _VALID_EXCHANGE_UI_RE.fullmatch(compact):
+        return compact
+    return "other"
+
+
+def has_rival_exchange_ui(platform: str, exchange_ui_list: Sequence[Any]) -> bool:
+    """仅对交易所内容平台（Binance / OKX）拦截明确露出竞品交易所界面的配图；X 等非交易所平台放行。"""
+    target = str(platform or "").strip().lower()
+    if target not in (PLATFORM_BINANCE, PLATFORM_OKX) or not exchange_ui_list:
+        return False
+    items = (exchange_ui_list,) if isinstance(exchange_ui_list, str) else exchange_ui_list
+    for item in items:
+        ui = normalize_exchange_ui(item)
+        if ui and ui != target:
+            return True
+    return False
+
+
 def has_rival_keyword(platform: str, text: str) -> bool:
     """检查文本是否包含目标平台禁止提及的竞品关键词。"""
     lower = str(text or "").lower()
     if platform == PLATFORM_BINANCE:
-        return "okx" in lower or "欧易" in lower
+        return "okx" in lower or "欧易" in lower or bool(_BINANCE_RIVAL_OKB_PATTERN.search(lower))
     if platform == PLATFORM_OKX:
         return "binance" in lower or "币安" in lower
     return False
 
 
 def add_hot_topic_to_article(text: str, topic: str, tag_count: int = 2) -> str:
-    """为分析正文尾部追加 Binance 热门话题、主币种标签与合约热榜首币标签。"""
-    hashtags = [item["hashtag"] for item in (fetch_binance_hot_hashtags() or []) if isinstance(item, dict) and item.get("hashtag")]
-    tags = hashtags[:1] + [f"#{topic}", f"${topic} "]
-    hot_coins = fetch_binance_future_hot_coins() or []
-    if hot_coins and isinstance(hot_coins[0], dict) and hot_coins[0].get("symbol"):
-        symbol = hot_coins[0]["symbol"].replace("USDT", "").replace("USDC", "")
-        tags.extend([f"#{symbol}", f"${symbol} "])
-    logger.info(f"[文章/标签] 标签已准备 | 主题: [{topic}] | 标签: [{tags}]")
-    return text + "\n\n\n" + "\n".join(tags)
+    """仅追加与主题精准匹配的单一币种标签；无准确币种（如空值或 MARKET）则不强加标签。"""
+    clean_topic = str(topic or "").strip().upper()
+    if not clean_topic or clean_topic == "MARKET":
+        return text
+    tags = [f"#{clean_topic}", f"${clean_topic} "]
+    logger.info(f"[文章/标签] 精准标签已准备 | 主题: [{clean_topic}] | 标签: [{tags}]")
+    return text + "\n\n" + "\n".join(tags)
 
 
 def _build_publish_text_list(text: str) -> List[Dict[str, Any]]:
@@ -192,18 +231,7 @@ class BinancePlatform:
         )
 
     def decorate_analysis(self, text: str, topic: str) -> str:
-        try:
-            return add_hot_topic_to_article(text, topic)
-        except Exception as exc:
-            _log(
-                "发布/标签",
-                "拼装分析帖时获取热门标签失败，使用主题标签继续发布",
-                level="warning",
-                主题=topic,
-                原因=exc,
-                排查="检查 Binance 热榜接口与网络",
-            )
-            return f"{text}\n\n#{topic}\n${topic} "
+        return add_hot_topic_to_article(text, topic)
 
 
 class OkxPlatform:
@@ -251,7 +279,7 @@ class OkxPlatform:
         )
 
     def decorate_analysis(self, text: str, topic: str) -> str:
-        return f"{text}\n\n#{topic}\n${topic} "
+        return add_hot_topic_to_article(text, topic)
 
 
 PLATFORMS: Dict[str, Any] = {
@@ -303,7 +331,8 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
     """分析文章 -> `(最终发布正文, 有序本地图片路径列表)`。"""
     info = article["article_info"]
     topic, text = (article.get("topic") or "").strip(), info.get("text", "").strip()
-    if topic:
+    has_coin_topic = bool(topic and topic.upper() != "MARKET")
+    if has_coin_topic:
         # 使用 ASCII 字符边界匹配（兼容如 "ZEC破800" 紧贴中文），避免与前缀叠加出 "$ZEC ZEC" 重复
         text = re.sub(
             rf"(?<![A-Za-z0-9$]){re.escape(topic)}(?![A-Za-z0-9]) ?",
@@ -315,7 +344,7 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
     text = adapter.decorate_analysis(text, topic)
     if platform == PLATFORM_BINANCE:
         text += "\n\n👇"
-    if topic and not text.upper().startswith(f"${topic}".upper()):
+    if has_coin_topic and not text.upper().startswith(f"${topic}".upper()):
         text = f"${topic} {text}"
     mapping = info.get("image_mapping") or {}
     paths = [
@@ -417,12 +446,19 @@ def sync_published_metrics(
             try:
                 if platform == PLATFORM_BINANCE:
                     detail = fetch_binance_post_detail(str(pid))
-                    if detail and detail.get("contentStatus") == 2:
-                        views = rec["view_count"] = detail.get("viewCount", 0)
-                        likes = rec["like_count"] = detail.get("likeCount", 0)
-                        comments = rec["comment_count"] = detail.get("commentCount", 0)
-                        rec["metrics_synced_at"] = cur_ts
-                        need_upsert.append(d)
+                    if isinstance(detail, dict):
+                        content_status = detail.get("contentStatus")
+                        if content_status == 2:
+                            views = rec["view_count"] = detail.get("viewCount", 0)
+                            likes = rec["like_count"] = detail.get("likeCount", 0)
+                            comments = rec["comment_count"] = detail.get("commentCount", 0)
+                        if content_status is not None:
+                            rec["content_status"] = content_status
+                            rec["recommend"] = detail.get("recommend")
+                            rec["lan"] = detail.get("lan")
+                            rec["detected_lang"] = detail.get("detectedLang")
+                            rec["metrics_synced_at"] = cur_ts
+                            need_upsert.append(d)
                 elif platform == PLATFORM_OKX:
                     detail = fetch_okx_post_detail(str(pid))
                     if detail and detail.get("reviewState") == 2:

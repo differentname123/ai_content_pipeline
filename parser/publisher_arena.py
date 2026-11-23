@@ -3,13 +3,13 @@
 跨平台去重、总编 Top-50 擂台与自动发布调度引擎 (`parser/publisher_arena.py`)
 
 核心职责与进化点：
-1. 发布前零成本账号可用性预检：通过 `AccountPublishStateStore.get_eligible_accounts` 优先剔除
-   常规间隔冷却账号；全平台无可用账号时立即跳过，
-   **零 DB 查询、零指标同步、零总编大模型调用**；
+1. 发布前零成本账号可用性预检与并发互斥占用：通过 `AccountPublishStateStore` 统一校验
+   账号级全局间隔冷却（合并分析与流量帖）并通过 `try_claim_account` 防止双线程并发连发撞车；
+   全平台无可用账号时立即跳过，**零 DB 查询、零指标同步、零总编大模型调用**；
 2. 7 天跨文章类型视觉内容去重 (`content_id` dHash + URL + 本地路径) 与 2 小时同账号同币冷却；
-3. 保留 OKX 平台流量帖排除 OKX 原创 (`source == "okx"` -> `source_conflict`) 的跨平台搬运规范；
+3. 跨平台竞品内容与截图界面分流规范：校验文本竞品词及选中配图 `exchange_ui`，严禁竞品交易所界面发往对方平台，并保留 OKX 排除 OKX 原创帖规范；
 4. 总编横向擂台：拉取近 50 条历史战报与互动数据，剥离内部评分后经由 `common.llm_gateway.call_llm_json`
-   (`model=None, preset_model_group="medium"`) 选稿润色，记录真实 `selection_model_used` 并回写数据库。
+   (`model=None, preset_model_group="medium"`) 选稿，记录真实 `selection_model_used` 并回写数据库。
 """
 import json
 import math
@@ -32,6 +32,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 from parser.platform_adapters import (
     BEIJING_TZ,
+    COIN_TAG_PATTERN,
     PLATFORMS,
     _execute_platform_post,
     _format_analysis_post_content,
@@ -40,8 +41,10 @@ from parser.platform_adapters import (
     _log,
     _normalize_hot_coins,
     _safe_get_latest_price,
+    has_rival_exchange_ui,
     has_rival_keyword,
     logger,
+    normalize_exchange_ui,
     sync_published_metrics,
 )
 from parser.post_ingestion import (
@@ -50,7 +53,6 @@ from parser.post_ingestion import (
     ARTICLE_TYPE_ANALYSIS,
     ARTICLE_TYPE_VIRAL,
     IMAGE_DEDUP_LOOKBACK_HOURS,
-    MEDIA_PATTERN,
     OKX_SOURCE,
     PUBLISH_MAX_ATTEMPTS,
     PUBLISH_POLL_SECONDS,
@@ -67,6 +69,39 @@ from platforms.playwright_base import ChallengeRequiredError
 # ==============================================================================
 # 图片去重与候选筛选
 # ==============================================================================
+_VIRAL_CORE_COINS = ("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "FIL", "DOT")
+
+
+def _extract_selected_image_exchange_uis(article: Dict[str, Any]) -> List[str]:
+    """提取当前文章实际选中配图的交易平台界面标识列表（老数据缺失该字段时默认空串放行）。"""
+    info = article.get("article_info")
+    if not isinstance(info, dict):
+        return []
+    mapping = info.get("image_mapping")
+    if not isinstance(mapping, dict):
+        mapping = {}
+    placeholders = (
+        info.get("selected_images")
+        if article.get("type") == ARTICLE_TYPE_VIRAL
+        else info.get("image_placeholders")
+    )
+    if not isinstance(placeholders, list) or not placeholders:
+        placeholders = list(mapping.keys())
+    sem_by_id = {
+        item.get("id"): item.get("exchange_ui")
+        for item in (info.get("image_semantics") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    uis: List[str] = []
+    for key in placeholders:
+        meta = mapping.get(key)
+        raw_ui = meta.get("exchange_ui") if isinstance(meta, dict) else None
+        if raw_ui is None:
+            raw_ui = sem_by_id.get(key)
+        uis.append(normalize_exchange_ui(raw_ui))
+    return uis
+
+
 def _extract_article_image_addresses(article: Dict[str, Any]) -> Tuple[Set[str], List[str]]:
     """提取文章采用图片的全部去重标识（dHash / 本地路径 / 原始 URL）与统计主标识列表。"""
     info = article.get("article_info")
@@ -204,10 +239,11 @@ def _collect_publish_candidates(
     )
     coins = _normalize_hot_coins(hot_coins)
     hot_set = {coin.lower() for coin in coins}
+    viral_coins = list(dict.fromkeys([*coins, *_VIRAL_CORE_COINS]))
     patterns = (
         [
-            (coin.upper(), re.compile(rf"(?<![A-Za-z]){re.escape(coin)}(?:USDT|USDC)?(?![A-Za-z])", re.IGNORECASE))
-            for coin in coins
+            (coin.upper(), re.compile(rf"(?<![A-Za-z0-9]){re.escape(coin)}(?:USDT|USDC)?(?![A-Za-z0-9])", re.IGNORECASE))
+            for coin in viral_coins
         ]
         if viral
         else []
@@ -241,6 +277,9 @@ def _collect_publish_candidates(
         if has_rival_keyword(platform, text_content + " " + comments_text):
             stats["rival_keyword"] += 1
             continue
+        if has_rival_exchange_ui(platform, _extract_selected_image_exchange_uis(article)):
+            stats["rival_image_ui"] += 1
+            continue
 
         record = (article.get("publish_records") or {}).get(platform) or {}
         if record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
@@ -255,19 +294,17 @@ def _collect_publish_candidates(
                 continue
 
         if viral:
-            original_post = (article.get("creation_brief") or {}).get("original_post") or {}
-            original_text = original_post.get("text_content")
-            clean = MEDIA_PATTERN.sub(
-                " ",
-                re.sub(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", " ", original_text if isinstance(original_text, str) else ""),
-            )
-            matched_coin = next((coin for coin, pattern in patterns if pattern.search(clean)), None)
+            tag_match = COIN_TAG_PATTERN.search(text_content)
+            if tag_match:
+                matched_coin = tag_match.group(0).lstrip("$").upper()
+            else:
+                matched_coin = next((coin for coin, pattern in patterns if pattern.search(text_content)), "")
         else:
             topic = (article.get("topic") or "").strip()
             matched_coin = topic if topic and topic.lower() in hot_set else None
-        if not matched_coin:
-            stats["no_hot_coin"] += 1
-            continue
+            if not matched_coin:
+                stats["no_hot_coin"] += 1
+                continue
 
         image_keys = info.get(rule["images"]) or []
         mapping = info.get("image_mapping") or {}
@@ -701,6 +738,7 @@ def _publish_articles_for_platform(
         ("尝试超限", stats["attempts"]),
         ("同源冲突", stats["source_conflict"]),
         ("含竞品词", stats["rival_keyword"]),
+        ("竞品图界面", stats["rival_image_ui"]),
         ("非热币", stats["no_hot_coin"]),
         ("图片缺失", stats["invalid_image"]),
         ("图片重复", stats["image_dup"]),
@@ -725,99 +763,114 @@ def _publish_articles_for_platform(
     for account in eligible_accounts:
         if not candidates:
             break
-        account_state = platform_state.get(account) or store.get_account_state(platform, account)
-        index = _select_and_polish_best_candidate(
-            article_manager,
+        claimed, claim_reason = store.try_claim_account(
             platform,
             account,
-            account_state,
-            candidates,
-            now,
-            used_addresses,
-            article_type,
-            state_store=store,
+            is_viral=viral,
+            now=time.time(),
         )
-        if index is None:
-            _log(f"{rule['action']}/账号", "候选受主题冷却或已发图片冲突限制", 平台=platform, 账号=account)
+        if not claimed:
+            _log(f"{rule['action']}/账号", "账号并发或全局冷却限制，已跳过", 平台=platform, 账号=account, 状态=claim_reason)
             continue
 
-        article, addresses, matched_coin = candidates[index]
-        info = article["article_info"]
-        topic = (article.get("topic") or info.get("topic_tag") or "") if viral else (article.get("topic") or "").strip()
-        stance = article.get("stance", "")
-        record = dict((article.get("publish_records") or {}).get(platform) or {})
-        started = time.monotonic()
-        stage, api_result = "准备正文、媒体及配置", "尚未调用"
         try:
-            if viral:
-                text, paths = _format_viral_post_content(info, matched_coin)
-            else:
-                text, paths = _format_analysis_post_content(article, platform=platform)
-
-            session_dir = _get_account_session_dir(platform, account)
-            attempts = record.get("attempts", 0) + 1
-            stage, api_result = "调用发布接口", "未知"
-            chart_coin = None if viral else (article.get("primary_coin") or topic)
-            sentiment_tag = None if viral else stance
-            try:
-                err, success, post_id = _execute_platform_post(
-                    platform,
-                    session_dir,
-                    text,
-                    paths,
-                    topic=chart_coin,
-                    stance=sentiment_tag,
-                )
-            except ChallengeRequiredError as waf_exc:
-                err, success, post_id = f"[WAF/人机验证] {waf_exc}", False, None
-
-            post_id_str = str(post_id)
-            api_result = "成功" if success else "失败"
-            latest_price = None if viral else _safe_get_latest_price(platform, topic)
-            if success:
-                used_addresses.update(addresses)
-            stage = "保存已确认的发布结果"
-            error = _persist_publish_result(
+            account_state = platform_state.get(account) or store.get_account_state(platform, account)
+            cur_now = time.time()
+            index = _select_and_polish_best_candidate(
                 article_manager,
                 platform,
                 account,
                 account_state,
-                article,
-                record,
-                success,
-                post_id_str,
-                attempts,
-                now,
-                topic,
-                latest_price,
-                err,
+                candidates,
+                cur_now,
+                used_addresses,
                 article_type,
-                matched_coin,
                 state_store=store,
             )
-        except Exception as exc:
-            raise RuntimeError(
-                f"{rule['action']}阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] "
-                f"| 文章: [{article.get('_id')}] | 主题: [{topic}] | 接口结果: [{api_result}] "
-                f"| 请核对远端结果与本地状态 | 原因: [{exc}]"
-            ) from exc
-        if success:
-            candidates.pop(index)
-        _log(
-            f"{rule['action']}/文章",
-            "本次处理结束",
-            level="info" if success else "error",
-            平台=platform,
-            账号=account,
-            文章=article.get("_id"),
-            主题=topic,
-            热币=matched_coin,
-            评分=info.get(rule["score"]),
-            尝试=f"{attempts}/{PUBLISH_MAX_ATTEMPTS}",
-            耗时=f"{time.monotonic() - started:.2f}秒",
-            结果=api_result,
-            说明="远端发布与本地回写完成" if success else error,
-        )
+            if index is None:
+                _log(f"{rule['action']}/账号", "候选受主题冷却或已发图片冲突限制", 平台=platform, 账号=account)
+                continue
+
+            article, addresses, matched_coin = candidates[index]
+            info = article["article_info"]
+            topic = (article.get("topic") or info.get("topic_tag") or "") if viral else (article.get("topic") or "").strip()
+            stance = article.get("stance", "")
+            record = dict((article.get("publish_records") or {}).get(platform) or {})
+            started = time.monotonic()
+            stage, api_result = "准备正文、媒体及配置", "尚未调用"
+            try:
+                if viral:
+                    text, paths = _format_viral_post_content(info, matched_coin)
+                else:
+                    text, paths = _format_analysis_post_content(article, platform=platform)
+
+                session_dir = _get_account_session_dir(platform, account)
+                attempts = record.get("attempts", 0) + 1
+                stage, api_result = "调用发布接口", "未知"
+                chart_coin = None if viral else (article.get("primary_coin") or topic)
+                sentiment_tag = None if viral else stance
+                try:
+                    err, success, post_id = _execute_platform_post(
+                        platform,
+                        session_dir,
+                        text,
+                        paths,
+                        topic=chart_coin,
+                        stance=sentiment_tag,
+                    )
+                except ChallengeRequiredError as waf_exc:
+                    err, success, post_id = f"[WAF/人机验证] {waf_exc}", False, None
+
+                post_id_str = str(post_id)
+                api_result = "成功" if success else "失败"
+                latest_price = None if viral else _safe_get_latest_price(platform, topic)
+                if success:
+                    used_addresses.update(addresses)
+                stage = "保存已确认的发布结果"
+                pub_now = time.time()
+                error = _persist_publish_result(
+                    article_manager,
+                    platform,
+                    account,
+                    account_state,
+                    article,
+                    record,
+                    success,
+                    post_id_str,
+                    attempts,
+                    pub_now,
+                    topic,
+                    latest_price,
+                    err,
+                    article_type,
+                    matched_coin,
+                    state_store=store,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{rule['action']}阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] "
+                    f"| 文章: [{article.get('_id')}] | 主题: [{topic}] | 接口结果: [{api_result}] "
+                    f"| 请核对远端结果与本地状态 | 原因: [{exc}]"
+                ) from exc
+            if success:
+                candidates.pop(index)
+            _log(
+                f"{rule['action']}/文章",
+                "本次处理结束",
+                level="info" if success else "error",
+                平台=platform,
+                账号=account,
+                文章=article.get("_id"),
+                主题=topic,
+                热币=matched_coin,
+                评分=info.get(rule["score"]),
+                尝试=f"{attempts}/{PUBLISH_MAX_ATTEMPTS}",
+                耗时=f"{time.monotonic() - started:.2f}秒",
+                结果=api_result,
+                说明="远端发布与本地回写完成" if success else error,
+            )
+        finally:
+            store.release_account(platform, account)
 
 
 def _publish_analysis_articles_for_platform(article_manager: Any, platform: str, hot_coins: Optional[Sequence[Any]]) -> None:
@@ -864,6 +917,7 @@ def auto_publish_articles(stop_event: Optional[threading.Event] = None, max_roun
     run_daemon_loop(
         lambda _round_idx: publish_analysis_once(mgr),
         interval_seconds=PUBLISH_POLL_SECONDS,
+        jitter_ratio=0.1,
         error_backoff_seconds=PUBLISH_POLL_SECONDS,
         name="单币分析发布",
         logger_obj=logger,
@@ -878,6 +932,7 @@ def auto_publish_viral_articles(stop_event: Optional[threading.Event] = None, ma
     run_daemon_loop(
         lambda _round_idx: publish_viral_once(mgr),
         interval_seconds=PUBLISH_POLL_SECONDS,
+        jitter_ratio=0.1,
         error_backoff_seconds=PUBLISH_POLL_SECONDS,
         name="流量发布",
         logger_obj=logger,

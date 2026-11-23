@@ -19,7 +19,7 @@ from common.daemon import run_daemon_loop
 from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
-from parser.platform_adapters import _log, logger
+from parser.platform_adapters import _log, logger, normalize_exchange_ui
 from parser.post_ingestion import (
     LLM_MAX_RETRIES,
     MAX_CONCURRENCY,
@@ -193,7 +193,7 @@ def check_format_info(json_data: Any, placeholders: Sequence[str]) -> Tuple[bool
         "images",
         "impact_reason",
     }
-    image_keys = {"image_id", "image_type", "context", "usable", "unusable_reason"}
+    image_keys = {"image_id", "image_type", "exchange_ui", "context", "usable", "unusable_reason"}
     enums = {
         "dimension": ("K线形态", "技术指标", "链上数据", "资金流", "消息面", "基本面", "情绪判断"),
         "stance": ("看多", "看空", "震荡"),
@@ -233,6 +233,9 @@ def check_format_info(json_data: Any, placeholders: Sequence[str]) -> Tuple[bool
                 return False, f"{image_label}.image_id 未出现在原文: {image['image_id']!r}"
             if image["image_type"] not in image_types:
                 return False, f"{image_label}.image_type 不在允许枚举内"
+            exchange_ui = image["exchange_ui"]
+            if exchange_ui is not None and not isinstance(exchange_ui, str):
+                return False, f"{image_label}.exchange_ui 必须是字符串或 null"
             usable, reason = image["usable"], image["unusable_reason"]
             if not isinstance(usable, bool) or not isinstance(reason, str):
                 return False, f"{image_label} 的 usable 必须是布尔值，unusable_reason 必须是字符串"
@@ -267,6 +270,11 @@ def gen_media_format_info(post: Dict[str, Any]) -> Dict[str, Any]:
             f"| 原因: [{trace.get('error') or trace.get('call_status')}]"
         )
         return {}
+    for evidence in data.get("evidences") or []:
+        if isinstance(evidence, dict):
+            for image in evidence.get("images") or []:
+                if isinstance(image, dict):
+                    image["exchange_ui"] = normalize_exchange_ui(image.get("exchange_ui"))
     return data
 
 

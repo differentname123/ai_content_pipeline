@@ -4,14 +4,14 @@
 
 统一维护 `logs/runtime/account_publish_state.json`：
 1. 与既有状态字段 100% 向后兼容（`last_publish_time` / `viral_last_publish_time` / `topic_publish_history` / `last_error_*`）；
-2. 引入线程安全的 `RLock` 与原子落盘（`save_json`）；
-3. 仅执行正常发帖间隔冷却与同币主题冷却，不对发布失败设置退避阻塞窗口，
-   使多账号发布前可零成本预检，在全部账号均处于正常冷却时跳过 DB 查询、指标同步与总编大模型调用。
+2. 引入线程安全的 `RLock`、原子落盘（`save_json`）与进程内同账号并发占用守卫（`try_claim_account` / `release_account`）；
+3. 实行账号级全局发帖间隔冷却（合并分析帖与流量帖，避免双线程短时间连发被限流）与同币主题冷却，
+   不对发布失败设置退避阻塞窗口，使多账号发布前可零成本预检。
 """
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from common.common_utils import (
     PLATFORM_ACCOUNTS,
@@ -55,6 +55,8 @@ def ensure_account_state(
     defaults = {
         "total_success": 0,
         "last_publish_time": 0,
+        "account_last_publish_time": 0,
+        "last_publish_type": "",
         "last_error_msg": "",
         "last_error_time": 0,
         "consecutive_failures": 0,
@@ -72,12 +74,22 @@ def ensure_account_state(
     return account_state
 
 
+def _get_account_last_publish_time(account_state: Dict[str, Any]) -> float:
+    """取账号维度（合并分析帖、流量帖及历史字段）最近一次成功发布时间戳。"""
+    return max(
+        float(account_state.get("account_last_publish_time") or 0.0),
+        float(account_state.get("last_publish_time") or 0.0),
+        float(account_state.get("viral_last_publish_time") or 0.0),
+    )
+
+
 class AccountPublishStateStore:
-    """线程安全的发帖账号状态、间隔冷却与主题冷却管理器。"""
+    """线程安全的发帖账号状态、账号级全局冷却与主题冷却管理器。"""
 
     def __init__(self, state_file: str = STATE_FILE):
         self.state_file = str(state_file)
         self._lock = threading.RLock()
+        self._in_flight: Set[Tuple[str, str]] = set()
 
     def _read_raw(self) -> Dict[str, Any]:
         if not os.path.exists(self.state_file):
@@ -112,21 +124,53 @@ class AccountPublishStateStore:
         cooldown_seconds: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """
-        检查账号当前是否允许发布指定类型文章：
-        仅校验普通发帖间隔冷却（忽略历史遗留的失败退避字段）。
+        检查账号当前是否允许发布（账号级全局冷却，合并分析帖与流量帖）：
+        1. 检查进程内是否已有同一 `(platform, account)` 任务正在并发执行；
+        2. 校验距该账号任意类型上一次成功发布的全局间隔（忽略历史失败退避字段）。
         返回 `(eligible, reason_if_blocked)`。
         """
+        del is_viral  # 账号冷却已升级为账号全局合并冷却，保留参数确保调用签名 100% 兼容
         now_ts = time.time() if now is None else float(now)
-        prefix = _state_prefix(is_viral)
         cooldown = get_platform_cooldown_seconds(platform) if cooldown_seconds is None else int(cooldown_seconds)
-        account_state = self.get_account_state(platform, account)
+        with self._lock:
+            if (platform, account) in self._in_flight:
+                return False, "同账号另一发布任务正在执行中"
+            account_state = self.get_account_state(platform, account)
 
-        last_pub = float(account_state.get(f"{prefix}last_publish_time") or 0.0)
+        last_pub = _get_account_last_publish_time(account_state)
         remaining = cooldown - (now_ts - last_pub)
         if remaining > 0:
-            return False, f"发布冷却中 (剩余{int(remaining)}秒)"
+            return False, f"账号全局发布冷却中 (剩余{int(remaining)}秒)"
 
         return True, ""
+
+    def try_claim_account(
+        self,
+        platform: str,
+        account: str,
+        *,
+        is_viral: bool = False,
+        now: Optional[float] = None,
+        cooldown_seconds: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """在线程锁内原子复查全局冷却并占用 `(platform, account)`，防止分析/流量双线程并发连发撞车。"""
+        with self._lock:
+            ok, reason = self.can_publish(
+                platform,
+                account,
+                is_viral=is_viral,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if not ok:
+                return False, reason
+            self._in_flight.add((platform, account))
+            return True, ""
+
+    def release_account(self, platform: str, account: str) -> None:
+        """释放 `(platform, account)` 的进程内并发发布占用。"""
+        with self._lock:
+            self._in_flight.discard((platform, account))
 
     def get_eligible_accounts(
         self,
@@ -194,6 +238,8 @@ class AccountPublishStateStore:
             account_state = ensure_account_state(state, platform, account, normalize_history=True)
             account_state[f"{prefix}total_success"] = int(account_state.get(f"{prefix}total_success") or 0) + 1
             account_state[f"{prefix}last_publish_time"] = now_ts
+            account_state["account_last_publish_time"] = now_ts
+            account_state["last_publish_type"] = "viral" if is_viral else "analysis"
             account_state.pop(f"{prefix}backoff_until", None)
             account_state.pop(f"{prefix}backoff_reason", None)
             account_state[f"{prefix}consecutive_failures"] = 0

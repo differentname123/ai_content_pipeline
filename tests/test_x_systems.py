@@ -97,14 +97,13 @@ class TestXPlaywrightSubmitRetry(unittest.TestCase):
         container.locator.return_value = send_btn
 
         with patch("platforms.x_playwright._dismiss_overlays"), \
-             patch("platforms.x_playwright.report_guard_hits"), \
              patch("platforms.x_playwright._wake_x_editor", return_value=editor_box), \
              patch("platforms.x_playwright._force_caret_to_tail"), \
              patch("platforms.x_playwright._type_x_body"), \
              patch("platforms.x_playwright._dismiss_x_typeahead_if_open"), \
              patch("platforms.x_playwright._pick_trusted_send_button", return_value=send_btn), \
              patch("platforms.x_playwright.expect"), \
-             patch("platforms.x_playwright._robust_click", side_effect=lambda btn: btn.click()), \
+             patch("platforms.x_playwright.human_click", side_effect=lambda _page, btn, **_kw: btn.click()), \
              patch("platforms.x_playwright._XApiWatcher", side_effect=watcher_factory):
             post_id = _submit_x_post(page, container, content="hello x", prepared_images=[])
         return post_id, send_btn

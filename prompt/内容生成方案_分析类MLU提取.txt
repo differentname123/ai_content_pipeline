@@ -38,6 +38,7 @@
 - `images` [Array]：支撑当前 `core_fact` 的图片证据列表（无相关图片时为 `[]`）。每个元素包含：
   - `image_id` [String]：原样保留正文中对应的占位符（含方括号、编号与大小写）。
   - `image_type` [String]：限选：`盘面截图 | 数据图表 | 新闻截图 | 社交截图 | 收益截图 | 梗图表情 | 实拍照片 | 其他`
+  - `exchange_ui` [String]：客观识别图中是否明确出现具体加密货币交易所的品牌标识、专属 App 界面、持仓/收益卡片或交易所社区页面；若可明确辨认，填小写英文平台名（如 `"binance"`、`"okx"`、`"bybit"`、`"bitget"` 等）；若为普通 K 线、TradingView、链上/第三方数据图表、新闻报道、实拍图或无法明确辨认具体交易所，填空字符串 `""`。**仅作客观记录，绝不可仅因出现某交易所界面就将 `usable` 设为 `false`**。
   - `context` [String]：图中直接证明当前 `core_fact` 的核心视觉证据描述（聚焦“该图能向读者证明什么”，剔除无关背景罗列）。
   - `usable` [Boolean]：评估第三方账号二次发布该图是否自圆其说：公共行情图、公开数据图表、新闻截图、公开言论截图填 `true`（带平台常规小水印视为 `true`）；含原作者唯一身份属性、私人聊天记录或个人实盘后台/收益卡片的排他性截图填 `false`。
   - `unusable_reason` [String]：`usable` 为 `true` 时填 `""`；为 `false` 时简述二次发布穿帮的具体原因。
@@ -97,6 +98,7 @@
         {
           "image_id": "",
           "image_type": "",
+          "exchange_ui": "",
           "context": "",
           "usable": true,
           "unusable_reason": ""

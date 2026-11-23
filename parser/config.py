@@ -50,8 +50,8 @@ STATE_FILE = str(
     )
 )
 
-ACCOUNT_COOLDOWN_SECONDS = 6 * 3600       # Binance 单账号发帖间隔（6h）
-OKX_ACCOUNT_COOLDOWN_SECONDS = 6 * 3600   # OKX 单账号发帖间隔（6h）
+ACCOUNT_COOLDOWN_SECONDS = 3 * 3600       # Binance 单账号全局发帖间隔（合并分析帖与流量帖，至少 2h；默认 3h 对应单号 <=8 篇/天健康节奏）
+OKX_ACCOUNT_COOLDOWN_SECONDS = 3 * 3600   # OKX 单账号全局发帖间隔（合并分析帖与流量帖，至少 2h；默认 3h 对应单号 <=8 篇/天健康节奏）
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600 # 同账号同币种冷却（2h）
 
 INTERACTION_CONFIG: Dict[str, Dict[str, Any]] = {
