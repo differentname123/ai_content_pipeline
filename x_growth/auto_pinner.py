@@ -84,9 +84,11 @@ ACCOUNTS: List[Dict[str, Any]] = [
 # 2. 定时节奏、持锁上限与风控冷却（单位：秒；默认 21600 秒 = 每 6 小时运行一轮）
 INTERVAL_SECONDS: int = 21600             # 轮询间隔（秒；21600=6 小时）
 JITTER_SECONDS: Tuple[int, int] = (120, 360)  # 每轮额外随机抖动 (最小秒, 最大秒)，避开整点机械指纹
+# 【保留过滤原因说明】凌晨 01:00–07:00（北京时间）开启浏览器静默保护，避开深夜通宵异常冷启时段（设为 None 关闭）
+QUIET_HOURS_CN: Optional[Tuple[int, int]] = (1, 7)  # 夜间静默小时段 [开始小时, 结束小时)（北京时间，None=全天运行）
 # 【保留过滤原因说明】`platforms/playwright_base.py` 跨进程目录锁超时为 300s；单次持锁上限设为 150s，给采集详情+置顶核验与同目录其他任务留足余量
 SESSION_MAX_HOLD_SECONDS: int = 150       # 单次打开浏览器的最长持锁秒数（预留最后 30s 专用置顶与核验）
-RISK_COOLDOWN_SECONDS: int = 21600        # 遇安全验证或登录失效时静默冷却秒数（21600=6 小时）
+RISK_COOLDOWN_SECONDS: int = 21600        # 遇业务限流触发软冷却秒数（21600=6 小时）；遇硬安全锁/掉登录则直接熔断停机
 DRY_RUN: bool = False                     # True=只采集计算与入库，不真实点击置顶；False=真实置顶
 BROWSER_VISIBLE: bool = False             # False=后台静默无弹窗；True=弹出 Chrome 窗口便于观察过程
 
@@ -95,8 +97,8 @@ WINDOW_HOURS: int = 72                    # 仅评选最近多少小时内发布
 # 【保留过滤原因说明】最多滚屏 6 次覆盖近 72 小时主帖（且扫到早于 72h 的非置顶帖即提前停滚），避免无意义翻看陈年旧帖引发风控
 MAX_PROFILE_SCROLLS: int = 6              # 主页最多向下滚屏次数
 FETCH_TWEET_ANALYTICS: bool = True        # True=逐条打开官方帖子分析页抓取《展示/参与/详情展开/个人资料访问/涨粉/外链点击》；False=仅凭公开互动量算分
-# 【保留过滤原因说明】单轮最多采集 25 条 72h 主帖的官方分析页（按曝光从高到低优先），控制浏览页数防高频风控
-MAX_ANALYTICS_POSTS_PER_RUN: int = 25     # 单轮最多访问多少条主帖的分析页
+# 【保留过滤原因说明】单轮最多采集 12 条 72h 主帖的官方分析页（按曝光从高到低优先），压减单轮连续导航页数防高速连扫风控
+MAX_ANALYTICS_POSTS_PER_RUN: int = 12     # 单轮最多访问多少条主帖的分析页
 # 【保留过滤原因说明】优先在曝光量达到一定基数且发布满 30 分钟的帖子中评选冠军，防止刚发几分钟只有 1 个赞的小样本刷出虚高转化率；若全员不足则自动放宽兜底，确保必有 1 帖置顶
 MIN_IMPRESSIONS: int = 20                 # 优先门槛：最低有效曝光量（全部不足时自动降级放宽）
 MIN_POST_AGE_MINUTES: int = 30            # 优先门槛：发布满多少分钟后参与竞争（全部不足时自动降级放宽）
@@ -151,7 +153,8 @@ _RE_PINNED_CONTEXT = re.compile(r"(置顶|Pinned|固定)", re.IGNORECASE)
 _RE_PIN_MENU_TEXT = re.compile(r"(置顶到你的个人资料|置顶|Pin to your profile|Pin to profile)", re.IGNORECASE)
 _RE_UNPIN_MENU_TEXT = re.compile(r"(从个人资料取消置顶|取消置顶|Unpin from profile|Unpin)", re.IGNORECASE)
 
-_RISK_HALT_STATUSES = {"locked_challenge", "not_logged_in", "suspended", "cooldown_required"}
+_HARD_LOCK_STATUSES = {"locked_challenge", "not_logged_in", "suspended"}
+_RISK_HALT_STATUSES = _HARD_LOCK_STATUSES | {"cooldown_required"}
 _INDEXED_DBS: Set[int] = set()
 _LOGGER: Optional[Any] = None
 
@@ -196,10 +199,48 @@ def _clip_text(text: Any, max_len: int = 38) -> str:
     return clean[: max(1, max_len - 1)] + "…"
 
 
+def _parse_quiet_hours(raw: Any) -> Optional[Tuple[int, int]]:
+    if raw is None or not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    try:
+        start_h = int(raw[0]) % 24
+        end_h = int(raw[1]) % 24
+    except (TypeError, ValueError):
+        return None
+    return None if start_h == end_h else (start_h, end_h)
+
+
+def _seconds_until_quiet_end(
+    quiet_hours: Optional[Tuple[int, int]],
+    now_dt: Optional[datetime] = None,
+) -> int:
+    parsed = _parse_quiet_hours(quiet_hours)
+    if not parsed:
+        return 0
+    start_h, end_h = parsed
+    dt = now_dt if now_dt is not None else datetime.now(TZ_CN)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ_CN)
+    hour = dt.hour
+    if start_h < end_h:
+        if not (start_h <= hour < end_h):
+            return 0
+        end_dt = dt.replace(hour=end_h, minute=0, second=0, microsecond=0)
+    else:
+        if hour >= start_h:
+            end_dt = (dt + timedelta(days=1)).replace(hour=end_h, minute=0, second=0, microsecond=0)
+        elif hour < end_h:
+            end_dt = dt.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        else:
+            return 0
+    return max(1, int((end_dt - dt).total_seconds()))
+
+
 def _default_cfg() -> Dict[str, Any]:
     return {
         "interval_seconds": INTERVAL_SECONDS,
         "jitter_seconds": JITTER_SECONDS,
+        "quiet_hours_cn": QUIET_HOURS_CN,
         "session_max_hold_seconds": SESSION_MAX_HOLD_SECONDS,
         "risk_cooldown_seconds": RISK_COOLDOWN_SECONDS,
         "dry_run": DRY_RUN,
@@ -1245,7 +1286,7 @@ def sync_best_pinned_post_for_account(
                             page.goto(f"https://x.com/{eff_handle}/status/{tid}/analytics", timeout=30000, wait_until="domcontentloaded")
                             if sniffer.wait_for_analytics(page, tid, timeout_ms=7000):
                                 analytics_fetched_cnt += 1
-                            page.wait_for_timeout(random.randint(350, 700))
+                            page.wait_for_timeout(random.randint(1800, 3500))
                         except Exception as an_e:
                             log.debug(f"[自动置顶/单帖分析略过] tweet_id={tid}: {str(an_e)[:100]}")
 
@@ -1492,27 +1533,54 @@ def run_pinner_daemon(
         if isinstance(raw_jitter, (list, tuple)) and len(raw_jitter) == 2
         else (0, 0)
     )
+    ev = stop_event if stop_event is not None else threading.Event()
+    quiet_hours = _parse_quiet_hours(cfg.get("quiet_hours_cn", QUIET_HOURS_CN))
     risk_cd_sec = max(300, safe_int(cfg.get("risk_cooldown_seconds"), RISK_COOLDOWN_SECONDS))
     cooldown_until: Dict[str, float] = {}
+    hard_halted: Dict[str, str] = {}
 
+    quiet_txt = f"{quiet_hours[0]:02d}:00-{quiet_hours[1]:02d}:00" if quiet_hours else "关闭"
     log.info(
         f"🚀 [AutoPinner/守护启动] 账号={[a['name'] + '(@' + (a['screen_name'] or '自动') + ')' for a in pool]} | "
-        f"周期={interval_sec}s ({round(interval_sec / 3600, 1):g}h) | 评估窗口={cfg.get('window_hours', WINDOW_HOURS)}h | "
+        f"周期={interval_sec}s ({round(interval_sec / 3600, 1):g}h) | 静默={quiet_txt} | 评估窗口={cfg.get('window_hours', WINDOW_HOURS)}h | "
         f"转化口径={cfg.get('conversion_metric_mode', CONVERSION_METRIC_MODE)}"
     )
 
     def _step(round_no: int) -> Dict[str, Any]:
+        q_rem = _seconds_until_quiet_end(quiet_hours)
+        if q_rem > 0 and quiet_hours is not None:
+            log.info(
+                f"🌙 [AutoPinner | #{round_no}] 处于夜间静默时段 ({quiet_hours[0]:02d}:00-{quiet_hours[1]:02d}:00)，"
+                f"推迟至静默结束后执行（约 {q_rem}s 后）"
+            )
+            return {"next_sleep_seconds": q_rem}
+
         db = gen_db_object()
         any_empty = False
         for acc in pool:
             acc_dir, acc_name = acc["user_data_dir"], acc["name"]
+            if acc_dir in hard_halted:
+                log.info(f"🛑 [AutoPinner | #{round_no} | {acc_name}] 已硬锁熔断({hard_halted[acc_dir]})，跳过。")
+                continue
             rem = cooldown_until.get(acc_dir, 0.0) - time.time()
             if rem > 0:
                 log.info(f"⏸️ [AutoPinner | #{round_no} | {acc_name}] 独立风控冷却中（剩余 {int(rem)}s），跳过。")
                 continue
             res = sync_best_pinned_post_for_account(acc, db=db, config=cfg, logger=log)
             st = str(res.get("status") or "ok")
-            if st in _RISK_HALT_STATUSES:
+            if st in _HARD_LOCK_STATUSES:
+                hard_halted[acc_dir] = st
+                cooldown_until.pop(acc_dir, None)
+                warn = str(res.get("warning") or "")[:160]
+                log.error(
+                    f"🛑 [AutoPinner | {acc_name}] 触发硬锁熔断（已停止本进程对该账号的所有浏览器访问，请人工解锁验证后重启）| "
+                    f"status={st}" + (f" | {warn}" if warn else "")
+                )
+                if pool and all(a["user_data_dir"] in hard_halted for a in pool):
+                    log.error("🛑 [AutoPinner/硬锁熔断停机] 全部账号已触发硬锁/登录失效，自动停止守护循环（绝不再每 6h 撞锁页）。")
+                    ev.set()
+                    return {}
+            elif st == "cooldown_required":
                 cooldown_until[acc_dir] = time.time() + risk_cd_sec
                 log.error(f"⏳ [AutoPinner | {acc_name}] 触发风控冷却 {risk_cd_sec}s | status={st}")
             elif st == "empty_capture":
@@ -1522,8 +1590,9 @@ def run_pinner_daemon(
 
         if any_empty:
             return {"next_sleep_seconds": min(interval_sec, 600)}
-        active_rems = [max(0.0, cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
-        if pool and all(r > 0 for r in active_rems):
+        unhalted = [a for a in pool if a["user_data_dir"] not in hard_halted]
+        active_rems = [max(0.0, cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in unhalted]
+        if unhalted and all(r > 0 for r in active_rems):
             return {"next_sleep_seconds": max(interval_sec, int(min(active_rems)))}
         return {}
 
@@ -1534,7 +1603,7 @@ def run_pinner_daemon(
         name="AutoPinner",
         logger_obj=log,
         max_rounds=max_rounds,
-        stop_event=stop_event,
+        stop_event=ev,
     )
 
 

@@ -2,6 +2,7 @@
 """Offline unit tests for parallel X comment auto-replier (`x_growth/auto_replier.py`)."""
 import ast
 import contextlib
+from datetime import datetime
 import logging
 import pathlib
 import re
@@ -22,9 +23,18 @@ from x_growth.auto_replier import (
     GENERATE_INITIAL_DELAY_SECONDS,
     GENERATE_INTERVAL_SECONDS,
     GENERATOR_MODEL_GROUP,
+    LIKE_COMMENT_BEFORE_REPLY,
+    MAX_POST_DETAILS_PER_RUN,
+    MAX_REPLIES_PER_DAY,
+    MAX_REPLIES_PER_HOUR,
+    MAX_REPLIES_PER_POST_PER_RUN,
+    MAX_REPLIES_PER_RUN,
     MAX_REPLIES_PER_USER_PER_POST,
     POST_CHECKPOINTS_COLLECTION,
+    POST_REPLY_QUOTA_RATIO,
+    POST_REPLY_WINDOW_HOURS,
     PROMPT_TEMPLATE_FILENAME,
+    QUIET_HOURS_CN,
     REPLY_INBOX_COLLECTION,
     REPLY_INITIAL_DELAY_SECONDS,
     REPLY_INTERVAL_SECONDS,
@@ -32,8 +42,12 @@ from x_growth.auto_replier import (
     RISK_COOLDOWN_SECONDS,
     RUN_MODE,
     SESSION_MAX_HOLD_SECONDS,
+    TZ_CN,
     XReplyInboxSniffer,
     _build_parent_context_block,
+    _build_time_context_block,
+    _calc_post_target_replies,
+    _seconds_until_quiet_end,
     build_status_report,
     collect_replies_for_account,
     format_status_text,
@@ -277,13 +291,22 @@ class TestAutoReplier(unittest.TestCase):
             self.assertNotIn(legacy_tbl, src)
 
         self.assertEqual(RUN_MODE, "daemon")
-        self.assertEqual(COLLECT_INTERVAL_SECONDS, 600)
-        self.assertEqual(GENERATE_INTERVAL_SECONDS, 600)
-        self.assertEqual(REPLY_INTERVAL_SECONDS, 600)
+        self.assertEqual(COLLECT_INTERVAL_SECONDS, 3600)
+        self.assertEqual(GENERATE_INTERVAL_SECONDS, 3600)
+        self.assertEqual(REPLY_INTERVAL_SECONDS, 3600)
         self.assertEqual(GENERATE_INITIAL_DELAY_SECONDS, 60)
         self.assertEqual(REPLY_INITIAL_DELAY_SECONDS, 120)
         self.assertEqual(RETRY_COOLDOWN_SECONDS, 600)
         self.assertEqual(GENERATOR_MODEL_GROUP, "low")
+        self.assertFalse(LIKE_COMMENT_BEFORE_REPLY)
+        self.assertEqual(MAX_REPLIES_PER_RUN, 3)
+        self.assertEqual(MAX_REPLIES_PER_HOUR, 8)
+        self.assertEqual(MAX_REPLIES_PER_DAY, 50)
+        self.assertEqual(MAX_POST_DETAILS_PER_RUN, 5)
+        self.assertEqual(POST_REPLY_WINDOW_HOURS, 24)
+        self.assertEqual(POST_REPLY_QUOTA_RATIO, 0.1)
+        self.assertEqual(MAX_REPLIES_PER_POST_PER_RUN, 1)
+        self.assertEqual(QUIET_HOURS_CN, (1, 7))
         self.assertEqual(MAX_REPLIES_PER_USER_PER_POST, 1)
         self.assertLessEqual(SESSION_MAX_HOLD_SECONDS, 180)
         self.assertTrue(bool(ACCOUNTS[0]["name"]))
@@ -306,6 +329,7 @@ class TestAutoReplier(unittest.TestCase):
                 "ACCOUNT_HANDLE": "peterzhu1003",
                 "MY_POST_TEXT": "Shipping small tools every day.",
                 "MY_POST_HAS_MEDIA": "否",
+                "TIME_CONTEXT_BLOCK": "原帖发布于 约 2 小时前；该评论发表于 约 15 分钟前",
                 "PARENT_CONTEXT_BLOCK": "该评论直接回复你的上述原帖。",
                 "REPLY_AUTHOR": "@alice",
                 "REPLY_TEXT": "Totally agree, consistency wins.",
@@ -479,6 +503,7 @@ class TestAutoReplier(unittest.TestCase):
         d1 = inbox.find_one({"account_name": "x_myself", "reply_id": "2001"})
         self.assertEqual(d1["status"], "pending_generate")
         self.assertEqual(d1["post_text"], "My post content")
+        self.assertGreater(d1["post_publish_ts"], 0)
         self.assertEqual(d1["reply_text"], "Interesting perspective!")
         self.assertEqual(inbox.find_one({"reply_id": "2002"})["skip_reason"], "max_replies_per_user_per_post_reached")
         self.assertEqual(inbox.find_one({"reply_id": "2003"})["replied_source"], "detected_on_x")
@@ -567,11 +592,15 @@ class TestAutoReplier(unittest.TestCase):
             rid = kwargs["task_label"].split(":")[-1]
             if rid == "r_ok":
                 # Verify validator rejects bad outputs first
-                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "See https://evil.com"}))
-                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "Great #tag"}))
-                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "x" * 245}))
-                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "@alice"}))
-                payload = {"skip": False, "skip_reason": "", "language": "en", "reply_text": "@alice It stores unique reply IDs locally before sending."}
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 80, "reply_text": "See https://evil.com"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 80, "reply_text": "Great #tag"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 80, "reply_text": "x" * 245}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 80, "reply_text": "@alice"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_text": "Missing score"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": True, "reply_text": "Bool score"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 0, "reply_text": "Zero score"}))
+                self.assertIsNotNone(validator({"skip": False, "language": "en", "reply_score": 101, "reply_text": "Too high score"}))
+                payload = {"skip": False, "skip_reason": "", "language": "en", "reply_score": 88, "reply_text": "@alice It stores unique reply IDs locally before sending."}
                 self.assertIsNone(validator(payload))
                 return payload, {
                     "model_used": "mock-low",
@@ -582,7 +611,7 @@ class TestAutoReplier(unittest.TestCase):
                     "prompt_sha1": "abc123",
                 }
             if rid == "r_skip":
-                payload = {"skip": True, "skip_reason": "spam_solicitation", "language": "en", "reply_text": ""}
+                payload = {"skip": True, "skip_reason": "spam_solicitation", "language": "en", "reply_score": 0, "reply_text": ""}
                 self.assertIsNone(validator(payload))
                 return payload, {"model_used": "mock-low", "elapsed_ms": 210, "schema_attempt": 1, "trace_id": "tr_2"}
             return None, {"parse_error": "gateway_timeout"}
@@ -606,11 +635,12 @@ class TestAutoReplier(unittest.TestCase):
             self.assertEqual(kw["preset_model_group"], "low")
 
         gen_info_msgs = [str(c.args[0]) for c in gen_log.info.call_args_list]
-        self.assertTrue(any("✍️" in m and "p=abc123" in m and "帖「We released our lig…" in m for m in gen_info_msgs))
+        self.assertTrue(any("✍️" in m and "88分" in m and "p=abc123" in m and "帖「We released our lig…" in m for m in gen_info_msgs))
         self.assertTrue(any("⏭️" in m and "p=" in m and "帖「We released our lig…" in m for m in gen_info_msgs))
 
         d_ok = col.find_one({"reply_id": "r_ok"})
         self.assertEqual(d_ok["status"], "ready_to_reply")
+        self.assertEqual(d_ok["reply_score"], 88)
         self.assertEqual(d_ok["generated_reply"], "It stores unique reply IDs locally before sending.")
         self.assertEqual(d_ok["generated_lang"], "en")
         self.assertEqual(d_ok["generator_prompt_file"], PROMPT_TEMPLATE_FILENAME)
@@ -621,6 +651,7 @@ class TestAutoReplier(unittest.TestCase):
 
         d_skip = col.find_one({"reply_id": "r_skip"})
         self.assertEqual(d_skip["status"], "skipped")
+        self.assertEqual(d_skip["reply_score"], 0)
         self.assertEqual(d_skip["skip_reason"], "ai_safety:spam_solicitation")
         self.assertEqual(d_skip["generate_elapsed_ms"], 210)
         self.assertEqual(d_skip["generate_trace_id"], "tr_2")
@@ -641,6 +672,61 @@ class TestAutoReplier(unittest.TestCase):
         self.assertEqual(res_idle_gen["pending_found"], 0)
         self.assertTrue(any("待生成=0" in str(c.args[0]) for c in mock_log.info.call_args_list))
 
+    def test_generate_replies_text_only_with_time_context(self):
+        now = 1_800_000_000
+        self.assertIn("15 分钟前", _build_time_context_block({"reply_publish_ts": now - 900}, now))
+        self.assertIn("2 小时前", _build_time_context_block({"post_publish_ts": now - 7200}, now))
+        self.assertIn("超过 1 天", _build_time_context_block({"post_publish_ts": now - 36 * 3600}, now))
+        self.assertEqual(_build_time_context_block({}, now), "发布时间未知")
+
+        db = _FakeDB()
+        col = db.get_collection(REPLY_INBOX_COLLECTION)
+        col.docs.append(
+            {
+                "account_name": "x_myself",
+                "account_handle": "peterzhu1003",
+                "post_id": "1001",
+                "post_text": "Holding through the volatility.",
+                "post_publish_ts": now - 36 * 3600,
+                "post_has_media": True,
+                "parent_tweet_id": "1001",
+                "parent_tweet_text": "Holding through the volatility.",
+                "reply_id": "r_tc",
+                "reply_author": "bob",
+                "reply_text": "Are you still holding?",
+                "reply_publish_ts": now - 900,
+                "reply_has_media": False,
+                "status": "pending_generate",
+                "generate_attempts": 0,
+                "generate_next_retry_ts": 0,
+            }
+        )
+        seen_calls = []
+
+        def _fake_llm(**kwargs):
+            seen_calls.append(kwargs)
+            return {
+                "skip": False,
+                "skip_reason": "",
+                "language": "en",
+                "reply_score": 76,
+                "reply_text": "That night was intense—definitely tested my patience.",
+            }, {"model_used": "mock-text", "elapsed_ms": 300, "schema_attempt": 1, "trace_id": "tr_tc", "prompt_sha1": "def456"}
+
+        with patch("x_growth.auto_replier.call_llm_json", side_effect=_fake_llm):
+            res = generate_replies_from_db(
+                {"name": "x_myself", "screen_name": "peterzhu1003"},
+                db=db,
+                now_ts=now,
+            )
+
+        self.assertEqual(res["ready_count"], 1)
+        self.assertIsNone(seen_calls[0]["file_paths"])
+        self.assertIn("原帖发布于 约 36 小时前（超过 1 天）", seen_calls[0]["prompt"])
+        self.assertIn("该评论发表于 约 15 分钟前", seen_calls[0]["prompt"])
+        self.assertIn("话题原帖是否含未展示图片或视频**：是", seen_calls[0]["prompt"])
+        self.assertIn("读者评论是否含未展示图片或视频**：否", seen_calls[0]["prompt"])
+
     def test_publish_replies_dry_run_daily_cap_live_dedup_and_hold_limit(self):
         db = _FakeDB()
         now = int(time.time())
@@ -657,10 +743,10 @@ class TestAutoReplier(unittest.TestCase):
             self.assertTrue(any("待发送=0" in str(c.args[0]) for c in pub_log.info.call_args_list))
 
             col.docs.extend([
-                {"account_name": "x_myself", "reply_id": "r_send", "reply_url": "https://x.com/alice/status/r_send", "reply_author": "alice", "reply_author_lower": "alice", "post_id": "1001", "status": "ready_to_reply", "generated_reply": "Thanks Alice!", "reply_publish_ts": now - 400, "reply_next_retry_ts": 0, "reply_attempts": 0},
-                {"account_name": "x_myself", "reply_id": "r_dup", "reply_url": "https://x.com/bob/status/r_dup", "reply_author": "bob", "reply_author_lower": "bob", "post_id": "1001", "status": "ready_to_reply", "generated_reply": "Thanks Bob!", "reply_publish_ts": now - 300, "reply_next_retry_ts": 0, "reply_attempts": 0},
-                {"account_name": "x_myself", "reply_id": "r_gone", "reply_url": "https://x.com/carol/status/r_gone", "reply_author": "carol", "reply_author_lower": "carol", "post_id": "1001", "status": "ready_to_reply", "generated_reply": "Thanks Carol!", "reply_publish_ts": now - 200, "reply_next_retry_ts": 0, "reply_attempts": 0},
-                {"account_name": "x_myself", "reply_id": "r_biz", "reply_url": "https://x.com/dave/status/r_biz", "reply_author": "dave", "reply_author_lower": "dave", "post_id": "1001", "status": "ready_to_reply", "generated_reply": "Thanks Dave!", "reply_publish_ts": now - 100, "reply_next_retry_ts": 0, "reply_attempts": 0},
+                {"account_name": "x_myself", "reply_id": "r_send", "reply_url": "https://x.com/alice/status/r_send", "reply_author": "alice", "reply_author_lower": "alice", "post_id": "p_send", "post_publish_ts": now - 1000, "reply_score": 95, "status": "ready_to_reply", "generated_reply": "Thanks Alice!", "reply_publish_ts": now - 400, "reply_next_retry_ts": 0, "reply_attempts": 0},
+                {"account_name": "x_myself", "reply_id": "r_dup", "reply_url": "https://x.com/bob/status/r_dup", "reply_author": "bob", "reply_author_lower": "bob", "post_id": "p_dup", "post_publish_ts": now - 1000, "reply_score": 90, "status": "ready_to_reply", "generated_reply": "Thanks Bob!", "reply_publish_ts": now - 300, "reply_next_retry_ts": 0, "reply_attempts": 0},
+                {"account_name": "x_myself", "reply_id": "r_gone", "reply_url": "https://x.com/carol/status/r_gone", "reply_author": "carol", "reply_author_lower": "carol", "post_id": "p_gone", "post_publish_ts": now - 1000, "reply_score": 85, "status": "ready_to_reply", "generated_reply": "Thanks Carol!", "reply_publish_ts": now - 200, "reply_next_retry_ts": 0, "reply_attempts": 0},
+                {"account_name": "x_myself", "reply_id": "r_biz", "reply_url": "https://x.com/dave/status/r_biz", "reply_author": "dave", "reply_author_lower": "dave", "post_id": "p_biz", "post_publish_ts": now - 1000, "reply_score": 80, "status": "ready_to_reply", "generated_reply": "Thanks Dave!", "reply_publish_ts": now - 100, "reply_next_retry_ts": 0, "reply_attempts": 0},
             ])
 
             # 2. dry_run=True never opens browser
@@ -707,7 +793,9 @@ class TestAutoReplier(unittest.TestCase):
                  patch("x_growth.auto_replier._submit_x_post", side_effect=_fake_submit), \
                  patch.object(XReplyInboxSniffer, "wait_for_ops", return_value=False), \
                  patch.object(XReplyInboxSniffer, "find_my_existing_reply", side_effect=_fake_find_dup):
-                res_live = publish_replies_for_account(acc, db=db, config={"max_replies_per_run": 5}, now_ts=now)
+                res_live = publish_replies_for_account(
+                    acc, db=db, config={"max_replies_per_run": 5, "like_comment_before_reply": True}, now_ts=now
+                )
 
             self.assertEqual(res_live["status"], "cooldown_required")
             self.assertEqual(res_live["replied_count"], 1)
@@ -721,12 +809,51 @@ class TestAutoReplier(unittest.TestCase):
             self.assertEqual(col.find_one({"reply_id": "r_gone"})["status"], "unavailable")
             self.assertEqual(col.find_one({"reply_id": "r_biz"})["reply_attempts"], 1)
 
-            # 4. Daily cap reached blocks opening browser
+            # 4. Daily cap reached blocks opening browser; hourly cap reached also blocks opening browser
             res_cap = publish_replies_for_account(acc, db=db, config={"max_replies_per_day": 1}, now_ts=now + 10)
             self.assertEqual(res_cap["status"], "daily_limit_reached")
             self.assertFalse(res_cap["browser_opened"])
 
-            # 5. Session max hold stop-loss exits cleanly without exceeding hold budget
+            res_hcap = publish_replies_for_account(
+                acc, db=db, config={"max_replies_per_day": 50, "max_replies_per_hour": 1}, now_ts=now + 10
+            )
+            self.assertEqual(res_hcap["status"], "hourly_limit_reached")
+            self.assertFalse(res_hcap["browser_opened"])
+
+            # 5. Default no-like skips liking & /account/access BusinessErrorException classifies as locked_challenge
+            db_sec = _FakeDB()
+            s_col = db_sec.get_collection(REPLY_INBOX_COLLECTION)
+            s_col.docs.extend([
+                {"account_name": "x_myself", "reply_id": "s1", "reply_url": "https://x.com/a/status/s1", "reply_author": "a", "reply_author_lower": "a", "post_id": "ps_1", "post_publish_ts": now - 1000, "reply_score": 90, "status": "ready_to_reply", "generated_reply": "Hi A", "reply_publish_ts": now - 200, "reply_next_retry_ts": 0, "reply_attempts": 0},
+                {"account_name": "x_myself", "reply_id": "s2", "reply_url": "https://x.com/b/status/s2", "reply_author": "b", "reply_author_lower": "b", "post_id": "ps_2", "post_publish_ts": now - 1000, "reply_score": 80, "status": "ready_to_reply", "generated_reply": "Hi B", "reply_publish_ts": now - 100, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            ])
+            mock_like = MagicMock()
+
+            def _submit_access_lock(_p, _b, content="", **_kw):
+                if content == "Hi B":
+                    raise BusinessErrorException("X 发送后页面触发安全验证/登录跳转: https://x.com/account/access")
+                return "8888"
+
+            with patch("x_growth.auto_replier.persistent_browser_session", side_effect=_fake_session), \
+                 patch("x_growth.auto_replier._wait_x_home_ready"), \
+                 patch("x_growth.auto_replier._wait_x_post_detail_ready"), \
+                 patch("x_growth.auto_replier._dismiss_overlays"), \
+                 patch("x_growth.auto_replier.check_for_crash"), \
+                 patch("x_growth.auto_replier._resolve_session_identity", return_value=("u_me", "peterzhu1003")), \
+                 patch("x_growth.auto_replier._locate_x_reply_box", return_value=MagicMock()), \
+                 patch("x_growth.auto_replier._like_focal_comment_on_page", mock_like), \
+                 patch("x_growth.auto_replier._sleep_jitter"), \
+                 patch("x_growth.auto_replier._submit_x_post", side_effect=_submit_access_lock), \
+                 patch.object(XReplyInboxSniffer, "wait_for_ops", return_value=False), \
+                 patch.object(XReplyInboxSniffer, "find_my_existing_reply", return_value=None):
+                res_lock = publish_replies_for_account(acc, db=db_sec, now_ts=now)
+
+            self.assertEqual(res_lock["status"], "locked_challenge")
+            self.assertEqual(res_lock["replied_count"], 1)
+            self.assertEqual(mock_like.call_count, 0)
+            self.assertIsNone(s_col.find_one({"reply_id": "s1"})["liked_before_reply"])
+
+            # 6. Session max hold stop-loss exits cleanly without exceeding hold budget
             db_hold = _FakeDB()
             h_col = db_hold.get_collection(REPLY_INBOX_COLLECTION)
             for idx in range(3):
@@ -737,7 +864,9 @@ class TestAutoReplier(unittest.TestCase):
                         "reply_url": f"https://x.com/u{idx}/status/rh_{idx}",
                         "reply_author": f"u{idx}",
                         "reply_author_lower": f"u{idx}",
-                        "post_id": "1001",
+                        "post_id": f"ph_{idx}",
+                        "post_publish_ts": now - 1000,
+                        "reply_score": 90 - idx,
                         "status": "ready_to_reply",
                         "generated_reply": f"Reply {idx}",
                         "reply_publish_ts": now + idx,
@@ -1022,6 +1151,7 @@ class TestAutoReplier(unittest.TestCase):
                         "collect_initial_delay_seconds": 0,
                         "generate_initial_delay_seconds": 0,
                         "reply_initial_delay_seconds": 0,
+                        "quiet_hours_cn": None,
                     },
                 )
 
@@ -1114,11 +1244,196 @@ class TestAutoReplier(unittest.TestCase):
                         "collect_interval_seconds": 60,
                         "generate_interval_seconds": 60,
                         "reply_interval_seconds": 60,
+                        "quiet_hours_cn": None,
                     },
                 )
             sched_msgs = [str(c.args[0]) for c in cap_log.info.call_args_list if "下次执行" in str(c.args[0])]
             self.assertTrue(any("| #1]" in m for m in sched_msgs))
             self.assertFalse(any("| #2]" in m for m in sched_msgs))
+
+    def test_quiet_hours_helper_and_daemon_skips_browser_during_quiet_window(self):
+        self.assertEqual(_seconds_until_quiet_end(None, datetime(2026, 11, 23, 3, 0, 0, tzinfo=TZ_CN)), 0)
+        self.assertEqual(_seconds_until_quiet_end((1, 7), datetime(2026, 11, 23, 0, 59, 59, tzinfo=TZ_CN)), 0)
+        self.assertEqual(_seconds_until_quiet_end((1, 7), datetime(2026, 11, 23, 3, 30, 0, tzinfo=TZ_CN)), 12600)
+        self.assertEqual(_seconds_until_quiet_end((1, 7), datetime(2026, 11, 23, 7, 0, 0, tzinfo=TZ_CN)), 0)
+        self.assertEqual(_seconds_until_quiet_end((23, 7), datetime(2026, 11, 23, 23, 30, 0, tzinfo=TZ_CN)), 27000)
+        self.assertEqual(_seconds_until_quiet_end((23, 7), datetime(2026, 11, 23, 1, 30, 0, tzinfo=TZ_CN)), 19800)
+        self.assertEqual(_seconds_until_quiet_end((23, 7), datetime(2026, 11, 23, 22, 0, 0, tzinfo=TZ_CN)), 0)
+
+        db = _FakeDB()
+        with tempfile.TemporaryDirectory() as tmp:
+            acc = {"name": "x_dahao", "screen_name": "2434954452qqc", "user_data_dir": tmp, "enabled": True}
+            mock_col = MagicMock(return_value={"status": "ok"})
+            mock_gen = MagicMock(return_value={"status": "ok", "pending_found": 0})
+            mock_pub = MagicMock(return_value={"status": "ok"})
+            q_log = MagicMock()
+            with patch("x_growth.auto_replier._get_logger", return_value=q_log), \
+                 patch("x_growth.auto_replier.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_replier._seconds_until_quiet_end", return_value=3600), \
+                 patch("x_growth.auto_replier.collect_replies_for_account", mock_col), \
+                 patch("x_growth.auto_replier.generate_replies_from_db", mock_gen), \
+                 patch("x_growth.auto_replier.publish_replies_for_account", mock_pub):
+                run_parallel_daemon(
+                    accounts=[acc],
+                    max_rounds=1,
+                    config={
+                        "collect_initial_delay_seconds": 0,
+                        "generate_initial_delay_seconds": 0,
+                        "reply_initial_delay_seconds": 0,
+                        "quiet_hours_cn": (1, 7),
+                    },
+                )
+            self.assertEqual(mock_col.call_count, 0)
+            self.assertEqual(mock_pub.call_count, 0)
+            self.assertEqual(mock_gen.call_count, 0)
+            self.assertTrue(any("夜间静默" in str(c.args[0]) for c in q_log.info.call_args_list))
+
+    def test_parallel_daemon_shared_risk_cooldown_and_hard_lock_circuit_breaker(self):
+        db = _FakeDB()
+        with tempfile.TemporaryDirectory() as tmp:
+            acc = {"name": "x_dahao", "screen_name": "2434954452qqc", "user_data_dir": tmp, "enabled": True}
+
+            # 1. Hard lock (locked_challenge) halts daemon immediately and blocks collector from ever opening Chrome
+            mock_col_lock = MagicMock(return_value={"status": "ok"})
+            mock_pub_lock = MagicMock(
+                return_value={"status": "locked_challenge", "warning": "https://x.com/account/access"}
+            )
+            with patch("x_growth.auto_replier.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_replier.collect_replies_for_account", mock_col_lock), \
+                 patch("x_growth.auto_replier.publish_replies_for_account", mock_pub_lock):
+                run_parallel_daemon(
+                    accounts=[acc],
+                    max_rounds=3,
+                    config={
+                        "enable_generator": False,
+                        "collect_initial_delay_seconds": 5,
+                        "reply_initial_delay_seconds": 0,
+                        "quiet_hours_cn": None,
+                    },
+                )
+            self.assertEqual(mock_pub_lock.call_count, 1)
+            self.assertEqual(mock_col_lock.call_count, 0)
+
+            # 2. Soft cooldown (cooldown_required) is shared: after replier hits cooldown, collector & round 2 skip
+            cooldown_recorded = threading.Event()
+            mock_col_cd = MagicMock(return_value={"status": "ok"})
+            mock_pub_cd = MagicMock(return_value={"status": "cooldown_required", "warning": "rate throttle"})
+            cd_log = MagicMock()
+
+            def _watch_err(msg, *_a, **_kw):
+                if "共享风控冷却" in str(msg):
+                    cooldown_recorded.set()
+
+            cd_log.error.side_effect = _watch_err
+
+            def _synced_sleep(_sec, stop_event=None, **_kw):
+                cooldown_recorded.wait(timeout=2.0)
+                return not (stop_event is not None and stop_event.is_set())
+
+            with patch("x_growth.auto_replier._get_logger", return_value=cd_log), \
+                 patch("x_growth.auto_replier.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_replier.collect_replies_for_account", mock_col_cd), \
+                 patch("x_growth.auto_replier.publish_replies_for_account", mock_pub_cd), \
+                 patch("x_growth.auto_replier.interruptible_sleep", side_effect=_synced_sleep), \
+                 patch("common.daemon.interruptible_sleep", return_value=True):
+                run_parallel_daemon(
+                    accounts=[acc],
+                    max_rounds=2,
+                    config={
+                        "enable_generator": False,
+                        "collect_initial_delay_seconds": 5,
+                        "reply_initial_delay_seconds": 0,
+                        "collect_interval_seconds": 60,
+                        "reply_interval_seconds": 60,
+                        "quiet_hours_cn": None,
+                    },
+                )
+            self.assertEqual(mock_pub_cd.call_count, 1)
+            self.assertEqual(mock_col_cd.call_count, 0)
+
+    def test_publish_24h_post_quota_ceil_and_one_best_score_per_post(self):
+        self.assertEqual(_calc_post_target_replies(0, 0.1), 0)
+        self.assertEqual(_calc_post_target_replies(1, 0.1), 1)
+        self.assertEqual(_calc_post_target_replies(10, 0.1), 1)
+        self.assertEqual(_calc_post_target_replies(11, 0.1), 2)
+        self.assertEqual(_calc_post_target_replies(20, 0.1), 2)
+        self.assertEqual(_calc_post_target_replies(21, 0.1), 3)
+        self.assertEqual(_calc_post_target_replies(48, 0.1), 5)
+
+        db = _FakeDB()
+        now = 1_800_000_000
+        col = db.get_collection(REPLY_INBOX_COLLECTION)
+        cp_col = db.get_collection(POST_CHECKPOINTS_COLLECTION)
+
+        cp_col.docs.extend([
+            {"account_name": "x_myself", "post_id": "p_old", "post_publish_ts": now - 25 * 3600, "seen_reply_count": 5},
+            {"account_name": "x_myself", "post_id": "p_full", "post_publish_ts": now - 5 * 3600, "seen_reply_count": 10},
+            {"account_name": "x_myself", "post_id": "p_need2", "post_publish_ts": now - 4 * 3600, "seen_reply_count": 11},
+            {"account_name": "x_myself", "post_id": "p_small", "post_publish_ts": now - 2 * 3600, "seen_reply_count": 1},
+            {"account_name": "x_myself", "post_id": "p_need2_r1", "post_publish_ts": now - 3 * 3600, "seen_reply_count": 11},
+            {"account_name": "x_myself", "post_id": "p_fourth", "post_publish_ts": now - 1 * 3600, "seen_reply_count": 4},
+        ])
+        col.docs.extend([
+            # >24h old post -> excluded even with score 99
+            {"account_name": "x_myself", "reply_id": "c_old", "post_id": "p_old", "post_publish_ts": now - 25 * 3600, "reply_author": "u_old", "reply_author_lower": "u_old", "reply_score": 99, "status": "ready_to_reply", "generated_reply": "Old reply", "reply_publish_ts": now - 600, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            # p_full: 10 comments -> target ceil(1.0)=1, already 1 replied -> quota full
+            {"account_name": "x_myself", "reply_id": "c_full_done", "post_id": "p_full", "post_publish_ts": now - 5 * 3600, "reply_author": "u_fd", "reply_author_lower": "u_fd", "reply_score": 80, "status": "replied", "replied_source": "auto_replier", "replied_at_ts": now - 5000},
+            {"account_name": "x_myself", "reply_id": "c_full_wait", "post_id": "p_full", "post_publish_ts": now - 5 * 3600, "reply_author": "u_fw", "reply_author_lower": "u_fw", "reply_score": 98, "status": "ready_to_reply", "generated_reply": "Should skip quota full", "reply_publish_ts": now - 500, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            # p_need2: 11 comments -> target ceil(1.1)=2, 0 replied; 2 ready candidates -> pick ONLY c_need2_hi (91) this round
+            {"account_name": "x_myself", "reply_id": "c_need2_lo", "post_id": "p_need2", "post_publish_ts": now - 4 * 3600, "reply_author": "u_n2l", "reply_author_lower": "u_n2l", "reply_score": 62, "status": "ready_to_reply", "generated_reply": "Need2 low", "reply_publish_ts": now - 300, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            {"account_name": "x_myself", "reply_id": "c_need2_hi", "post_id": "p_need2", "post_publish_ts": now - 4 * 3600, "reply_author": "u_n2h", "reply_author_lower": "u_n2h", "reply_score": 91, "status": "ready_to_reply", "generated_reply": "Need2 high", "reply_publish_ts": now - 400, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            # p_small: 1 comment -> target ceil(0.1)=1
+            {"account_name": "x_myself", "reply_id": "c_small", "post_id": "p_small", "post_publish_ts": now - 2 * 3600, "reply_author": "u_sm", "reply_author_lower": "u_sm", "reply_score": 84, "status": "ready_to_reply", "generated_reply": "Small post reply", "reply_publish_ts": now - 200, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            # p_need2_r1: 11 comments -> target 2, 1 already replied -> remaining 1
+            {"account_name": "x_myself", "reply_id": "c_r1_done", "post_id": "p_need2_r1", "post_publish_ts": now - 3 * 3600, "reply_author": "u_r1d", "reply_author_lower": "u_r1d", "reply_score": 90, "status": "replied", "replied_source": "detected_on_x", "replied_at_ts": now - 4000},
+            {"account_name": "x_myself", "reply_id": "c_r1_wait", "post_id": "p_need2_r1", "post_publish_ts": now - 3 * 3600, "reply_author": "u_r1w", "reply_author_lower": "u_r1w", "reply_score": 78, "status": "ready_to_reply", "generated_reply": "Remaining 1 reply", "reply_publish_ts": now - 150, "reply_next_retry_ts": 0, "reply_attempts": 0},
+            # p_fourth: 4 comments -> target 1, score 70 -> ranks 4th in round 1, wins round 2
+            {"account_name": "x_myself", "reply_id": "c_fourth", "post_id": "p_fourth", "post_publish_ts": now - 1 * 3600, "reply_author": "u_4th", "reply_author_lower": "u_4th", "reply_score": 70, "status": "ready_to_reply", "generated_reply": "Fourth post reply", "reply_publish_ts": now - 100, "reply_next_retry_ts": 0, "reply_attempts": 0},
+        ])
+
+        sent_order = []
+
+        @contextlib.contextmanager
+        def _fake_session(*_a, **_kw):
+            page = _make_fake_page(url="https://x.com/home", visible_selectors=("tweetTextarea_0",))
+            resp = MagicMock()
+            resp.status = 200
+            page.goto.side_effect = lambda u, **_kw2: (setattr(page, "url", u) or resp)
+            yield (MagicMock(), page)
+
+        def _fake_submit(_p, _b, content="", **_kw):
+            sent_order.append(content)
+            return f"tw_{len(sent_order)}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            acc = {"name": "x_myself", "screen_name": "peterzhu1003", "user_data_dir": tmp}
+            with patch("x_growth.auto_replier.persistent_browser_session", side_effect=_fake_session), \
+                 patch("x_growth.auto_replier._wait_x_home_ready"), \
+                 patch("x_growth.auto_replier._wait_x_post_detail_ready"), \
+                 patch("x_growth.auto_replier._dismiss_overlays"), \
+                 patch("x_growth.auto_replier.check_for_crash"), \
+                 patch("x_growth.auto_replier._resolve_session_identity", return_value=("u_me", "peterzhu1003")), \
+                 patch("x_growth.auto_replier._locate_x_reply_box", return_value=MagicMock()), \
+                 patch("x_growth.auto_replier._sleep_jitter"), \
+                 patch("x_growth.auto_replier._submit_x_post", side_effect=_fake_submit), \
+                 patch.object(XReplyInboxSniffer, "wait_for_ops", return_value=False), \
+                 patch.object(XReplyInboxSniffer, "find_my_existing_reply", return_value=None):
+                res1 = publish_replies_for_account(acc, db=db, config={"max_replies_per_run": 3}, now_ts=now)
+                self.assertEqual(res1["status"], "ok")
+                self.assertEqual(res1["candidates_found"], 4)
+                self.assertEqual(res1["replied_count"], 3)
+                self.assertEqual([it["reply_id"] for it in res1["items"]], ["c_need2_hi", "c_small", "c_r1_wait"])
+                self.assertEqual(len({it["post_id"] for it in res1["items"]}), 3)
+
+                # Round 2: p_small & p_need2_r1 are now exhausted (1/1 and 2/2); p_need2 still has 1 left -> c_need2_lo & c_fourth send!
+                res2 = publish_replies_for_account(acc, db=db, config={"max_replies_per_run": 3}, now_ts=now + 3600)
+                self.assertEqual(res2["status"], "ok")
+                self.assertEqual(res2["candidates_found"], 2)
+                self.assertEqual(res2["replied_count"], 2)
+                self.assertEqual([it["reply_id"] for it in res2["items"]], ["c_fourth", "c_need2_lo"])
+                self.assertEqual(col.find_one({"reply_id": "c_old"})["status"], "ready_to_reply")
+                self.assertEqual(col.find_one({"reply_id": "c_full_wait"})["status"], "ready_to_reply")
+
 
 
 if __name__ == "__main__":

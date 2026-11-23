@@ -3,6 +3,7 @@
 import ast
 import base64
 import contextlib
+from datetime import datetime
 import logging
 import pathlib
 import tempfile
@@ -16,11 +17,15 @@ from x_growth.auto_pinner import (
     ACCOUNTS,
     CONVERSION_METRIC_MODE,
     INTERVAL_SECONDS,
+    MAX_ANALYTICS_POSTS_PER_RUN,
     PIN_HISTORY_COLLECTION,
     PIN_SNAPSHOTS_COLLECTION,
+    QUIET_HOURS_CN,
     SESSION_MAX_HOLD_SECONDS,
+    TZ_CN,
     WINDOW_HOURS,
     XPinAnalyticsSniffer,
+    _seconds_until_quiet_end,
     build_status_report,
     compute_post_conversion_metrics,
     detect_pinned_tweet_id_from_dom,
@@ -267,6 +272,8 @@ class TestAutoPinner(unittest.TestCase):
 
         self.assertEqual(INTERVAL_SECONDS, 21600)
         self.assertEqual(WINDOW_HOURS, 72)
+        self.assertEqual(MAX_ANALYTICS_POSTS_PER_RUN, 12)
+        self.assertEqual(QUIET_HOURS_CN, (1, 7))
         self.assertEqual(CONVERSION_METRIC_MODE, "weighted_conversion")
         self.assertLessEqual(SESSION_MAX_HOLD_SECONDS, 180)
         self.assertTrue(bool(ACCOUNTS[0]["name"]))
@@ -594,9 +601,34 @@ class TestAutoPinner(unittest.TestCase):
 
             with patch("x_growth.auto_pinner.gen_db_object", return_value=db), \
                  patch("x_growth.auto_pinner.sync_best_pinned_post_for_account", return_value={"status": "already_pinned"}) as mock_sync:
-                rounds = run_pinner_daemon(accounts=[acc], max_rounds=1)
+                rounds = run_pinner_daemon(accounts=[acc], max_rounds=1, config={"quiet_hours_cn": None})
             self.assertEqual(rounds, 1)
             self.assertEqual(mock_sync.call_count, 1)
+
+    def test_quiet_hours_and_hard_lock_halts_pinner_daemon(self):
+        self.assertEqual(_seconds_until_quiet_end(None, datetime(2026, 11, 23, 2, 0, 0, tzinfo=TZ_CN)), 0)
+        self.assertEqual(_seconds_until_quiet_end((1, 7), datetime(2026, 11, 23, 2, 0, 0, tzinfo=TZ_CN)), 18000)
+        self.assertEqual(_seconds_until_quiet_end((1, 7), datetime(2026, 11, 23, 8, 0, 0, tzinfo=TZ_CN)), 0)
+        self.assertEqual(_seconds_until_quiet_end((23, 7), datetime(2026, 11, 23, 23, 45, 0, tzinfo=TZ_CN)), 26100)
+
+        db = _FakeDB()
+        with tempfile.TemporaryDirectory() as tmp:
+            acc = {"name": "x_dahao", "screen_name": "2434954452qqc", "user_data_dir": tmp, "enabled": True}
+
+            # Quiet hours defers sync without opening Chrome
+            with patch("x_growth.auto_pinner.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_pinner._seconds_until_quiet_end", return_value=3600), \
+                 patch("x_growth.auto_pinner.sync_best_pinned_post_for_account") as mock_q:
+                rounds_q = run_pinner_daemon(accounts=[acc], max_rounds=1, config={"quiet_hours_cn": (1, 7)})
+            self.assertEqual(rounds_q, 1)
+            self.assertEqual(mock_q.call_count, 0)
+
+            # Hard lock (locked_challenge) halts daemon immediately after round 1
+            with patch("x_growth.auto_pinner.gen_db_object", return_value=db), \
+                 patch("x_growth.auto_pinner.sync_best_pinned_post_for_account", return_value={"status": "locked_challenge", "warning": "https://x.com/account/access"}) as mock_lock:
+                rounds_lock = run_pinner_daemon(accounts=[acc], max_rounds=3, config={"quiet_hours_cn": None})
+            self.assertEqual(rounds_lock, 1)
+            self.assertEqual(mock_lock.call_count, 1)
 
 
 if __name__ == "__main__":

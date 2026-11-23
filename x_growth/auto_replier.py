@@ -19,6 +19,7 @@ X (Twitter) 帖子评论全自动回复系统 (`x_growth/auto_replier.py`)
 """
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_CEILING
 from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
@@ -97,20 +98,22 @@ ACCOUNTS: List[Dict[str, Any]] = [
     # },
 ]
 
-# 2. 三个独立工人的并行调度开关与运行周期（单位：秒；默认 600 秒 = 每 10 分钟各独立运行一轮）
+# 2. 三个独立工人的并行调度开关与运行周期（单位：秒；三工人均按 1 小时周期并行运行，按错峰初始延迟依次衔接）
 ENABLE_COLLECTOR: bool = True             # 是否启动【工人 1 · 收集评论】（False=不采集）
-COLLECT_INTERVAL_SECONDS: int = 600       # 工人 1 基础执行间隔（秒；600=10 分钟；想改回半小时/1小时可调为 1800/3600）
-COLLECT_JITTER_SECONDS: Tuple[int, int] = (15, 45)   # 每轮额外附加的随机延迟范围 (最小秒, 最大秒)，防止整点机械规律
+# 【保留过滤原因说明】每 1 小时冷启一次浏览器采集通知，兼顾新帖评论捕获时效与低频抗风控，且与生成/回复错峰
+COLLECT_INTERVAL_SECONDS: int = 3600      # 工人 1 基础执行间隔（秒；3600=1 小时）
+COLLECT_JITTER_SECONDS: Tuple[int, int] = (90, 300)  # 每轮额外附加的随机延迟范围 (最小秒, 最大秒)，打散整点规律
 COLLECT_INITIAL_DELAY_SECONDS: int = 0    # 启动后工人 1 首次等待多少秒再开跑（0=启动立即运行）
 
-ENABLE_GENERATOR: bool = True             # 是否启动【工人 2 · AI 生成回复】（纯查库不开浏览器）
-GENERATE_INTERVAL_SECONDS: int = 600      # 工人 2 基础执行间隔（秒；600=10 分钟）
+ENABLE_GENERATOR: bool = True             # 是否启动【工人 2 · AI 生成回复】（纯查库不开浏览器，零 X 流量）
+GENERATE_INTERVAL_SECONDS: int = 3600     # 工人 2 基础执行间隔（秒；3600=1 小时）
 GENERATE_JITTER_SECONDS: Tuple[int, int] = (5, 15)   # 工人 2 轮次随机抖动范围（秒）
 GENERATE_INITIAL_DELAY_SECONDS: int = 60  # 启动后工人 2 延迟 60 秒运行，确保接住工人 1 首轮展开详情后的完整入库数据
 
 ENABLE_REPLIER: bool = True               # 是否启动【工人 3 · 精准执行回复】（开浏览器发回复）
-REPLY_INTERVAL_SECONDS: int = 600         # 工人 3 基础执行间隔（秒；600=10 分钟）
-REPLY_JITTER_SECONDS: Tuple[int, int] = (15, 45)     # 工人 3 轮次随机抖动范围（秒）
+# 【保留过滤原因说明】每 1 小时检查并慢速发出回复，与 1 小时采集/生成保持 120s 错峰运行，彻底避开目录锁碰撞
+REPLY_INTERVAL_SECONDS: int = 3600        # 工人 3 基础执行间隔（秒；3600=1 小时）
+REPLY_JITTER_SECONDS: Tuple[int, int] = (90, 300)    # 工人 3 轮次随机抖动范围（秒）
 REPLY_INITIAL_DELAY_SECONDS: int = 120    # 启动后工人 3 延迟 120 秒运行，避开工人 1 抢锁并接住工人 2 刚生成的回复
 
 # 3. 【模块 1 · 收集评论】监控范围、扫描深度与防重复过滤参数
@@ -120,8 +123,8 @@ REPLY_INITIAL_DELAY_SECONDS: int = 120    # 启动后工人 3 延迟 120 秒运�
 ONLY_MY_ROOT_POSTS: bool = True
 # 【保留过滤原因说明】单轮仅扫描本人主页最新 N 条原创/引用主帖，避免翻阅陈年旧帖引发无意义的浏览器滚屏风控
 MAX_OWN_POSTS_TO_SCAN: int = 20           # 每次访问自己主页最多检查最新多少条主帖
-# 【保留过滤原因说明】单轮最多打开 N 个帖子详情页做深度抓评，配合持锁上限控制单次浏览耗时
-MAX_POST_DETAILS_PER_RUN: int = 8         # 单轮最多点开几条有评论/新提及的帖子详情页抓取完整评论树
+# 【保留过滤原因说明】单轮最多打开 5 个帖子详情页做深度抓评，配合持锁上限压低单次会话连续跳转数
+MAX_POST_DETAILS_PER_RUN: int = 5         # 单轮最多点开几条有评论/新提及的帖子详情页抓取完整评论树
 PROFILE_SCROLL_ROUNDS: int = 2            # 浏览自己主页时向下滚屏次数（想扫更早的主帖可适当调大如 3~4）
 MENTIONS_SCROLL_ROUNDS: int = 2           # 浏览通知页（全部通知 + 提及）时向下滚屏次数
 DETAIL_SCROLL_ROUNDS: int = 2             # 点开单个帖子详情页后向下滚屏加载评论的次数
@@ -144,15 +147,28 @@ MAX_GENERATE_RETRIES: int = 3             # 单条评论 AI 生成失败最多�
 # 5. 【模块 3 · 执行回复】浏览器可见性、频率控制与风控冷却参数
 DRY_RUN: bool = False                     # True=仅预览待发内容，绝不打开浏览器或真发；False=真实发送回复
 BROWSER_VISIBLE: bool = False             # False=后台静默运行不弹窗（推荐挂机）；True=弹出 Chrome 窗口方便观察过程
-LIKE_COMMENT_BEFORE_REPLY: bool = True    # 回复对方评论前是否顺手给对方那条评论点赞
-MAX_REPLIES_PER_RUN: int = 5              # 【保留过滤原因说明】单轮最多真实发出 5 条回复，分散行为节奏防高频刷评风控
-MAX_REPLIES_PER_DAY: int = 300             # 【保留过滤原因说明】单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
-ACTION_DELAY_RANGE: Tuple[int, int] = (12, 25)  # 同一轮发多条回复时，每两条之间随机停顿多少秒 (最小秒, 最大秒)
+# 【保留过滤原因说明】关闭回评前顺手点赞（此前每条 reply 强绑 like 导致写操作翻倍且形成固定双写自动化指纹）
+LIKE_COMMENT_BEFORE_REPLY: bool = False   # 回复对方评论前是否顺手给对方那条评论点赞
+MAX_REPLIES_PER_RUN: int = 3              # 【保留过滤原因说明】单轮最多真实发出 3 条回复，配合长间隔防止批内高密度脉冲
+# 【保留过滤原因说明】单账号滚动 60 分钟写回复硬上限，直接消除爆帖期间单小时几十条连续 CreateTweet 脉冲风控
+MAX_REPLIES_PER_HOUR: int = 8             # 单账号滚动 1 小时自动回复上限（设为 0 表示不限制）
+# 【保留过滤原因说明】单账号 24 小时滚动自动回复上限收紧至 50 条，匹配稳定养号安全预算（设为 0 表示不限制）
+MAX_REPLIES_PER_DAY: int = 50             # 单账号 24 小时滚动自动回复上限（设为 0 表示不限制）
+# 【保留过滤原因说明】同轮多条回复间拉长随机停顿至 25~55s，彻底打破固定 ~30s 机械发送节拍
+ACTION_DELAY_RANGE: Tuple[int, int] = (25, 55)  # 同一轮发多条回复时，每两条之间随机停顿多少秒 (最小秒, 最大秒)
+# 【保留过滤原因说明】仅筛选发帖 24 小时内的活跃主帖分配回复额度，超过 24 小时黄金传播期的旧帖不再消耗每日预算（设为 0 表示不限制）
+POST_REPLY_WINDOW_HOURS: int = 24         # 仅回复发布多少小时内的主帖（默认 24 小时）
+# 【保留过滤原因说明】每篇主帖的目标自动回复总数 = 向上取整(主帖总评论数 × 0.1)，如 1 条评->回 1 个、11 条评->回 2 个
+POST_REPLY_QUOTA_RATIO: float = 0.1       # 每帖应回复比例（向上取整）
+# 【保留过滤原因说明】单轮每篇主帖最多选出 1 条评分最高的待发评论，即使该帖剩余配额 >= 2 也分散到多轮发送，避免集中刷屏单帖
+MAX_REPLIES_PER_POST_PER_RUN: int = 1     # 单轮同一原帖最多选几条最高分评论回复
+# 【保留过滤原因说明】凌晨 01:00–07:00（北京时间）开启全量静默休息，三个工人均不执行任何操作，杜绝深夜机械作息特征（设为 None 关闭）
+QUIET_HOURS_CN: Optional[Tuple[int, int]] = (1, 7)  # 夜间静默小时段 [开始小时, 结束小时)（北京时间，None=全天运行）
 # 【保留过滤原因说明】`platforms/playwright_base.py` 跨进程目录锁超时为 300s；单次持锁满 150s 主动收手放锁，确保与采集/发帖/互关共存不超时
 SESSION_MAX_HOLD_SECONDS: int = 150       # 单次打开浏览器的最长持锁秒数（到点自动收手放锁，下轮再继续）
 MAX_REPLY_RETRIES: int = 3                # 单条评论发送失败最多重试几次（超限标为 failed）
 RETRY_COOLDOWN_SECONDS: int = 600         # 单条生成或发送临时失败后的重试退避秒数（600=10 分钟后下轮再试）
-RISK_COOLDOWN_SECONDS: int = 21600        # 遇安全验证、登录失效或业务风控拦截时，该账号自动静默冷却秒数（21600=6 小时）
+RISK_COOLDOWN_SECONDS: int = 21600        # 遇业务限流触发软风控冷却秒数（21600=6 小时）；若遇硬安全锁/掉登录则直接熔断停机待人工处理
 
 # 6. 独立 MongoDB 集合名（物理隔离历史旧表与采集评论池，一般无需修改）
 REPLY_INBOX_COLLECTION: str = "x_reply_inbox"              # 评论收件箱与生成/发送状态表
@@ -185,7 +201,9 @@ _HASHTAG_RE = re.compile(r"(?:^|\s)#[\w\u4e00-\u9fff]+", re.UNICODE)
 _LEADING_MENTIONS_RE = re.compile(r"^(?:@[A-Za-z0-9_]+\s*)+")
 _LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 _UNDETERMINED_LANGS = {"", "unknown", "und", "qme", "qam", "zxx", "art"}
-_RISK_HALT_STATUSES = {"locked_challenge", "not_logged_in", "suspended", "cooldown_required"}
+_HARD_LOCK_STATUSES = {"locked_challenge", "not_logged_in", "suspended"}
+_RISK_HALT_STATUSES = _HARD_LOCK_STATUSES | {"cooldown_required"}
+_HARD_LOCK_ERROR_HINTS = ("/account/access", "i/flow/login", "安全验证", "登录跳转", "suspended")
 
 _INDEXED_DBS: Set[int] = set()
 _LOGGER: Optional[Any] = None
@@ -253,7 +271,7 @@ def _sleep_jitter(delay_range: Sequence[float]) -> None:
     try:
         lo, hi = float(delay_range[0]), float(delay_range[1])
     except Exception:
-        lo, hi = 12.0, 25.0
+        lo, hi = 25.0, 55.0
     if hi > 0:
         time.sleep(random.uniform(max(1.0, lo), max(lo + 1.0, hi)))
 
@@ -263,6 +281,43 @@ def _parse_jitter_pair(raw_jitter: Any) -> Tuple[int, int]:
         lo, hi = max(0, int(raw_jitter[0])), max(0, int(raw_jitter[1]))
         return (hi, lo) if lo > hi else (lo, hi)
     return (0, 0)
+
+
+def _parse_quiet_hours(raw: Any) -> Optional[Tuple[int, int]]:
+    if raw is None or not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return None
+    try:
+        start_h = int(raw[0]) % 24
+        end_h = int(raw[1]) % 24
+    except (TypeError, ValueError):
+        return None
+    return None if start_h == end_h else (start_h, end_h)
+
+
+def _seconds_until_quiet_end(
+    quiet_hours: Optional[Tuple[int, int]],
+    now_dt: Optional[datetime] = None,
+) -> int:
+    parsed = _parse_quiet_hours(quiet_hours)
+    if not parsed:
+        return 0
+    start_h, end_h = parsed
+    dt = now_dt if now_dt is not None else datetime.now(TZ_CN)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ_CN)
+    hour = dt.hour
+    if start_h < end_h:
+        if not (start_h <= hour < end_h):
+            return 0
+        end_dt = dt.replace(hour=end_h, minute=0, second=0, microsecond=0)
+    else:
+        if hour >= start_h:
+            end_dt = (dt + timedelta(days=1)).replace(hour=end_h, minute=0, second=0, microsecond=0)
+        elif hour < end_h:
+            end_dt = dt.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        else:
+            return 0
+    return max(1, int((end_dt - dt).total_seconds()))
 
 
 def _default_cfg() -> Dict[str, Any]:
@@ -297,8 +352,13 @@ def _default_cfg() -> Dict[str, Any]:
         "browser_visible": BROWSER_VISIBLE,
         "like_comment_before_reply": LIKE_COMMENT_BEFORE_REPLY,
         "max_replies_per_run": MAX_REPLIES_PER_RUN,
+        "max_replies_per_hour": MAX_REPLIES_PER_HOUR,
         "max_replies_per_day": MAX_REPLIES_PER_DAY,
         "action_delay_range": ACTION_DELAY_RANGE,
+        "post_reply_window_hours": POST_REPLY_WINDOW_HOURS,
+        "post_reply_quota_ratio": POST_REPLY_QUOTA_RATIO,
+        "max_replies_per_post_per_run": MAX_REPLIES_PER_POST_PER_RUN,
+        "quiet_hours_cn": QUIET_HOURS_CN,
         "session_max_hold_seconds": SESSION_MAX_HOLD_SECONDS,
         "max_reply_retries": MAX_REPLY_RETRIES,
         "retry_cooldown_seconds": RETRY_COOLDOWN_SECONDS,
@@ -687,12 +747,17 @@ class XReplyInboxSniffer:
             self.tweets_by_id[tid] = tw
             return
         merged_rc = max(safe_int(prev.get("reply_count"), 0), safe_int(tw.get("reply_count"), 0))
+        merged_pub = safe_int(tw.get("publish_ts"), 0) or safe_int(prev.get("publish_ts"), 0)
         if len(tw.get("text") or "") >= len(prev.get("text") or ""):
-            self.tweets_by_id[tid] = (
-                {**tw, "reply_count": merged_rc} if merged_rc != safe_int(tw.get("reply_count"), 0) else tw
-            )
-        elif merged_rc > safe_int(prev.get("reply_count"), 0):
+            self.tweets_by_id[tid] = {
+                **tw,
+                "reply_count": merged_rc,
+                "publish_ts": merged_pub,
+            }
+        else:
             prev["reply_count"] = merged_rc
+            if merged_pub and not prev.get("publish_ts"):
+                prev["publish_ts"] = merged_pub
 
     def ingest_payload(self, op: str, payload: Any, *, resp_url: str = "") -> None:
         if not isinstance(payload, dict):
@@ -927,6 +992,7 @@ def upsert_collected_replies(
             continue
 
         post_text = str((root_tweet or {}).get("text") or cp_doc.get("post_text") or "").strip()
+        post_publish_ts = safe_int((root_tweet or {}).get("publish_ts") or cp_doc.get("post_publish_ts"), 0)
         post_has_media = bool((root_tweet or {}).get("has_media"))
         post_url = str(
             (root_tweet or {}).get("url")
@@ -941,6 +1007,8 @@ def upsert_collected_replies(
             updates: Dict[str, Any] = {}
             if post_text and not str(existing_doc.get("post_text") or "").strip():
                 updates["post_text"] = post_text
+            if post_publish_ts > 0 and safe_int(existing_doc.get("post_publish_ts"), 0) <= 0:
+                updates["post_publish_ts"] = post_publish_ts
             if parent_text and not str(existing_doc.get("parent_tweet_text") or "").strip():
                 updates["parent_tweet_text"] = parent_text
             if my_existing and existing_doc.get("status") != "replied":
@@ -992,6 +1060,7 @@ def upsert_collected_replies(
             "post_id": post_id,
             "post_url": post_url,
             "post_text": post_text,
+            "post_publish_ts": post_publish_ts,
             "post_has_media": post_has_media,
             "is_own_root_post": bool(is_own_root) if is_own_root is not None else False,
             "parent_tweet_id": parent_id,
@@ -999,6 +1068,7 @@ def upsert_collected_replies(
             "status": "pending_generate",
             "skip_reason": None,
             "generated_reply": None,
+            "reply_score": None,
             "generated_lang": None,
             "generated_weighted_len": None,
             "generator_model": None,
@@ -1268,20 +1338,21 @@ def collect_replies_for_account(
                     pid = post["tweet_id"]
                     rcount = safe_int(post.get("reply_count"), 0)
                     cp = cp_col.find_one({"account_name": acc_name, "post_id": pid})
+                    cp_set: Dict[str, Any] = {
+                        "account_name": acc_name,
+                        "post_id": pid,
+                        "post_url": post["url"],
+                        "post_text": post["text"],
+                        "is_own_post": True,
+                        "seen_reply_count": rcount,
+                        "updated_at": _now_iso(now_ts),
+                        "updated_at_ts": now_ts,
+                    }
+                    if safe_int(post.get("publish_ts"), 0) > 0:
+                        cp_set["post_publish_ts"] = safe_int(post.get("publish_ts"), 0)
                     cp_col.update_one(
                         {"account_name": acc_name, "post_id": pid},
-                        {
-                            "$set": {
-                                "account_name": acc_name,
-                                "post_id": pid,
-                                "post_url": post["url"],
-                                "post_text": post["text"],
-                                "is_own_post": True,
-                                "seen_reply_count": rcount,
-                                "updated_at": _now_iso(now_ts),
-                                "updated_at_ts": now_ts,
-                            }
-                        },
+                        {"$set": cp_set},
                         upsert=True,
                     )
                     if rcount <= 0 and pid not in fresh_mention_conv_ids:
@@ -1446,23 +1517,24 @@ def collect_replies_for_account(
                         )
                     )
                     inbox_cnt = inbox_col.count_documents({"account_name": acc_name, "post_id": conv_id})
+                    detail_cp_set: Dict[str, Any] = {
+                        "account_name": acc_name,
+                        "post_id": conv_id,
+                        "post_url": root_tw["url"],
+                        "post_text": root_tw["text"],
+                        "is_own_post": is_own_root,
+                        "last_reply_count": safe_int(root_tw.get("reply_count"), 0),
+                        "last_captured_replies": max(detail_reply_cnt, inbox_cnt),
+                        "last_checked_ts": chk_now,
+                        "last_checked_at": _now_iso(chk_now),
+                        "updated_at": _now_iso(chk_now),
+                        "updated_at_ts": chk_now,
+                    }
+                    if safe_int(root_tw.get("publish_ts"), 0) > 0:
+                        detail_cp_set["post_publish_ts"] = safe_int(root_tw.get("publish_ts"), 0)
                     cp_col.update_one(
                         {"account_name": acc_name, "post_id": conv_id},
-                        {
-                            "$set": {
-                                "account_name": acc_name,
-                                "post_id": conv_id,
-                                "post_url": root_tw["url"],
-                                "post_text": root_tw["text"],
-                                "is_own_post": is_own_root,
-                                "last_reply_count": safe_int(root_tw.get("reply_count"), 0),
-                                "last_captured_replies": max(detail_reply_cnt, inbox_cnt),
-                                "last_checked_ts": chk_now,
-                                "last_checked_at": _now_iso(chk_now),
-                                "updated_at": _now_iso(chk_now),
-                                "updated_at_ts": chk_now,
-                            }
-                        },
+                        {"$set": detail_cp_set},
                         upsert=True,
                     )
 
@@ -1531,6 +1603,26 @@ def _build_parent_context_block(doc: Dict[str, Any]) -> str:
     return f"该评论是对你此前一条回复的追评，你上一条回复内容为：\n{parent_txt}"
 
 
+def _format_relative_age_zh(age_sec: int) -> str:
+    sec = max(0, int(age_sec))
+    if sec < 3600:
+        return f"约 {max(1, round(sec / 60))} 分钟前"
+    if sec < 86400:
+        return f"约 {round(sec / 3600, 1):g} 小时前"
+    return f"约 {round(sec / 3600, 1):g} 小时前（超过 1 天）"
+
+
+def _build_time_context_block(doc: Dict[str, Any], now_ts: int) -> str:
+    parts: List[str] = []
+    post_ts = safe_int(doc.get("post_publish_ts"), 0)
+    reply_ts = safe_int(doc.get("reply_publish_ts"), 0)
+    if post_ts > 0:
+        parts.append(f"原帖发布于 {_format_relative_age_zh(now_ts - post_ts)}")
+    if reply_ts > 0:
+        parts.append(f"该评论发表于 {_format_relative_age_zh(now_ts - reply_ts)}")
+    return "；".join(parts) if parts else "发布时间未知"
+
+
 def generate_replies_from_db(
     account: Dict[str, Any],
     *,
@@ -1563,7 +1655,7 @@ def generate_replies_from_db(
                 "generate_next_retry_ts": {"$lte": eff_now},
             }
         )
-        .sort("reply_publish_ts", 1)
+        .sort("reply_publish_ts", -1)
         .limit(limit)
     )
 
@@ -1584,6 +1676,7 @@ def generate_replies_from_db(
         reply_author = str(doc.get("reply_author") or "").lstrip("@")
         reply_text = str(doc.get("reply_text") or "").strip()
         post_text = str(doc.get("post_text") or "").strip() or "（原帖正文暂无文本）"
+        time_context_block = _build_time_context_block(doc, int(time.time()) if now_ts is None else eff_now)
 
         prompt_text, prompt_meta = render_prompt_template(
             PROMPT_TEMPLATE_FILENAME,
@@ -1591,6 +1684,7 @@ def generate_replies_from_db(
                 "ACCOUNT_HANDLE": acc_handle,
                 "MY_POST_TEXT": post_text,
                 "MY_POST_HAS_MEDIA": "是" if doc.get("post_has_media") else "否",
+                "TIME_CONTEXT_BLOCK": time_context_block,
                 "PARENT_CONTEXT_BLOCK": _build_parent_context_block(doc),
                 "REPLY_AUTHOR": f"@{reply_author}" if reply_author else "读者",
                 "REPLY_TEXT": reply_text,
@@ -1604,8 +1698,13 @@ def generate_replies_from_db(
             skip_val = data.get("skip")
             if not isinstance(skip_val, bool):
                 return "`skip` 必须为布尔值 true 或 false"
+            raw_score = data.get("reply_score")
             if skip_val:
+                if raw_score is not None and (isinstance(raw_score, bool) or not isinstance(raw_score, int) or not (0 <= raw_score <= 100)):
+                    return "`skip=true` 时 `reply_score` 须为 0 ~ 100 整数"
                 return None
+            if isinstance(raw_score, bool) or not isinstance(raw_score, int) or not (1 <= raw_score <= 100):
+                return "`reply_score` 在未跳过时必须是 1 ~ 100 的整数"
             lang_norm = _norm_lang(data.get("language"))
             if lang_norm == "unknown" or not _LANG_CODE_RE.match(lang_norm):
                 return f"`language` ({data.get('language')}) 必须是双字母小写语言代码"
@@ -1674,6 +1773,7 @@ def generate_replies_from_db(
                     "$set": {
                         "status": "skipped",
                         "skip_reason": f"ai_safety:{reason}",
+                        "reply_score": 0,
                         "generator_model": model_used,
                         "generator_prompt_file": prompt_file,
                         "generator_prompt_sha1": prompt_sha1,
@@ -1698,6 +1798,7 @@ def generate_replies_from_db(
         reply_out = _clean_generated_reply_text(parsed.get("reply_text"), reply_author)
         w_len = calc_x_weighted_length(reply_out)
         gen_lang = _norm_lang(parsed.get("language"))
+        reply_score = int(parsed["reply_score"])
 
         col.update_one(
             {"account_name": acc_name, "reply_id": rid},
@@ -1705,6 +1806,7 @@ def generate_replies_from_db(
                 "$set": {
                     "status": "ready_to_reply",
                     "generated_reply": reply_out,
+                    "reply_score": reply_score,
                     "generated_lang": gen_lang,
                     "generated_weighted_len": w_len,
                     "generator_model": model_used,
@@ -1724,7 +1826,7 @@ def generate_replies_from_db(
         ready_cnt += 1
         log.info(
             f"✍️ [模块2/生成就绪 | {acc_name}] @{reply_author}({rid}) "
-            f"[{gen_lang}|{w_len}w|{model_used}|p={prompt_tag}|{gen_cost_s}s] "
+            f"[{reply_score}分|{gen_lang}|{w_len}w|{model_used}|p={prompt_tag}|{gen_cost_s}s] "
             f"帖「{_clip_log_text(post_text, 20)}」 | 评「{_clip_log_text(reply_text, 28)}」 -> 回「{reply_out}」"
         )
 
@@ -1763,6 +1865,140 @@ def _like_focal_comment_on_page(page: Any, reply_id: str, logger: Any) -> bool:
         return False
 
 
+def _calc_post_target_replies(total_comments: int, ratio: float = POST_REPLY_QUOTA_RATIO) -> int:
+    """按帖子总评论数 × 比例向上取整计算目标回复总数（1 条 -> 1 个，11 条 -> 2 个）。"""
+    total = max(0, int(total_comments or 0))
+    if total <= 0:
+        return 0
+    r = max(0.0, float(ratio or 0.0))
+    if r <= 0.0:
+        return total
+    return max(1, int((Decimal(total) * Decimal(str(r))).to_integral_value(rounding=ROUND_CEILING)))
+
+
+def _effective_reply_score(doc: Dict[str, Any]) -> int:
+    raw = doc.get("reply_score")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and int(raw) > 0:
+        return int(raw)
+    return 50
+
+
+def _select_post_balanced_candidates(
+    col: Any,
+    cp_col: Any,
+    *,
+    account_name: str,
+    eff_now: int,
+    window_hours: int,
+    quota_ratio: float,
+    per_post_per_run: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """从 24h 内仍有剩余回复配额的帖子中，每帖仅挑选评分最高的 1 条待发评论并按评分全局降序。"""
+    ready_docs = list(
+        col.find(
+            {
+                "account_name": account_name,
+                "status": "ready_to_reply",
+                "generated_reply": {"$exists": True, "$ne": ""},
+                "reply_next_retry_ts": {"$lte": eff_now},
+            }
+        )
+    )
+    if not ready_docs:
+        return [], {
+            "raw_ready_count": 0,
+            "raw_post_count": 0,
+            "eligible_post_count": 0,
+            "skipped_old_posts": 0,
+            "skipped_quota_posts": 0,
+        }
+
+    ready_by_post: Dict[str, List[Dict[str, Any]]] = {}
+    real_post_ids: Set[str] = set()
+    for d in ready_docs:
+        raw_pid = str(d.get("post_id") or "").strip()
+        if raw_pid:
+            real_post_ids.add(raw_pid)
+        key = raw_pid or f"__orphan_{d.get('reply_id')}"
+        ready_by_post.setdefault(key, []).append(d)
+
+    cp_by_post: Dict[str, Dict[str, Any]] = {}
+    inbox_by_post: Dict[str, List[Dict[str, Any]]] = {}
+    if real_post_ids:
+        pid_list = sorted(real_post_ids)
+        for cp in cp_col.find({"account_name": account_name, "post_id": {"$in": pid_list}}):
+            pid = str(cp.get("post_id") or "").strip()
+            if pid:
+                cp_by_post[pid] = cp
+        for d in col.find({"account_name": account_name, "post_id": {"$in": pid_list}}):
+            pid = str(d.get("post_id") or "").strip()
+            if pid:
+                inbox_by_post.setdefault(pid, []).append(d)
+
+    window_sec = max(0, int(window_hours or 0)) * 3600
+    skipped_old_posts = 0
+    skipped_quota_posts = 0
+    selected: List[Dict[str, Any]] = []
+
+    for post_key, post_ready_docs in ready_by_post.items():
+        is_orphan = post_key.startswith("__orphan_")
+        cp_doc = cp_by_post.get(post_key, {}) if not is_orphan else {}
+        post_inbox_docs = inbox_by_post.get(post_key, post_ready_docs) if not is_orphan else post_ready_docs
+
+        known_post_ts = [safe_int(cp_doc.get("post_publish_ts"), 0)] + [
+            safe_int(x.get("post_publish_ts"), 0) for x in post_inbox_docs
+        ]
+        post_ts = max(known_post_ts)
+        if post_ts <= 0:
+            reply_ts_list = [safe_int(x.get("reply_publish_ts"), 0) for x in post_inbox_docs if safe_int(x.get("reply_publish_ts"), 0) > 0]
+            post_ts = min(reply_ts_list) if reply_ts_list else 0
+
+        if window_sec > 0 and post_ts > 0 and (eff_now - post_ts) > window_sec:
+            skipped_old_posts += 1
+            continue
+
+        total_comments = max(
+            safe_int(cp_doc.get("seen_reply_count"), 0),
+            safe_int(cp_doc.get("last_captured_replies"), 0),
+            len(post_inbox_docs),
+        )
+        replied_cnt = sum(1 for x in post_inbox_docs if x.get("status") == "replied")
+        target_cnt = _calc_post_target_replies(total_comments, quota_ratio)
+        rem_quota = max(0, target_cnt - replied_cnt)
+        if rem_quota <= 0:
+            skipped_quota_posts += 1
+            continue
+
+        take_n = min(rem_quota, per_post_per_run) if per_post_per_run > 0 else rem_quota
+        ranked_post_docs = sorted(
+            post_ready_docs,
+            key=lambda x: (-_effective_reply_score(x), -safe_int(x.get("reply_publish_ts"), 0), str(x.get("reply_id") or "")),
+        )
+        for pick in ranked_post_docs[:take_n]:
+            item = dict(pick)
+            item["_eff_post_publish_ts"] = post_ts
+            item["_post_total_comments"] = total_comments
+            item["_post_target_replies"] = target_cnt
+            item["_post_replied_count"] = replied_cnt
+            selected.append(item)
+
+    selected.sort(
+        key=lambda x: (
+            -_effective_reply_score(x),
+            -safe_int(x.get("_eff_post_publish_ts"), 0),
+            -safe_int(x.get("reply_publish_ts"), 0),
+            str(x.get("reply_id") or ""),
+        )
+    )
+    return selected, {
+        "raw_ready_count": len(ready_docs),
+        "raw_post_count": len(ready_by_post),
+        "eligible_post_count": len(selected),
+        "skipped_old_posts": skipped_old_posts,
+        "skipped_quota_posts": skipped_quota_posts,
+    }
+
+
 def publish_replies_for_account(
     account: Dict[str, Any],
     *,
@@ -1780,14 +2016,22 @@ def publish_replies_for_account(
     _ensure_indexes(db_obj)
 
     col = db_obj.get_collection(REPLY_INBOX_COLLECTION)
+    cp_col = db_obj.get_collection(POST_CHECKPOINTS_COLLECTION)
     acc_name = str(account["name"])
     acc_handle = _clean_handle(account.get("screen_name")).lower()
     session_path = str(Path(str(account["user_data_dir"])).expanduser().resolve())
 
     eff_now = int(now_ts if now_ts is not None else time.time())
+    hourly_cap = max(0, safe_int(cfg.get("max_replies_per_hour"), MAX_REPLIES_PER_HOUR))
     daily_cap = max(0, safe_int(cfg.get("max_replies_per_day"), MAX_REPLIES_PER_DAY))
     per_run_cap = max(1, safe_int(cfg.get("max_replies_per_run"), MAX_REPLIES_PER_RUN))
     max_per_user = max(0, safe_int(cfg.get("max_replies_per_user_per_post"), MAX_REPLIES_PER_USER_PER_POST))
+    post_win_hours = max(0, safe_int(cfg.get("post_reply_window_hours"), POST_REPLY_WINDOW_HOURS))
+    try:
+        post_quota_ratio = max(0.0, float(cfg.get("post_reply_quota_ratio", POST_REPLY_QUOTA_RATIO)))
+    except Exception:
+        post_quota_ratio = POST_REPLY_QUOTA_RATIO
+    per_post_per_run = max(0, safe_int(cfg.get("max_replies_per_post_per_run"), MAX_REPLIES_PER_POST_PER_RUN))
     max_retries = max(1, safe_int(cfg.get("max_reply_retries"), MAX_REPLY_RETRIES))
     retry_cd = max(60, safe_int(cfg.get("retry_cooldown_seconds"), RETRY_COOLDOWN_SECONDS))
     hold_limit = max(30, safe_int(cfg.get("session_max_hold_seconds"), SESSION_MAX_HOLD_SECONDS))
@@ -1802,6 +2046,14 @@ def publish_replies_for_account(
             "replied_at_ts": {"$gte": eff_now - 86400},
         }
     )
+    hour_sent = col.count_documents(
+        {
+            "account_name": acc_name,
+            "status": "replied",
+            "replied_source": "auto_replier",
+            "replied_at_ts": {"$gte": eff_now - 3600},
+        }
+    )
     if (not eff_dry) and daily_cap > 0 and today_sent >= daily_cap:
         log.info(f"⏸️ [模块3/每日上限 | {acc_name}] 24h 已回复 {today_sent}/{daily_cap} 条，本轮跳过。")
         return {
@@ -1809,29 +2061,46 @@ def publish_replies_for_account(
             "status": "daily_limit_reached",
             "dry_run": False,
             "browser_opened": False,
+            "hourly_sent_count": hour_sent,
+            "daily_sent_count": today_sent,
+            "replied_count": 0,
+            "items": [],
+        }
+    if (not eff_dry) and hourly_cap > 0 and hour_sent >= hourly_cap:
+        log.info(f"⏸️ [模块3/每小时上限 | {acc_name}] 近 1h 已回复 {hour_sent}/{hourly_cap} 条，本轮跳过。")
+        return {
+            "account_name": acc_name,
+            "status": "hourly_limit_reached",
+            "dry_run": False,
+            "browser_opened": False,
+            "hourly_sent_count": hour_sent,
             "daily_sent_count": today_sent,
             "replied_count": 0,
             "items": [],
         }
 
-    eff_limit = per_run_cap if (eff_dry or daily_cap <= 0) else min(per_run_cap, max(1, daily_cap - today_sent))
-    candidates = list(
-        col.find(
-            {
-                "account_name": acc_name,
-                "status": "ready_to_reply",
-                "generated_reply": {"$exists": True, "$ne": ""},
-                "reply_next_retry_ts": {"$lte": eff_now},
-            }
-        )
-        .sort("reply_publish_ts", 1)
-        .limit(max(eff_limit * 3, eff_limit))
+    eff_limit = per_run_cap
+    if not eff_dry:
+        if daily_cap > 0:
+            eff_limit = min(eff_limit, max(1, daily_cap - today_sent))
+        if hourly_cap > 0:
+            eff_limit = min(eff_limit, max(1, hourly_cap - hour_sent))
+    candidates, sel_stats = _select_post_balanced_candidates(
+        col,
+        cp_col,
+        account_name=acc_name,
+        eff_now=eff_now,
+        window_hours=post_win_hours,
+        quota_ratio=post_quota_ratio,
+        per_post_per_run=per_post_per_run,
     )
 
     if eff_dry or not candidates:
         preview = [
             {
                 "reply_id": d["reply_id"],
+                "post_id": d.get("post_id"),
+                "reply_score": d.get("reply_score"),
                 "reply_author": f"@{d.get('reply_author') or ''}",
                 "reply_text": d.get("reply_text") or "",
                 "generated_reply": d.get("generated_reply") or "",
@@ -1839,20 +2108,39 @@ def publish_replies_for_account(
             for d in candidates[:eff_limit]
         ]
         if eff_dry:
-            log.info(f"[模块3/DRY_RUN | {acc_name}] 待发队列={len(candidates)}条 (本轮预览 {len(preview)} 条)")
+            log.info(
+                f"[模块3/DRY_RUN | {acc_name}] 原始待发={sel_stats['raw_ready_count']}条({sel_stats['raw_post_count']}帖) -> "
+                f"24h有配额={len(candidates)}帖 (本轮预览 {len(preview)} 条)"
+            )
         else:
-            cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
-            log.info(f"ℹ️ [模块3-回复 | {acc_name}] 待发送=0（空闲未开浏览器 | 24h已回={today_sent}/{cap_txt}）")
+            h_cap_txt = str(hourly_cap) if hourly_cap > 0 else "∞"
+            d_cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
+            raw_r = sel_stats["raw_ready_count"]
+            filter_note = (
+                f" | 库内待发={raw_r}(超{post_win_hours}h={sel_stats['skipped_old_posts']}帖, 配额满={sel_stats['skipped_quota_posts']}帖)"
+                if raw_r > 0
+                else ""
+            )
+            log.info(
+                f"ℹ️ [模块3-回复 | {acc_name}] 待发送=0（空闲未开浏览器 | 1h已回={hour_sent}/{h_cap_txt} | 24h已回={today_sent}/{d_cap_txt}{filter_note}）"
+            )
         return {
             "account_name": acc_name,
             "status": "ok",
             "dry_run": eff_dry,
             "browser_opened": False,
+            "hourly_sent_count": hour_sent,
             "daily_sent_count": today_sent,
             "candidates_found": len(candidates),
+            "selection_stats": sel_stats,
             "replied_count": 0,
             "items": preview,
         }
+
+    log.info(
+        f"🎯 [模块3/24h帖配额优选 | {acc_name}] 原始待发={sel_stats['raw_ready_count']}条({sel_stats['raw_post_count']}帖) -> "
+        f"入选={len(candidates)}帖 (超{post_win_hours}h={sel_stats['skipped_old_posts']}帖, 配额满={sel_stats['skipped_quota_posts']}帖 | 本轮名额={eff_limit})"
+    )
 
     if not os.path.isdir(session_path):
         warn = f"浏览器会话目录不存在: {session_path}"
@@ -2058,8 +2346,12 @@ def publish_replies_for_account(
                                 }
                             },
                         )
-                        halt_status, halt_warning = "cooldown_required", err_s
-                        log.error(f"🚨 [模块3/业务风控阻断 | {acc_name}] reply_id={rid} | {err_s}")
+                        low_err = err_s.lower()
+                        is_hard_lock = any(tok in low_err for tok in _HARD_LOCK_ERROR_HINTS)
+                        halt_status = "locked_challenge" if is_hard_lock else "cooldown_required"
+                        halt_warning = err_s
+                        tag = "安全锁硬阻断" if is_hard_lock else "业务风控阻断"
+                        log.error(f"🚨 [模块3/{tag} | {acc_name}] reply_id={rid} | {err_s}")
                         break
                     except Exception as send_e:
                         done_ts = int(time.time())
@@ -2110,6 +2402,8 @@ def publish_replies_for_account(
                     sent_items.append(
                         {
                             "reply_id": rid,
+                            "post_id": post_id,
+                            "reply_score": fresh.get("reply_score"),
                             "reply_author": f"@{fresh.get('reply_author') or ''}",
                             "replied_tweet_id": new_reply_id,
                             "replied_text": reply_text,
@@ -2117,16 +2411,20 @@ def publish_replies_for_account(
                         }
                     )
                     like_txt = "是" if liked_ok else ("否" if liked_ok is False else "关")
+                    sc_val = fresh.get("reply_score")
+                    sc_txt = f"分={sc_val} | " if isinstance(sc_val, int) and not isinstance(sc_val, bool) else ""
                     log.info(
                         f"💬 [模块3/精准回复成功 | @{eff_handle or acc_name}] 对 @{fresh.get('reply_author')}({rid}) -> "
-                        f"new_id={new_reply_id} | 赞={like_txt} | 总延迟={_format_duration_brief(e2e_delay)} | {reply_text}"
+                        f"new_id={new_reply_id} | {sc_txt}赞={like_txt} | 总延迟={_format_duration_brief(e2e_delay)} | {reply_text}"
                     )
 
                 hold_sec = round(time.monotonic() - lock_t0, 1)
-                cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
+                h_cap_txt = str(hourly_cap) if hourly_cap > 0 else "∞"
+                d_cap_txt = str(daily_cap) if daily_cap > 0 else "∞"
                 log.info(
                     f"✅ [模块3-回复 | @{eff_handle or acc_name}] 候选={len(candidates)} -> 已回={len(sent_items)} | "
-                    f"跳过={skipped_cnt} | 失败={failed_cnt} | 24h累计={today_sent + len(sent_items)}/{cap_txt} | 持锁={hold_sec}s"
+                    f"跳过={skipped_cnt} | 失败={failed_cnt} | 1h累计={hour_sent + len(sent_items)}/{h_cap_txt} | "
+                    f"24h累计={today_sent + len(sent_items)}/{d_cap_txt} | 持锁={hold_sec}s"
                 )
                 return {
                     "account_name": acc_name,
@@ -2135,6 +2433,7 @@ def publish_replies_for_account(
                     "warning": halt_warning,
                     "dry_run": False,
                     "browser_opened": True,
+                    "hourly_sent_count": hour_sent + len(sent_items),
                     "daily_sent_count": today_sent + len(sent_items),
                     "candidates_found": len(candidates),
                     "replied_count": len(sent_items),
@@ -2249,6 +2548,7 @@ def build_status_report(
                 "recent": [
                     {
                         "status": d.get("status"),
+                        "reply_score": d.get("reply_score"),
                         "reply_author": f"@{d.get('reply_author') or ''}",
                         "post_text": _clip_log_text(d.get("post_text") or "", 24),
                         "reply_text": (d.get("reply_text") or "")[:60],
@@ -2296,6 +2596,9 @@ def format_status_text(report: Dict[str, Any]) -> str:
             lines.append(f"   跳过原因: {an['skip_reasons']}")
         for item in a["recent"]:
             meta_tags = [str(item.get("status") or "")]
+            sc_item = item.get("reply_score")
+            if isinstance(sc_item, int) and not isinstance(sc_item, bool):
+                meta_tags.append(f"{sc_item}分")
             if item.get("model"):
                 meta_tags.append(str(item["model"]))
             if item.get("prompt_sha1"):
@@ -2350,8 +2653,10 @@ def run_parallel_daemon(
 
     ev = stop_event if stop_event is not None else threading.Event()
     risk_cd_sec = max(300, safe_int(cfg.get("risk_cooldown_seconds"), RISK_COOLDOWN_SECONDS))
-    collect_cooldown_until: Dict[str, float] = {}
-    reply_cooldown_until: Dict[str, float] = {}
+    quiet_hours = _parse_quiet_hours(cfg.get("quiet_hours_cn", QUIET_HOURS_CN))
+    state_lock = threading.Lock()
+    account_cooldown_until: Dict[str, float] = {}
+    account_hard_halted: Dict[str, str] = {}
 
     collect_interval = max(60, safe_int(cfg.get("collect_interval_seconds"), COLLECT_INTERVAL_SECONDS))
     collect_jitter = _parse_jitter_pair(cfg.get("collect_jitter_seconds"))
@@ -2379,15 +2684,111 @@ def run_parallel_daemon(
             log.info(f"⏰ [{worker_label} | #{round_no}] 下次执行 {next_at} (约{mins_txt}后{reason_txt})")
         return {"next_sleep_seconds": sleep_sec}
 
+    def _quiet_sleep_if_needed(
+        worker_label: str,
+        round_no: int,
+        base_sec: int,
+        jitter_pair: Tuple[int, int],
+    ) -> Optional[Dict[str, Any]]:
+        q_rem = _seconds_until_quiet_end(quiet_hours)
+        if q_rem <= 0 or quiet_hours is None:
+            return None
+        log.info(
+            f"🌙 [{worker_label} | #{round_no}] 处于夜间静默时段 ({quiet_hours[0]:02d}:00-{quiet_hours[1]:02d}:00)，"
+            f"暂停操作（约 {_format_duration_brief(q_rem)} 后恢复）"
+        )
+        return _schedule_next_sleep(
+            worker_label,
+            round_no,
+            base_sec,
+            jitter_pair,
+            override_base=q_rem,
+            reason="夜间静默",
+            did_work=True,
+        )
+
+    def _account_gate_reason(acc_dir: str) -> Optional[Tuple[str, str]]:
+        with state_lock:
+            halt_st = account_hard_halted.get(acc_dir)
+            if halt_st:
+                return ("hard_halted", halt_st)
+            rem = account_cooldown_until.get(acc_dir, 0.0) - time.time()
+            if rem > 0:
+                return ("cooldown", str(int(rem)))
+        return None
+
+    def _record_account_status(
+        worker_label: str,
+        acc_dir: str,
+        acc_name: str,
+        st: str,
+        warning: Any,
+    ) -> bool:
+        if st in _HARD_LOCK_STATUSES:
+            with state_lock:
+                account_hard_halted[acc_dir] = st
+                account_cooldown_until.pop(acc_dir, None)
+                all_halted = bool(pool) and all(a["user_data_dir"] in account_hard_halted for a in pool)
+            warn_tail = f" | {str(warning)[:160]}" if warning else ""
+            log.error(
+                f"🛑 [{worker_label} | {acc_name}] 触发硬锁熔断（已停止对该账号的一切浏览器访问，请人工解锁验证后重启）| "
+                f"status={st}{warn_tail}"
+            )
+            if all_halted:
+                log.error("🛑 [AutoReplier/硬锁熔断停机] 全部账号已触发硬锁/登录失效，自动停止全部工人线程（绝不再每 6h 撞锁页）。")
+                ev.set()
+            return all_halted
+        if st == "cooldown_required":
+            with state_lock:
+                account_cooldown_until[acc_dir] = time.time() + risk_cd_sec
+            log.error(f"⏳ [{worker_label} | {acc_name}] 触发账号共享风控冷却 {risk_cd_sec}s（采集与回复同步暂停）| status={st}")
+        elif st not in ("empty_capture", "lock_timeout"):
+            with state_lock:
+                account_cooldown_until.pop(acc_dir, None)
+        return False
+
+    def _cooldown_sleep_if_blocked(
+        worker_label: str,
+        round_no: int,
+        base_sec: int,
+        jitter_pair: Tuple[int, int],
+    ) -> Optional[Dict[str, Any]]:
+        with state_lock:
+            now_wall = time.time()
+            unhalted = [a for a in pool if a["user_data_dir"] not in account_hard_halted]
+            if pool and not unhalted:
+                return {}
+            active_rems = [max(0.0, account_cooldown_until.get(a["user_data_dir"], 0.0) - now_wall) for a in unhalted]
+        if unhalted and all(r > 0 for r in active_rems):
+            return _schedule_next_sleep(
+                worker_label,
+                round_no,
+                base_sec,
+                jitter_pair,
+                override_base=max(base_sec, int(min(active_rems))),
+                reason="共享风控冷却",
+                did_work=True,
+            )
+        return None
+
     def _collector_step(round_no: int) -> Dict[str, Any]:
+        q_sleep = _quiet_sleep_if_needed("工人1-采集", round_no, collect_interval, collect_jitter)
+        if q_sleep is not None:
+            return q_sleep
         db = gen_db_object()
         any_empty = False
         any_work = False
         for acc in pool:
+            if ev.is_set():
+                break
             acc_dir, acc_name = acc["user_data_dir"], acc["name"]
-            rem = collect_cooldown_until.get(acc_dir, 0.0) - time.time()
-            if rem > 0:
-                log.info(f"⏸️ [工人1-采集 | #{round_no} | {acc_name}] 独立风控冷却中（剩余 {int(rem)}s），跳过。")
+            gate = _account_gate_reason(acc_dir)
+            if gate is not None:
+                kind, detail = gate
+                if kind == "hard_halted":
+                    log.info(f"🛑 [工人1-采集 | #{round_no} | {acc_name}] 已硬锁熔断({detail})，跳过。")
+                else:
+                    log.info(f"⏸️ [工人1-采集 | #{round_no} | {acc_name}] 共享风控冷却中（剩余 {detail}s），跳过。")
                 continue
             res = collect_replies_for_account(acc, db=db, config=cfg, logger=log)
             st = str(res.get("status") or "ok")
@@ -2400,13 +2801,12 @@ def run_parallel_daemon(
                 or st != "ok"
             ):
                 any_work = True
-            if st in _RISK_HALT_STATUSES:
-                collect_cooldown_until[acc_dir] = time.time() + risk_cd_sec
-                log.error(f"⏳ [工人1-采集 | {acc_name}] 触发独立风控冷却 {risk_cd_sec}s | status={st}")
-            elif st == "empty_capture":
+            if _record_account_status("工人1-采集", acc_dir, acc_name, st, res.get("warning")):
+                return {}
+            if st == "empty_capture":
                 any_empty = True
-            elif st == "ok":
-                collect_cooldown_until.pop(acc_dir, None)
+        if ev.is_set():
+            return {}
         if any_empty:
             return _schedule_next_sleep(
                 "工人1-采集",
@@ -2417,57 +2817,54 @@ def run_parallel_daemon(
                 reason="空采重试",
                 did_work=True,
             )
-        active_rems = [max(0.0, collect_cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
-        if pool and all(r > 0 for r in active_rems):
-            return _schedule_next_sleep(
-                "工人1-采集",
-                round_no,
-                collect_interval,
-                collect_jitter,
-                override_base=max(collect_interval, int(min(active_rems))),
-                reason="风控冷却",
-                did_work=True,
-            )
+        cd_sleep = _cooldown_sleep_if_blocked("工人1-采集", round_no, collect_interval, collect_jitter)
+        if cd_sleep is not None:
+            return cd_sleep
         return _schedule_next_sleep("工人1-采集", round_no, collect_interval, collect_jitter, did_work=any_work)
 
     def _generator_step(round_no: int) -> Dict[str, Any]:
+        q_sleep = _quiet_sleep_if_needed("工人2-生成", round_no, generate_interval, generate_jitter)
+        if q_sleep is not None:
+            return q_sleep
         db = gen_db_object()
         any_work = False
         for acc in pool:
+            if ev.is_set():
+                break
             res = generate_replies_from_db(acc, db=db, config=cfg, logger=log)
             if safe_int(res.get("pending_found"), 0) > 0:
                 any_work = True
         return _schedule_next_sleep("工人2-生成", round_no, generate_interval, generate_jitter, did_work=any_work)
 
     def _replier_step(round_no: int) -> Dict[str, Any]:
+        q_sleep = _quiet_sleep_if_needed("工人3-回复", round_no, reply_interval, reply_jitter)
+        if q_sleep is not None:
+            return q_sleep
         db = gen_db_object()
         any_work = False
         for acc in pool:
+            if ev.is_set():
+                break
             acc_dir, acc_name = acc["user_data_dir"], acc["name"]
-            rem = reply_cooldown_until.get(acc_dir, 0.0) - time.time()
-            if rem > 0:
-                log.info(f"⏸️ [工人3-回复 | #{round_no} | {acc_name}] 独立风控冷却中（剩余 {int(rem)}s），跳过。")
+            gate = _account_gate_reason(acc_dir)
+            if gate is not None:
+                kind, detail = gate
+                if kind == "hard_halted":
+                    log.info(f"🛑 [工人3-回复 | #{round_no} | {acc_name}] 已硬锁熔断({detail})，跳过。")
+                else:
+                    log.info(f"⏸️ [工人3-回复 | #{round_no} | {acc_name}] 共享风控冷却中（剩余 {detail}s），跳过。")
                 continue
             res = publish_replies_for_account(acc, db=db, config=cfg, logger=log)
             st = str(res.get("status") or "ok")
             if bool(res.get("browser_opened")) or safe_int(res.get("candidates_found"), 0) > 0 or st != "ok":
                 any_work = True
-            if st in _RISK_HALT_STATUSES:
-                reply_cooldown_until[acc_dir] = time.time() + risk_cd_sec
-                log.error(f"⏳ [工人3-回复 | {acc_name}] 触发独立风控冷却 {risk_cd_sec}s | status={st}")
-            elif st == "ok":
-                reply_cooldown_until.pop(acc_dir, None)
-        active_rems = [max(0.0, reply_cooldown_until.get(a["user_data_dir"], 0.0) - time.time()) for a in pool]
-        if pool and all(r > 0 for r in active_rems):
-            return _schedule_next_sleep(
-                "工人3-回复",
-                round_no,
-                reply_interval,
-                reply_jitter,
-                override_base=max(reply_interval, int(min(active_rems))),
-                reason="风控冷却",
-                did_work=True,
-            )
+            if _record_account_status("工人3-回复", acc_dir, acc_name, st, res.get("warning")):
+                return {}
+        if ev.is_set():
+            return {}
+        cd_sleep = _cooldown_sleep_if_blocked("工人3-回复", round_no, reply_interval, reply_jitter)
+        if cd_sleep is not None:
+            return cd_sleep
         return _schedule_next_sleep("工人3-回复", round_no, reply_interval, reply_jitter, did_work=any_work)
 
     worker_specs = []
@@ -2503,10 +2900,15 @@ def run_parallel_daemon(
         )
 
     scope_desc = "仅本人主帖" if bool(cfg.get("only_my_root_posts", ONLY_MY_ROOT_POSTS)) else "本人主帖+他帖追评"
+    quiet_txt = f"{quiet_hours[0]:02d}:00-{quiet_hours[1]:02d}:00" if quiet_hours else "关闭"
+    r_lim = max(1, safe_int(cfg.get("max_replies_per_run"), MAX_REPLIES_PER_RUN))
+    h_lim = max(0, safe_int(cfg.get("max_replies_per_hour"), MAX_REPLIES_PER_HOUR))
+    d_lim = max(0, safe_int(cfg.get("max_replies_per_day"), MAX_REPLIES_PER_DAY))
+    like_txt = "开" if bool(cfg.get("like_comment_before_reply", LIKE_COMMENT_BEFORE_REPLY)) else "关"
     log.info(
         f"🚀 [AutoReplier/三工人并行启动] 账号={[a['name'] + '(@' + (a['screen_name'] or '自动') + ')' for a in pool]} | "
-        f"范围={scope_desc} | 启动工人={[w[0] for w in worker_specs]} | 各自独立并行周期="
-        f"[{', '.join(f'{w[0]}:{w[2]}s(延迟{w[1]}s)' for w in worker_specs)}]"
+        f"范围={scope_desc} | 静默={quiet_txt} | 限速=单轮{r_lim}/1h:{h_lim or '∞'}/24h:{d_lim or '∞'} | 顺手赞={like_txt} | "
+        f"启动工人={[w[0] for w in worker_specs]} | 周期=[{', '.join(f'{w[0]}:{w[2]}s(延迟{w[1]}s)' for w in worker_specs)}]"
     )
 
     threads: List[threading.Thread] = []
