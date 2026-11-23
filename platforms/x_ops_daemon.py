@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Unified Persistent X Operations Daemon & Action Queue (`platforms/x_ops_daemon.py`)
+Pure Passive X Action Executor & Queue Daemon (`platforms/x_ops_daemon.py`)
 
-Single-instance headed Chrome architecture built on `platforms/x_browser.py` + `platforms/x_playwright.py`:
-- Zero `--headless=new`, zero repeated cold-starts per action
-- Extensible `x_ops_queue` action plugin registry (`post`, `reply`, `sync_and_reply`, `follow`, `pin`)
-- Zero-auth comment sentinel (`fetch_x_tweet_zero_auth`) polls `comment_count` deltas with zero account risk
-- Global 0-second persistent circuit breaker (`XAccountCircuitBreaker`)
-- Rolling 1h/24h safety quotas (time-of-day rest scheduling belongs to upper callers)
+Single-instance headed Chrome executor built on `platforms/x_browser.py` + `platforms/x_playwright.py`:
+- Zero autonomous polling, zero embedded LLM logic, zero default actions on its own
+- Lazy single-Chrome reuse: stays completely idle until upper applications enqueue tasks via `enqueue_x_action`
+- Extensible `x_ops_queue` atomic action registry (`post`, `reply`, `follow`, `pin`, `sniff_notifications`, or custom handlers)
+- Passive safety guardrails (daily/hourly quotas + 0-second 48h persistent `XAccountCircuitBreaker`)
 """
 import json
 from datetime import datetime, timedelta, timezone
@@ -17,7 +16,7 @@ import random
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -26,10 +25,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from common.common_utils import get_config, resolve_session_dir, safe_int, setup_logger
 from common.daemon import run_daemon_loop
-from common.llm_gateway import call_llm_json, render_prompt_template
 from common.mongo_db.mongo_base import gen_db_object
-from common.x_text import calc_x_weighted_length
-from platforms.x_api import fetch_x_tweet_zero_auth
 from platforms.x_browser import (
     BusinessErrorException,
     ChallengeRequiredError,
@@ -57,9 +53,9 @@ logger = setup_logger(app_name="x_ops_daemon")
 # ==============================================================================
 
 # 1. 运行模式开关（修改这里的值后，直接运行本文件即可切换模式）：
-#   - "status"       : 只读查看当前账号配额、熔断状态与待执行队列（默认值，误点运行也不会打开浏览器或发帖）
-#   - "daemon"       : 长驻后台守护运行（持续执行队列任务 + 自动巡检评论）
-#   - "once"         : 只跑一轮当前队列里到期的任务（顺带检查一次评论哨兵）然后自动退出
+#   - "status"       : 只读查看当前账号配额、熔断状态与待执行队列（不开浏览器）
+#   - "daemon"       : 纯被动监听队列执行器（只等待并执行上层投递来的任务，自身不做任何默认主动动作；队列空时不拉起浏览器）
+#   - "once"         : 执行一轮当前队列里到期的任务后立即退出
 #   - "smoke_test"   : 打开本地正版 Chrome 做只读体检（检测反风控指纹、登录态、通知嗅探，不发帖）
 #   - "login"        : 打开同一个本地正版 Chrome 人工登录或过验证（关掉窗口即自动保存登录态并退出）
 #   - "clear_freeze" : 确认风控解除后，手动清除 48 小时熔断冷却锁
@@ -85,37 +81,32 @@ DEFAULT_ACCOUNT: Dict[str, Any] = {
 #     .lstrip("@"),
 # }
 
-# 4. 发帖频率控制（单日最多几条主帖、任意两条主帖至少间隔多少秒，7200 秒 = 2 小时）
+# 4. 发帖防刷底线（单日最多几条主帖、任意两条主帖至少间隔多少秒，7200 秒 = 2 小时）
 # 【保留过滤原因说明】单日主帖上限 5 篇、任意两帖间隔 >= 2 小时，避开 AuthorDiversityScorer 同作者自相杀与刷屏特征
 MAX_POSTS_PER_DAY: int = 5
 MIN_POST_INTERVAL_SECONDS: int = 7200
 
-# 5. 自动回复控制（每日上限 / 每小时上限 / 同一主帖最多回几条 / 超过几小时的老帖不回 / 连续回复随机间隔秒数）
-# 【保留过滤原因说明】聚焦黄金 24h 主帖的前排高价值互动，限制单帖<=3、1h<=4、24h<=15，吃满算法权重并远离刷评红线
+# 5. 回复防刷底线（每日上限 / 每小时上限 / 同一主帖最多回几条 / 超过几小时的老帖不回）
+# 【保留过滤原因说明】聚焦黄金 24h 主帖的高价值互动，限制单帖<=3、1h<=4、24h<=15，吃满算法权重并远离刷评红线
 MAX_REPLIES_PER_DAY: int = 15
 MAX_REPLIES_PER_HOUR: int = 4
 MAX_REPLIES_PER_POST: int = 3
 REPLY_PARENT_MAX_AGE_HOURS: int = 24
-INTER_REPLY_DELAY_RANGE: Tuple[int, int] = (45, 110)
 
-# 6. 低频辅助动作上限（每日最多关注几人 / 每日最多置顶几次）
-# 【保留过滤原因说明】低频辅助动作硬上限（日关<=3、日置顶<=1），远离 Follow Bot 与高频资料改动阈值
+# 6. 辅助动作防刷底线（每日最多关注几人 / 两次关注至少间隔秒数 / 每日最多置顶几次）
+# 【保留过滤原因说明】低频辅助动作硬上限（日关<=3、两次关注间隔>=15分钟、日置顶<=1），远离 Follow Bot 突发特征
 MAX_FOLLOWS_PER_DAY: int = 3
+MIN_FOLLOW_INTERVAL_SECONDS: int = 900
 MAX_PINS_PER_DAY: int = 1
 
-# 7. 巡检与保活节奏（评论哨兵免登轮询间隔秒数 / 守护循环每轮等待秒数 / 浏览器连续运行几小时重启清内存）
-# 【保留过滤原因说明】免登评论哨兵每 40 分钟仅轮询近 24h 自发主帖的公开 comment_count，0 账号风控且按需触发嗅探
-SENTINEL_INTERVAL_SECONDS: int = 2400
-POLL_LOOP_SECONDS: int = 60
+# 7. 守护轮询、写动作间距、内存回收与熔断（查队列秒数 / 同批次相邻写动作随机停顿秒数 / 空闲重启小时 / 冻结秒数）
+POLL_LOOP_SECONDS: int = 15
+# 【保留过滤原因说明】同一批次相邻写动作之间随机停顿 35~90s，避免 0 秒连射触发反垃圾突发风控模型
+INTER_WRITE_DELAY_SECONDS: Tuple[int, int] = (35, 90)
 # 【保留过滤原因说明】长驻浏览器满 8 小时在空闲期温和重启一次，清理页面长期运行的内存累积
 SESSION_REFRESH_HOURS: int = 8
-
-# 8. 触发人机验证 / 安全挑战后的自动冻结时长（秒，默认 48 小时，防止继续操作把小限制打成深降权）
 # 【保留过滤原因说明】触发任意安全验证或风控挑战立即 0 秒冻结 48h，绝不继续撞墙
 FREEZE_ON_CHALLENGE_SECONDS: int = DEFAULT_FREEZE_SECONDS
-
-# 9. 自动生成回复内容使用的模型分组（"low" / "medium" / "high"，严禁硬编码具体模型名）
-GENERATOR_MODEL_GROUP: str = "low"
 
 # ==============================================================================
 # 内部固定常量（通常无需改动）
@@ -123,9 +114,7 @@ GENERATOR_MODEL_GROUP: str = "low"
 TZ_CN = timezone(timedelta(hours=8))
 QUEUE_COLLECTION = "x_ops_queue"
 STATE_COLLECTION = DEFAULT_X_STATE_COLLECTION
-REPLY_PROMPT_REL_PATH = "x_growth/auto_reply_comment.md"
-TRACKED_POST_WINDOW_HOURS: int = 24
-MAX_REPLY_WEIGHTED_CHARS: int = 240
+_WRITE_ACTION_TYPES = frozenset({"post", "reply", "follow", "pin"})
 
 _INDEXED_DBS: set = set()
 
@@ -162,7 +151,7 @@ def _ensure_indexes(db: Any) -> None:
 
 
 class XAccountStateStore:
-    """Stores per-account action timestamps, tracked posts, and replied IDs in `x_ops_state`."""
+    """Stores per-account action timestamps, per-post reply counts, and replied IDs in `x_ops_state`."""
 
     def __init__(self, db: Any = None, collection_name: str = STATE_COLLECTION) -> None:
         self._db = db
@@ -197,6 +186,21 @@ class XAccountStateStore:
         ts_list = ((doc.get("action_timestamps") or {}).get(kind)) or []
         return max((safe_int(t, 0) for t in ts_list), default=0)
 
+    def oldest_action_ts_in_window(
+        self,
+        account_name: str,
+        kind: str,
+        window_seconds: int,
+        *,
+        now_ts: Optional[int] = None,
+    ) -> int:
+        now = int(time.time()) if now_ts is None else int(now_ts)
+        doc = self.get_state(account_name)
+        ts_list = ((doc.get("action_timestamps") or {}).get(kind)) or []
+        cutoff = now - max(1, int(window_seconds))
+        in_win = [safe_int(t, 0) for t in ts_list if cutoff < safe_int(t, 0) <= now]
+        return min(in_win) if in_win else 0
+
     def record_action(self, account_name: str, kind: str, *, now_ts: Optional[int] = None) -> None:
         now = int(time.time()) if now_ts is None else int(now_ts)
         doc = self.get_state(account_name)
@@ -218,80 +222,13 @@ class XAccountStateStore:
             upsert=True,
         )
 
-    def track_own_post(
-        self,
-        account_name: str,
-        post_id: str,
-        publish_ts: int,
-        *,
-        text: str = "",
-        comment_count: int = 0,
-        now_ts: Optional[int] = None,
-    ) -> None:
+    def get_post_reply_count(self, account_name: str, post_id: str) -> int:
         pid = str(post_id or "").strip()
         if not pid:
-            return
-        now = int(time.time()) if now_ts is None else int(now_ts)
+            return 0
         doc = self.get_state(account_name)
-        tracked = dict(doc.get("tracked_posts") or {})
-        prev = dict(tracked.get(pid) or {})
-        tracked[pid] = {
-            "post_id": pid,
-            "publish_ts": safe_int(publish_ts, now) or now,
-            "text": str(text or prev.get("text") or "")[:400],
-            "last_comment_count": max(safe_int(prev.get("last_comment_count"), 0), safe_int(comment_count, 0)),
-            "replied_count": safe_int(prev.get("replied_count"), 0),
-        }
-        # Prune oldest beyond 30 tracked posts to bound state doc growth
-        if len(tracked) > 30:
-            sorted_keys = sorted(tracked.keys(), key=lambda k: safe_int(tracked[k].get("publish_ts"), 0), reverse=True)
-            tracked = {k: tracked[k] for k in sorted_keys[:30]}
-        self._col().update_one(
-            {"_id": self._doc_id(account_name)},
-            {
-                "$set": {
-                    "account_name": account_name,
-                    "tracked_posts": tracked,
-                    "updated_at_ts": now,
-                    "updated_at_iso": _now_iso(now),
-                }
-            },
-            upsert=True,
-        )
-
-    def update_tracked_post_sentinel(
-        self,
-        account_name: str,
-        post_id: str,
-        comment_count: int,
-        *,
-        now_ts: Optional[int] = None,
-    ) -> None:
-        now = int(time.time()) if now_ts is None else int(now_ts)
-        pid = str(post_id or "").strip()
-        if not pid:
-            return
-        doc = self.get_state(account_name)
-        tracked = dict(doc.get("tracked_posts") or {})
-        entry = dict(tracked.get(pid) or {"post_id": pid, "publish_ts": now, "replied_count": 0})
-        entry["last_comment_count"] = safe_int(comment_count, 0)
-        tracked[pid] = entry
-        self._col().update_one(
-            {"_id": self._doc_id(account_name)},
-            {
-                "$set": {
-                    "account_name": account_name,
-                    "tracked_posts": tracked,
-                    "updated_at_ts": now,
-                    "updated_at_iso": _now_iso(now),
-                }
-            },
-            upsert=True,
-        )
-
-    def get_tracked_post(self, account_name: str, post_id: str) -> Dict[str, Any]:
-        doc = self.get_state(account_name)
-        return dict((doc.get("tracked_posts") or {}).get(str(post_id or "").strip()) or {})
+        counts = doc.get("post_reply_counts") or {}
+        return safe_int(counts.get(pid), 0)
 
     def is_reply_recorded(self, account_name: str, reply_id: str) -> bool:
         doc = self.get_state(account_name)
@@ -312,19 +249,22 @@ class XAccountStateStore:
         if rid and rid not in replied_ids:
             replied_ids.append(rid)
         replied_ids = replied_ids[-500:]
-        tracked = dict(doc.get("tracked_posts") or {})
+
+        counts = {str(k): safe_int(v, 0) for k, v in (doc.get("post_reply_counts") or {}).items() if k}
         pid = str(post_id or "").strip()
         if pid:
-            entry = dict(tracked.get(pid) or {"post_id": pid, "publish_ts": now, "last_comment_count": 0})
-            entry["replied_count"] = safe_int(entry.get("replied_count"), 0) + 1
-            tracked[pid] = entry
+            next_cnt = counts.pop(pid, 0) + 1
+            counts[pid] = next_cnt
+            if len(counts) > 100:
+                counts = dict(list(counts.items())[-100:])
+
         self._col().update_one(
             {"_id": self._doc_id(account_name)},
             {
                 "$set": {
                     "account_name": account_name,
                     "replied_ids": replied_ids,
-                    "tracked_posts": tracked,
+                    "post_reply_counts": counts,
                     "updated_at_ts": now,
                     "updated_at_iso": _now_iso(now),
                 }
@@ -365,123 +305,37 @@ def enqueue_x_action(
     return item_id
 
 
-def check_comment_sentinel(
-    account_name: str,
+def get_x_action(item_id: str, *, db: Any = None) -> Optional[Dict[str, Any]]:
+    """Fetch a queued action document from `x_ops_queue` (contains `status`, `result`, `error`)."""
+    doc = _resolve_col(db, QUEUE_COLLECTION).find_one({"_id": str(item_id or "").strip()})
+    return dict(doc) if isinstance(doc, dict) else None
+
+
+def wait_x_action(
+    item_id: str,
     *,
+    timeout_seconds: float = 120.0,
+    poll_interval: float = 1.0,
     db: Any = None,
-    state_store: Optional[XAccountStateStore] = None,
-    fetch_fn: Callable[[str], Optional[Dict[str, Any]]] = fetch_x_tweet_zero_auth,
-    window_hours: int = TRACKED_POST_WINDOW_HOURS,
-    max_replies_per_post: int = MAX_REPLIES_PER_POST,
-    now_ts: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Zero-auth comment sentinel: checks public `comment_count` of recent tracked posts via `x_api`.
-    Only enqueues `sync_and_reply` when a post has new unread comments.
-    """
-    now = int(time.time()) if now_ts is None else int(now_ts)
-    store = state_store or XAccountStateStore(db)
-    doc = store.get_state(account_name)
-    tracked = dict(doc.get("tracked_posts") or {})
-    cutoff = now - max(1, int(window_hours)) * 3600
-
-    checked = 0
-    changed_posts: List[str] = []
-    for pid, meta in tracked.items():
-        pub_ts = safe_int((meta or {}).get("publish_ts"), 0)
-        replied_cnt = safe_int((meta or {}).get("replied_count"), 0)
-        if pub_ts > 0 and pub_ts < cutoff:
-            continue
-        if replied_cnt >= max_replies_per_post:
-            continue
-        checked += 1
-        try:
-            std = fetch_fn(pid)
-        except Exception as exc:
-            logger.warning(f"[免登哨兵 | {account_name}] 拉取主帖 {pid} 状态异常: {exc}")
-            continue
-        if not isinstance(std, dict):
-            continue
-        live_cnt = safe_int((std.get("engagement") or {}).get("comment_count"), 0)
-        prev_cnt = safe_int((meta or {}).get("last_comment_count"), 0)
-        if live_cnt > prev_cnt:
-            store.update_tracked_post_sentinel(account_name, pid, live_cnt, now_ts=now)
-            changed_posts.append(pid)
-
-    enqueued_id = ""
-    if changed_posts:
-        q_col = _resolve_col(db, QUEUE_COLLECTION)
-        existing = q_col.find_one(
-            {"account_name": account_name, "action_type": "sync_and_reply", "status": "pending"}
-        )
-        if not existing:
-            enqueued_id = enqueue_x_action(
-                account_name,
-                "sync_and_reply",
-                {"trigger": "zero_auth_sentinel", "post_ids": changed_posts},
-                db=db,
-                now_ts=now,
-            )
-            logger.info(
-                f"🛰️ [免登哨兵 | {account_name}] 检测到主帖新评论增量: {changed_posts} -> 已入队 sync_and_reply ({enqueued_id})"
-            )
-
-    return {"checked": checked, "changed_posts": changed_posts, "enqueued_id": enqueued_id}
-
-
-def _generate_reply_via_llm(own_handle: str, candidate: Dict[str, Any], *, now_ts: int) -> Dict[str, Any]:
-    reply_ts = safe_int(candidate.get("reply_created_ts"), 0)
-    age_desc = f"{max(0, (now_ts - reply_ts) // 60)} 分钟前" if reply_ts > 0 else "近期"
-    parent_ctx = "读者直接回复了你的上述主帖。"
-    if candidate.get("in_reply_to_status_id") and candidate.get("post_id") and (
-        candidate["in_reply_to_status_id"] != candidate["post_id"]
-    ):
-        parent_ctx = "读者在你的上述主帖评论区继续追评回复了你。"
-
-    rendered, meta = render_prompt_template(
-        REPLY_PROMPT_REL_PATH,
-        {
-            "ACCOUNT_HANDLE": own_handle or DEFAULT_ACCOUNT["screen_name"],
-            "MAX_WEIGHTED_CHARS": MAX_REPLY_WEIGHTED_CHARS,
-            "MY_POST_TEXT": candidate.get("parent_text") or "(原帖正文暂不可见，仅结合读者评论谨慎回应)",
-            "MY_POST_HAS_MEDIA": "是" if candidate.get("parent_has_media") else "否",
-            "TIME_CONTEXT_BLOCK": f"当前距读者评论约 {age_desc}",
-            "PARENT_CONTEXT_BLOCK": parent_ctx,
-            "REPLY_AUTHOR": f"@{candidate.get('reply_author') or 'unknown'}",
-            "REPLY_HAS_MEDIA": "是" if candidate.get("reply_has_media") else "否",
-            "REPLY_TEXT": candidate.get("reply_text") or "",
-        },
-    )
-
-    def _validate(obj: Any) -> Optional[str]:
-        if not isinstance(obj, dict):
-            return "输出必须为 JSON 对象"
-        if bool(obj.get("skip")):
-            return None
-        txt = str(obj.get("reply_text") or "").strip()
-        if not txt:
-            return "skip=false 时 reply_text 不能为空"
-        if calc_x_weighted_length(txt) > MAX_REPLY_WEIGHTED_CHARS:
-            return f"reply_text 超出 {MAX_REPLY_WEIGHTED_CHARS} X 加权字符限制"
-        return None
-
-    data, llm_meta = call_llm_json(
-        prompt=rendered,
-        prompt_meta=meta,
-        model=None,
-        preset_model_group=GENERATOR_MODEL_GROUP,
-        validator=_validate,
-        timeout=120,
-        schema_retries=2,
-        task_label=f"x_ops_reply:{candidate.get('reply_id')}",
-    )
-    out = dict(data or {}) if isinstance(data, dict) else {"skip": True, "skip_reason": "llm_empty"}
-    out["model_used"] = llm_meta.get("model_used") or ""
-    return out
+    """Poll `x_ops_queue` until the action completes (`done` / `skipped` / `failed`), then return the doc."""
+    clean_id = str(item_id or "").strip()
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    sleep_sec = max(0.01, float(poll_interval))
+    while True:
+        doc = get_x_action(clean_id, db=db)
+        if doc is None:
+            raise KeyError(f"Queue action not found: {clean_id}")
+        if str(doc.get("status") or "pending") != "pending":
+            return doc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out waiting for queue action: {clean_id}")
+        time.sleep(min(sleep_sec, remaining))
 
 
 class DaemonContext:
-    """Execution context passed to every registered action handler."""
+    """Execution context passed to every registered atomic action handler."""
 
     def __init__(
         self,
@@ -494,8 +348,6 @@ class DaemonContext:
         breaker: XAccountCircuitBreaker,
         cfg: Dict[str, Any],
         now_ts: int,
-        reply_generator_fn: Callable[[str, Dict[str, Any], int], Dict[str, Any]] = None,
-        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.account = account
         self.page = page
@@ -505,10 +357,6 @@ class DaemonContext:
         self.breaker = breaker
         self.cfg = cfg
         self.now_ts = now_ts
-        self.reply_generator_fn = reply_generator_fn or (
-            lambda handle, cand, ts: _generate_reply_via_llm(handle, cand, now_ts=ts)
-        )
-        self.sleep_fn = sleep_fn
 
 
 ActionHandler = Callable[[DaemonContext, Dict[str, Any]], Dict[str, Any]]
@@ -527,6 +375,13 @@ def get_registered_action_handlers() -> Dict[str, ActionHandler]:
     return dict(_ACTION_HANDLERS)
 
 
+def _cooldown_outcome(payload: Dict[str, Any], *, defer_until_ts: int, error: str) -> Dict[str, Any]:
+    """冷却类临时限制默认顺延排期（保持 pending）；传入 defer_on_cooldown=False 时才直接跳过。"""
+    if defer_until_ts > 0 and bool(payload.get("defer_on_cooldown", True)):
+        return {"status": "deferred", "defer_until_ts": int(defer_until_ts), "error": error}
+    return {"status": "skipped", "error": error}
+
+
 def _handle_post(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     acc_name = ctx.account["name"]
     payload = item.get("payload") or {}
@@ -539,7 +394,11 @@ def _handle_post(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     last_ts = ctx.state_store.last_action_ts(acc_name, "post")
     if last_ts > 0 and (ctx.now_ts - last_ts) < cfg["min_post_interval_seconds"]:
         rem = cfg["min_post_interval_seconds"] - (ctx.now_ts - last_ts)
-        return {"status": "skipped", "error": f"post_interval_cooldown ({rem}s remaining)"}
+        return _cooldown_outcome(
+            payload,
+            defer_until_ts=last_ts + int(cfg["min_post_interval_seconds"]) + 5,
+            error=f"post_interval_cooldown ({rem}s remaining)",
+        )
 
     post_id = post_on_x_page(
         ctx.page,
@@ -551,14 +410,6 @@ def _handle_post(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
         scroll_before=bool(payload.get("scroll_before", True)),
     )
     ctx.state_store.record_action(acc_name, "post", now_ts=ctx.now_ts)
-    ctx.state_store.track_own_post(
-        acc_name,
-        post_id,
-        ctx.now_ts,
-        text=str(payload.get("content") or ""),
-        comment_count=0,
-        now_ts=ctx.now_ts,
-    )
     return {"status": "done", "result": {"post_id": post_id}}
 
 
@@ -573,30 +424,29 @@ def _decode_x_snowflake_ts(tweet_id: str) -> int:
         return 0
 
 
-def _check_reply_budget(ctx: DaemonContext, root_post_id: str, parent_pub_ts: int) -> Optional[str]:
+def _check_reply_budget(ctx: DaemonContext, root_post_id: str, parent_pub_ts: int) -> Tuple[Optional[str], int]:
     acc_name = ctx.account["name"]
     cfg = ctx.cfg
     eff_parent_ts = safe_int(parent_pub_ts, 0) or _decode_x_snowflake_ts(root_post_id)
     if eff_parent_ts > 0 and (ctx.now_ts - eff_parent_ts) > cfg["reply_parent_max_age_hours"] * 3600:
-        return f"parent_post_too_old (>{cfg['reply_parent_max_age_hours']}h)"
+        return f"parent_post_too_old (>{cfg['reply_parent_max_age_hours']}h)", 0
 
     if root_post_id:
-        tracked = ctx.state_store.get_tracked_post(acc_name, root_post_id)
-        t_pub = safe_int(tracked.get("publish_ts"), 0)
-        if t_pub > 0 and (ctx.now_ts - t_pub) > cfg["reply_parent_max_age_hours"] * 3600:
-            return f"tracked_root_post_too_old (>{cfg['reply_parent_max_age_hours']}h)"
-        if safe_int(tracked.get("replied_count"), 0) >= cfg["max_replies_per_post"]:
-            return f"per_post_reply_cap ({tracked.get('replied_count')}/{cfg['max_replies_per_post']})"
-
-    hr_cnt = ctx.state_store.count_recent_actions(acc_name, "reply", 3600, now_ts=ctx.now_ts)
-    if hr_cnt >= cfg["max_replies_per_hour"]:
-        return f"reply_hourly_cap ({hr_cnt}/{cfg['max_replies_per_hour']})"
+        replied_on_post = ctx.state_store.get_post_reply_count(acc_name, root_post_id)
+        if replied_on_post >= cfg["max_replies_per_post"]:
+            return f"per_post_reply_cap ({replied_on_post}/{cfg['max_replies_per_post']})", 0
 
     day_cnt = ctx.state_store.count_recent_actions(acc_name, "reply", 24 * 3600, now_ts=ctx.now_ts)
     if day_cnt >= cfg["max_replies_per_day"]:
-        return f"reply_daily_cap ({day_cnt}/{cfg['max_replies_per_day']})"
+        return f"reply_daily_cap ({day_cnt}/{cfg['max_replies_per_day']})", 0
 
-    return None
+    hr_cnt = ctx.state_store.count_recent_actions(acc_name, "reply", 3600, now_ts=ctx.now_ts)
+    if hr_cnt >= cfg["max_replies_per_hour"]:
+        oldest_hr = ctx.state_store.oldest_action_ts_in_window(acc_name, "reply", 3600, now_ts=ctx.now_ts)
+        defer_until = (oldest_hr + 3615) if oldest_hr > 0 else (ctx.now_ts + 600)
+        return f"reply_hourly_cap ({hr_cnt}/{cfg['max_replies_per_hour']})", defer_until
+
+    return None, 0
 
 
 def _handle_reply(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -606,9 +456,13 @@ def _handle_reply(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     root_pid = str(payload.get("root_post_id") or payload.get("post_id") or "").strip()
     parent_pub_ts = safe_int(payload.get("parent_publish_ts"), 0)
 
-    deny_reason = _check_reply_budget(ctx, root_pid, parent_pub_ts)
+    dedup_id = str(payload.get("reply_id") or target).strip()
+    if dedup_id and ctx.state_store.is_reply_recorded(acc_name, dedup_id):
+        return {"status": "skipped", "error": f"already_replied ({dedup_id})"}
+
+    deny_reason, defer_until = _check_reply_budget(ctx, root_pid, parent_pub_ts)
     if deny_reason:
-        return {"status": "skipped", "error": deny_reason}
+        return _cooldown_outcome(payload, defer_until_ts=defer_until, error=deny_reason)
 
     # 【保留过滤原因说明】彻底关闭回复前自动顺手点赞，消除双写自动化序列特征
     comment_id = reply_on_x_page(
@@ -625,86 +479,10 @@ def _handle_reply(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     ctx.state_store.record_reply_for_post(
         acc_name,
         root_pid or target,
-        str(payload.get("reply_id") or target),
+        dedup_id,
         now_ts=ctx.now_ts,
     )
     return {"status": "done", "result": {"reply_id": comment_id}}
-
-
-def _handle_sync_and_reply(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
-    acc_name = ctx.account["name"]
-    cfg = ctx.cfg
-    payload = item.get("payload") or {}
-
-    sniffed = sniff_notifications_on_page(
-        ctx.page,
-        own_handle=ctx.account.get("screen_name", ""),
-        scroll_rounds=safe_int(payload.get("scroll_rounds"), 2),
-        account_name=acc_name,
-        breaker=ctx.breaker,
-    )
-    own_handle = sniffed.get("own_handle") or ctx.account.get("screen_name", "")
-    candidates = list(sniffed.get("items") or [])
-
-    sent: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-
-    for cand in candidates:
-        hr_cnt = ctx.state_store.count_recent_actions(acc_name, "reply", 3600, now_ts=ctx.now_ts)
-        day_cnt = ctx.state_store.count_recent_actions(acc_name, "reply", 24 * 3600, now_ts=ctx.now_ts)
-        if hr_cnt >= cfg["max_replies_per_hour"] or day_cnt >= cfg["max_replies_per_day"] or len(sent) >= 3:
-            break
-
-        rid = str(cand.get("reply_id") or "").strip()
-        root_pid = str(cand.get("post_id") or "").strip()
-        if not rid or ctx.state_store.is_reply_recorded(acc_name, rid):
-            continue
-
-        reply_text_raw = str(cand.get("reply_text") or "").strip()
-        if not reply_text_raw:
-            skipped.append({"reply_id": rid, "reason": "empty_reply_text"})
-            continue
-
-        reply_ts = safe_int(cand.get("reply_created_ts"), 0)
-        parent_ts = safe_int(cand.get("parent_publish_ts"), 0) or reply_ts
-        deny_reason = _check_reply_budget(ctx, root_pid, parent_ts)
-        if deny_reason:
-            skipped.append({"reply_id": rid, "reason": deny_reason})
-            continue
-
-        gen = ctx.reply_generator_fn(own_handle, cand, ctx.now_ts)
-        if gen.get("skip"):
-            skipped.append({"reply_id": rid, "reason": str(gen.get("skip_reason") or "llm_skip")})
-            continue
-
-        reply_body = str(gen.get("reply_text") or "").strip()
-        if not reply_body:
-            skipped.append({"reply_id": rid, "reason": "empty_generated_reply"})
-            continue
-
-        if sent:
-            lo_d, hi_d = cfg["inter_reply_delay_range"]
-            ctx.sleep_fn(random.randint(int(lo_d), int(hi_d)))
-
-        new_id = reply_on_x_page(
-            ctx.page,
-            target_post_url=cand.get("reply_url") or rid,
-            content=reply_body,
-            like=False,
-            account_name=acc_name,
-            breaker=ctx.breaker,
-        )
-        ctx.state_store.record_action(acc_name, "reply", now_ts=ctx.now_ts)
-        ctx.state_store.record_reply_for_post(acc_name, root_pid or rid, rid, now_ts=ctx.now_ts)
-        sent.append({"target_reply_id": rid, "sent_reply_id": new_id, "post_id": root_pid, "text": reply_body})
-
-    if ctx.session is not None:
-        try:
-            ctx.session.goto_home(wait_ms=900)
-        except Exception:
-            pass
-
-    return {"status": "done", "result": {"sent_count": len(sent), "sent": sent, "skipped": skipped}}
 
 
 def _handle_follow(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -714,6 +492,15 @@ def _handle_follow(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     day_cnt = ctx.state_store.count_recent_actions(acc_name, "follow", 24 * 3600, now_ts=ctx.now_ts)
     if day_cnt >= cfg["max_follows_per_day"]:
         return {"status": "skipped", "error": f"follow_daily_cap ({day_cnt}/{cfg['max_follows_per_day']})"}
+
+    last_ts = ctx.state_store.last_action_ts(acc_name, "follow")
+    if last_ts > 0 and (ctx.now_ts - last_ts) < cfg["min_follow_interval_seconds"]:
+        rem = cfg["min_follow_interval_seconds"] - (ctx.now_ts - last_ts)
+        return _cooldown_outcome(
+            payload,
+            defer_until_ts=last_ts + int(cfg["min_follow_interval_seconds"]) + 5,
+            error=f"follow_interval_cooldown ({rem}s remaining)",
+        )
 
     target = str(payload.get("screen_name") or payload.get("target_screen_name") or "").strip()
     status = follow_on_x_page(
@@ -748,15 +535,33 @@ def _handle_pin(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "done", "result": {"post_id": target_post_id, "pin_status": status}}
 
 
+def _handle_sniff_notifications(ctx: DaemonContext, item: Dict[str, Any]) -> Dict[str, Any]:
+    acc_name = ctx.account["name"]
+    payload = item.get("payload") or {}
+    sniffed = sniff_notifications_on_page(
+        ctx.page,
+        own_handle=ctx.account.get("screen_name", ""),
+        scroll_rounds=safe_int(payload.get("scroll_rounds"), 1),
+        account_name=acc_name,
+        breaker=ctx.breaker,
+    )
+    if ctx.session is not None:
+        try:
+            ctx.session.goto_home(wait_ms=900)
+        except Exception:
+            pass
+    return {"status": "done", "result": sniffed}
+
+
 register_action_handler("post", _handle_post)
 register_action_handler("reply", _handle_reply)
-register_action_handler("sync_and_reply", _handle_sync_and_reply)
 register_action_handler("follow", _handle_follow)
 register_action_handler("pin", _handle_pin)
+register_action_handler("sniff_notifications", _handle_sniff_notifications)
 
 
 class XOpsDaemon:
-    """Persistent single-Chrome orchestrator executing queued X actions under unified safety controls."""
+    """Passive single-Chrome executor: performs ONLY actions explicitly enqueued by upper callers."""
 
     def __init__(
         self,
@@ -766,18 +571,16 @@ class XOpsDaemon:
         session: Optional[XBrowserSession] = None,
         state_store: Optional[XAccountStateStore] = None,
         breaker: Optional[XAccountCircuitBreaker] = None,
-        sentinel_fetch_fn: Callable[[str], Optional[Dict[str, Any]]] = fetch_x_tweet_zero_auth,
-        reply_generator_fn: Optional[Callable[[str, Dict[str, Any], int], Dict[str, Any]]] = None,
         cfg: Optional[Dict[str, Any]] = None,
         stop_event: Optional[threading.Event] = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.account = dict(account or DEFAULT_ACCOUNT)
         self._db = db
         self.state_store = state_store or XAccountStateStore(db)
         self.breaker = breaker or XAccountCircuitBreaker(db, default_freeze_seconds=FREEZE_ON_CHALLENGE_SECONDS)
-        self.sentinel_fetch_fn = sentinel_fetch_fn
-        self.reply_generator_fn = reply_generator_fn
         self.stop_event = stop_event
+        self.sleep_fn = sleep_fn
         self.cfg = {
             "max_posts_per_day": MAX_POSTS_PER_DAY,
             "min_post_interval_seconds": MIN_POST_INTERVAL_SECONDS,
@@ -785,18 +588,16 @@ class XOpsDaemon:
             "max_replies_per_hour": MAX_REPLIES_PER_HOUR,
             "max_replies_per_post": MAX_REPLIES_PER_POST,
             "reply_parent_max_age_hours": REPLY_PARENT_MAX_AGE_HOURS,
-            "inter_reply_delay_range": INTER_REPLY_DELAY_RANGE,
             "max_follows_per_day": MAX_FOLLOWS_PER_DAY,
+            "min_follow_interval_seconds": MIN_FOLLOW_INTERVAL_SECONDS,
             "max_pins_per_day": MAX_PINS_PER_DAY,
-            "sentinel_interval_seconds": SENTINEL_INTERVAL_SECONDS,
-            "tracked_post_window_hours": TRACKED_POST_WINDOW_HOURS,
+            "inter_write_delay_seconds": INTER_WRITE_DELAY_SECONDS,
             "session_refresh_hours": SESSION_REFRESH_HOURS,
             "poll_loop_seconds": POLL_LOOP_SECONDS,
             **(cfg or {}),
         }
         self.session = session or XBrowserSession(self.account["user_data_dir"], use_proxy=USE_PROXY)
         self._session_started_ts: int = 0
-        self._last_sentinel_ts: int = 0
 
     def _queue_col(self) -> Any:
         _ensure_indexes(self._db)
@@ -831,12 +632,28 @@ class XOpsDaemon:
             },
         )
 
-    def run_once(
+    def _defer_queue_item(
         self,
+        item_id: str,
         *,
-        now_ts: Optional[int] = None,
-        check_sentinel: bool = True,
-    ) -> Dict[str, Any]:
+        defer_until_ts: int,
+        now_ts: int,
+        error: str = "",
+    ) -> None:
+        self._queue_col().update_one(
+            {"_id": item_id},
+            {
+                "$set": {
+                    "status": "pending",
+                    "scheduled_at_ts": int(defer_until_ts),
+                    "deferred_until_iso": _now_iso(int(defer_until_ts)),
+                    "updated_at_ts": now_ts,
+                    "error": str(error or ""),
+                }
+            },
+        )
+
+    def run_once(self, *, now_ts: Optional[int] = None) -> Dict[str, Any]:
         now = int(time.time()) if now_ts is None else int(now_ts)
         acc_name = self.account["name"]
 
@@ -853,28 +670,17 @@ class XOpsDaemon:
             logger.info(f"🔄 [XOpsDaemon | {acc_name}] 长驻会话满 {self.cfg['session_refresh_hours']}h，温和重启回收内存...")
             self._close_session_if_open()
 
-        # 3. Zero-auth comment sentinel
-        if check_sentinel and (now - self._last_sentinel_ts) >= int(self.cfg["sentinel_interval_seconds"]):
-            self._last_sentinel_ts = now
-            check_comment_sentinel(
-                acc_name,
-                db=self._db,
-                state_store=self.state_store,
-                fetch_fn=self.sentinel_fetch_fn,
-                window_hours=self.cfg["tracked_post_window_hours"],
-                max_replies_per_post=self.cfg["max_replies_per_post"],
-                now_ts=now,
-            )
-
-        # 4. Fetch due actions from x_ops_queue
+        # 3. Fetch due actions from x_ops_queue
         q_col = self._queue_col()
         due_items = list(
             q_col.find(
                 {"account_name": acc_name, "status": "pending", "scheduled_at_ts": {"$lte": now}}
             ).sort([("scheduled_at_ts", 1), ("created_at_ts", 1)])
         )
+        if not due_items:
+            return {"status": "idle", "due": 0, "executed": 0, "skipped": 0, "deferred": 0, "failed": 0}
 
-        # Keep single headed Chrome warm while daemon is active
+        # 4. Lazily start/reuse single headed Chrome only when tasks exist
         was_alive = self.session.is_alive()
         page = self.session.ensure_alive()
         if not was_alive:
@@ -893,16 +699,40 @@ class XOpsDaemon:
         executed = 0
         failed = 0
         skipped = 0
+        deferred = 0
+        writes_executed = 0
         for item in due_items:
             if self.stop_event is not None and self.stop_event.is_set():
                 break
+
+            item_now = int(time.time()) if now_ts is None else int(now_ts)
+            frozen_mid, _, reason_mid = self.breaker.is_frozen(acc_name, now_ts=item_now)
+            if frozen_mid:
+                self._close_session_if_open()
+                return {
+                    "status": "frozen_challenge",
+                    "error": reason_mid,
+                    "executed": executed,
+                    "skipped": skipped,
+                    "deferred": deferred,
+                    "failed": failed,
+                }
+
             item_id = str(item.get("_id"))
             action_type = str(item.get("action_type") or "").strip()
             handler = _ACTION_HANDLERS.get(action_type)
             if handler is None:
-                self._update_queue_item(item_id, status="failed", now_ts=now, error=f"unknown_action_type: {action_type}")
+                self._update_queue_item(item_id, status="failed", now_ts=item_now, error=f"unknown_action_type: {action_type}")
                 failed += 1
                 continue
+
+            if writes_executed > 0 and action_type in _WRITE_ACTION_TYPES:
+                lo_d, hi_d = self.cfg["inter_write_delay_seconds"]
+                if float(hi_d) > 0:
+                    delay_s = random.uniform(max(0.0, float(lo_d)), max(float(lo_d), float(hi_d)))
+                    self.sleep_fn(delay_s)
+                    if now_ts is None:
+                        item_now = int(time.time())
 
             ctx = DaemonContext(
                 account=self.account,
@@ -912,43 +742,79 @@ class XOpsDaemon:
                 state_store=self.state_store,
                 breaker=self.breaker,
                 cfg=self.cfg,
-                now_ts=now,
-                reply_generator_fn=self.reply_generator_fn,
+                now_ts=item_now,
             )
             try:
                 outcome = handler(ctx, item)
                 st = str(outcome.get("status") or "done")
-                self._update_queue_item(
-                    item_id,
-                    status=st,
-                    now_ts=now,
-                    result=outcome.get("result"),
-                    error=str(outcome.get("error") or ""),
-                )
-                if st == "done":
-                    executed += 1
-                elif st == "skipped":
-                    skipped += 1
+                if st == "deferred":
+                    defer_until = safe_int(outcome.get("defer_until_ts"), item_now + 60)
+                    self._defer_queue_item(
+                        item_id,
+                        defer_until_ts=defer_until,
+                        now_ts=item_now,
+                        error=str(outcome.get("error") or ""),
+                    )
+                    deferred += 1
                 else:
-                    failed += 1
+                    self._update_queue_item(
+                        item_id,
+                        status=st,
+                        now_ts=item_now,
+                        result=outcome.get("result"),
+                        error=str(outcome.get("error") or ""),
+                    )
+                    if st == "done":
+                        executed += 1
+                        if action_type in _WRITE_ACTION_TYPES:
+                            writes_executed += 1
+                    elif st == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
             except ChallengeRequiredError as ch_err:
-                frozen_now, _, _ = self.breaker.is_frozen(acc_name, now_ts=now)
+                frozen_now, _, _ = self.breaker.is_frozen(acc_name, now_ts=item_now)
                 if not frozen_now:
-                    self.breaker.trip(acc_name, reason=str(ch_err), url=str(getattr(page, "url", "") or ""), now_ts=now)
-                self._update_queue_item(item_id, status="failed", now_ts=now, error=str(ch_err))
+                    self.breaker.trip(acc_name, reason=str(ch_err), url=str(getattr(page, "url", "") or ""), now_ts=item_now)
+                self._update_queue_item(item_id, status="failed", now_ts=item_now, error=str(ch_err))
                 self._close_session_if_open()
-                return {"status": "frozen_challenge", "error": str(ch_err), "executed": executed, "failed": failed + 1}
+                return {
+                    "status": "frozen_challenge",
+                    "error": str(ch_err),
+                    "executed": executed,
+                    "skipped": skipped,
+                    "deferred": deferred,
+                    "failed": failed + 1,
+                }
             except Exception as exc:
-                self._update_queue_item(item_id, status="failed", now_ts=now, error=str(exc))
+                self._update_queue_item(item_id, status="failed", now_ts=item_now, error=str(exc))
                 failed += 1
                 logger.exception(f"❌ [XOpsDaemon | {acc_name}] 执行任务 {item_id}({action_type}) 异常: {exc}")
+                frozen_after, _, reason_after = self.breaker.is_frozen(acc_name, now_ts=item_now)
+                if frozen_after:
+                    self._close_session_if_open()
+                    return {
+                        "status": "frozen_challenge",
+                        "error": reason_after or str(exc),
+                        "executed": executed,
+                        "skipped": skipped,
+                        "deferred": deferred,
+                        "failed": failed,
+                    }
 
-        return {"status": "ok", "due": len(due_items), "executed": executed, "skipped": skipped, "failed": failed}
+        return {
+            "status": "ok",
+            "due": len(due_items),
+            "executed": executed,
+            "skipped": skipped,
+            "deferred": deferred,
+            "failed": failed,
+        }
 
     def run_daemon(self, max_rounds: int = 0) -> int:
         logger.info(
             f"🚀 [XOpsDaemon 启动] 账号={self.account['name']}(@{self.account.get('screen_name')}) "
-            f"| 轮询={self.cfg['poll_loop_seconds']}s"
+            f"| 纯被动排队执行模式 | 轮询={self.cfg['poll_loop_seconds']}s"
         )
         try:
             return run_daemon_loop(
@@ -1022,7 +888,6 @@ class XOpsDaemon:
         pin_day = self.state_store.count_recent_actions(acc_name, "pin", 24 * 3600, now_ts=now)
         q_col = self._queue_col()
         pending_cnt = q_col.count_documents({"account_name": acc_name, "status": "pending"})
-        tracked = (self.state_store.get_state(acc_name) or {}).get("tracked_posts") or {}
         return (
             f"=== XOpsDaemon Status ({acc_name} / @{self.account.get('screen_name')}) ===\n"
             f"Session Dir : {self.account['user_data_dir']}\n"
@@ -1030,7 +895,7 @@ class XOpsDaemon:
             f"Quotas      : post_24h={p_day}/{self.cfg['max_posts_per_day']} | reply_1h={r_hr}/{self.cfg['max_replies_per_hour']} "
             f"| reply_24h={r_day}/{self.cfg['max_replies_per_day']} | follow_24h={f_day}/{self.cfg['max_follows_per_day']} "
             f"| pin_24h={pin_day}/{self.cfg['max_pins_per_day']}\n"
-            f"Queue/Track : pending={pending_cnt} | tracked_posts={len(tracked)}"
+            f"Queue       : pending={pending_cnt}"
         )
 
 
@@ -1069,7 +934,7 @@ def main(mode: Optional[str] = None) -> None:
 
 
 if __name__ == "__main__":
-    # 默认直接运行按顶部 RUN_MODE 执行（默认 "status" 为纯只读状态检查，不会开浏览器）。
+    # 默认直接运行按顶部 RUN_MODE 执行（本模块是纯执行器，绝不会自行触发默认操作，只有在接到队列任务时才会动作）。
     # 如需单独跑下方某一个测试示例：先注释掉 `main()`，再取消对应示例块的注释后直接运行本文件即可。
     main()
 
@@ -1084,8 +949,8 @@ if __name__ == "__main__":
     # main("login")
 
     # ==========================================================================
-    # 示例 3：往队列塞一条主帖（纯文字或带图）并立即执行一次
-    # 提示：日常后台跑 RUN_MODE = "daemon" 时，外部模块只需调用 enqueue_x_action(...) 入队即可
+    # 示例 3：往队列塞一条主帖（纯文字或带图）并立即执行一次（并取回 post_id）
+    # 提示：当后台已常驻跑 RUN_MODE="daemon" 时，外部模块只需 enqueue_x_action(...)，需要结果再用 wait_x_action(qid)
     # ==========================================================================
     # daemon = XOpsDaemon()
     # qid = enqueue_x_action(
@@ -1100,7 +965,10 @@ if __name__ == "__main__":
     # )
     # print("已入队主帖任务 ID:", qid)
     # try:
-    #     print(daemon.run_once(check_sentinel=False))
+    #     print("执行汇总:", daemon.run_once())
+    #     print("任务详情:", get_x_action(qid))
+    #     # 若后台已有另一进程在跑 daemon，上层模块改为直接等结果：
+    #     # print("等待守护完成:", wait_x_action(qid, timeout_seconds=120))
     # finally:
     #     daemon._close_session_if_open()
 
@@ -1119,21 +987,21 @@ if __name__ == "__main__":
     # )
     # print("已入队回复任务 ID:", qid)
     # try:
-    #     print(daemon.run_once(check_sentinel=False))
+    #     print(daemon.run_once())
+    #     print(get_x_action(qid))
     # finally:
     #     daemon._close_session_if_open()
 
     # ==========================================================================
-    # 示例 5：免登评论哨兵巡检（无风险）+ 站内拉取未读通知并 AI 自动回复
+    # 示例 5：纯只读拉取一次站内通知列表（只返回原始数据给上层应用，不生成文案也不自动回复）
     # ==========================================================================
     # daemon = XOpsDaemon()
-    # sentinel_res = check_comment_sentinel(daemon.account["name"])
-    # print("免登哨兵巡检结果:", sentinel_res)
-    # # 若想跳过哨兵直接去站内拉一次通知并尝试 AI 回复，取消下面注释即可：
-    # # qid = enqueue_x_action(daemon.account["name"], "sync_and_reply", {"scroll_rounds": 1})
-    # # print("已入队自动拉评回复任务 ID:", qid)
+    # qid = enqueue_x_action(daemon.account["name"], "sniff_notifications", {"scroll_rounds": 1})
+    # print("已入队只读拉评任务 ID:", qid)
     # try:
-    #     print(daemon.run_once(check_sentinel=False))
+    #     print(daemon.run_once())
+    #     res_doc = get_x_action(qid) or {}
+    #     print("拉到的通知条数:", len(((res_doc.get("result") or {}).get("items")) or []))
     # finally:
     #     daemon._close_session_if_open()
 
@@ -1145,7 +1013,7 @@ if __name__ == "__main__":
     # # qid_follow = enqueue_x_action(daemon.account["name"], "follow", {"screen_name": "对方Handle不含@"})
     # print("已入队置顶任务 ID:", qid_pin)
     # try:
-    #     print(daemon.run_once(check_sentinel=False))
+    #     print(daemon.run_once())
     # finally:
     #     daemon._close_session_if_open()
 
@@ -1162,6 +1030,6 @@ if __name__ == "__main__":
     # daemon = XOpsDaemon()
     # enqueue_x_action(daemon.account["name"], "custom_demo", {"hello": "x_ops"})
     # try:
-    #     print(daemon.run_once(check_sentinel=False))
+    #     print(daemon.run_once())
     # finally:
     #     daemon._close_session_if_open()

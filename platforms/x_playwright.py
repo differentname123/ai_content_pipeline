@@ -467,6 +467,17 @@ def _locate_x_reply_box(page, post_id=None):
     return page.locator('main[role="main"]').first
 
 
+def _dismiss_x_overlays(page, *, aggressive=False, desc=""):
+    """在安全范围内清理页面浮层；若当前已弹出 X 发帖/回复框，则跳过以免误关对话框。"""
+    try:
+        active_dialog = page.locator('div[role="dialog"]:has(div[data-testid="tweetTextarea_0"])').first
+        if active_dialog.count() > 0 and active_dialog.is_visible():
+            return False
+    except Exception:
+        pass
+    return _dismiss_overlays(page, aggressive=aggressive, desc=desc)
+
+
 def _wake_x_editor(page, editor_container, max_round=3):
     """唤醒 X Draft.js 富文本编辑器并确保焦点落入其中（纯物理点击，严禁 synthetic JS 事件）。返回 real_editor(Locator)。"""
     target_cands = (
@@ -494,7 +505,7 @@ def _wake_x_editor(page, editor_container, max_round=3):
     last_hit = None
 
     for rnd in range(1, max_round + 1):
-        _dismiss_overlays(page, aggressive=(rnd >= 2), desc=f"x-wake-r{rnd}")
+        _dismiss_x_overlays(page, aggressive=(rnd >= 2), desc=f"x-wake-r{rnd}")
         try:
             target.scroll_into_view_if_needed(timeout=3000)
         except Exception:
@@ -822,7 +833,7 @@ def _submit_x_post(
     if not content.strip() and not valid_text_list and not valid_images:
         raise Exception("发帖/回复正文与图片不能同时为空")
 
-    _dismiss_overlays(page, aggressive=False, desc="x-pre-submit")
+    _dismiss_x_overlays(page, aggressive=False, desc="x-pre-submit")
 
     real_editor = _wake_x_editor(page, editor_container)
 
@@ -1391,6 +1402,28 @@ def reply_on_x_page(
     )
 
 
+def _detect_x_response_risk(resp, *, risk_codes=("226", "326", "161")):
+    """检测关注/置顶等 X 接口响应中的风控/限流拦截信号（HTTP 403/429 或特定错误码/关键词）。"""
+    if resp is None:
+        return None
+    status = getattr(resp, "status", 0) or 0
+    if status in (403, 429):
+        return f"HTTP {status}"
+    body = _parse_api_json(resp)
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, list) and errors:
+        first_err = errors[0] if isinstance(errors[0], dict) else {"message": str(errors[0])}
+        err_code = str(first_err.get("code", "") or "").strip()
+        err_msg = str(first_err.get("message") or str(errors[0]) or "").strip()
+        low_msg = err_msg.lower()
+        if err_code in risk_codes or any(
+            k in low_msg
+            for k in ("automated", "challenge", "suspended", "locked", "bounce", "unable to follow", "rate limit")
+        ):
+            return f"HTTP {status} code={err_code or 'unknown'}: {err_msg}"
+    return None
+
+
 def follow_on_x_page(
     page,
     target_screen_name,
@@ -1455,23 +1488,28 @@ def follow_on_x_page(
     if (follow_btn.get_attribute("data-testid") or "").endswith("-unfollow"):
         return "ALREADY_FOLLOWING"
 
-    friendship_ok = {"hit": False}
+    friendship_state = {"hit": False, "risk": ""}
 
     def _on_follow_resp(resp):
         u = (resp.url or "").lower()
-        if ("friendships/create" in u or "createfriendship" in u) and resp.status == 200:
-            friendship_ok["hit"] = True
+        if "friendships/create" in u or "createfriendship" in u:
+            risk = _detect_x_response_risk(resp)
+            if risk:
+                friendship_state["risk"] = risk
+                return
+            if resp.status == 200:
+                friendship_state["hit"] = True
 
     page.on("response", _on_follow_resp)
     try:
         human_click(page, follow_btn)
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            if friendship_ok["hit"]:
+            if friendship_state["hit"] or friendship_state["risk"]:
                 break
             unfollow_now = header_placement.locator('button[data-testid$="-unfollow"], button[data-testid$="-cancel"]').first
             if unfollow_now.count() > 0 and unfollow_now.is_visible():
-                friendship_ok["hit"] = True
+                friendship_state["hit"] = True
                 break
             page.wait_for_timeout(300)
     finally:
@@ -1480,7 +1518,13 @@ def follow_on_x_page(
         except Exception:
             pass
 
-    if friendship_ok["hit"]:
+    if friendship_state["risk"]:
+        if breaker is not None and account_name:
+            breaker.trip(account_name, reason=f"follow_risk: {friendship_state['risk']}", url=page.url)
+        _forensics(page, f"x_follow_risk_{clean_handle}", {"url": profile_url, "risk": friendship_state["risk"]})
+        raise ChallengeRequiredError(f"X 关注触发风控限制 (@{clean_handle}): {friendship_state['risk']}")
+
+    if friendship_state["hit"]:
         human_pause(800, 1400, page=page)
         return "FOLLOWED"
 
@@ -1547,18 +1591,23 @@ def pin_on_x_page(
     confirm_btn = page.locator('button[data-testid="confirmationSheetConfirm"]').first
     confirm_btn.wait_for(state="visible", timeout=6000)
 
-    pin_ok = {"hit": False}
+    pin_state = {"hit": False, "risk": ""}
 
     def _on_pin_resp(resp):
-        if resp.status == 200 and RE_PIN_API.search(resp.url or ""):
-            pin_ok["hit"] = True
+        if RE_PIN_API.search(resp.url or ""):
+            risk = _detect_x_response_risk(resp)
+            if risk:
+                pin_state["risk"] = risk
+                return
+            if resp.status == 200:
+                pin_state["hit"] = True
 
     page.on("response", _on_pin_resp)
     try:
         human_click(page, confirm_btn)
         deadline = time.time() + 8.0
         while time.time() < deadline:
-            if pin_ok["hit"]:
+            if pin_state["hit"] or pin_state["risk"]:
                 break
             page.wait_for_timeout(250)
     finally:
@@ -1567,8 +1616,18 @@ def pin_on_x_page(
         except Exception:
             pass
 
-    human_pause(800, 1500, page=page)
-    return "PINNED"
+    if pin_state["risk"]:
+        if breaker is not None and account_name:
+            breaker.trip(account_name, reason=f"pin_risk: {pin_state['risk']}", url=page.url)
+        _forensics(page, f"x_pin_risk_{tid}", {"url": target_url, "risk": pin_state["risk"]})
+        raise ChallengeRequiredError(f"X 置顶触发风控限制 ({tid}): {pin_state['risk']}")
+
+    if pin_state["hit"]:
+        human_pause(800, 1500, page=page)
+        return "PINNED"
+
+    _forensics(page, f"x_pin_unconfirmed_{tid}", {"url": target_url})
+    raise Exception(f"点击置顶确认后未检测到置顶成功接口响应 ({tid})")
 
 
 def sniff_notifications_on_page(
