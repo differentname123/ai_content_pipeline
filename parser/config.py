@@ -21,8 +21,8 @@ from common.common_utils import (
 # ==============================================================================
 # 1. 提示词版本与模板配置
 # ==============================================================================
-prompt_version = "1016-1"
-SELECTION_PROMPT_VERSION = "20261121-v6_minimal_pick_only"
+prompt_version = "1124-1"
+SELECTION_PROMPT_VERSION = "20261124-v7_breathable_layout"
 
 PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
 MLU_EXTRACT_PROMPT_NAME = "内容生成方案_分析类MLU提取.txt"
@@ -53,6 +53,8 @@ STATE_FILE = str(
 ACCOUNT_COOLDOWN_SECONDS = 3 * 3600       # Binance 单账号全局发帖间隔（合并分析帖与流量帖，至少 2h；默认 3h 对应单号 <=8 篇/天健康节奏）
 OKX_ACCOUNT_COOLDOWN_SECONDS = 3 * 3600   # OKX 单账号全局发帖间隔（合并分析帖与流量帖，至少 2h；默认 3h 对应单号 <=8 篇/天健康节奏）
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600 # 同账号同币种冷却（2h）
+WAF_BACKOFF_SCHEDULE_SECONDS = (1800, 3600, 7200)  # HTTP 405 / WAF 人机验证单账号阶梯退避（30m -> 60m -> 120m 封顶）
+AUTH_EXPIRED_BACKOFF_SECONDS = 3600                # Cookie / 登录态失效单账号自动退避（60m，支持人工补登后自动恢复）
 
 INTERACTION_CONFIG: Dict[str, Dict[str, Any]] = {
     PLATFORM_OKX: {

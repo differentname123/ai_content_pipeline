@@ -67,7 +67,7 @@ USE_PROXY: bool = True
 # 3. 当前操作的 X 账号配置（当前严格默认小号/测试号 x_myself，严禁在风控未解除前启用大号）
 DEFAULT_ACCOUNT: Dict[str, Any] = {
     "name": "x_myself",
-    "user_data_dir": resolve_session_dir("x_myself_browser_session_dir", "x_myself"),
+    "user_data_dir": resolve_session_dir("x_xiaohao_browser_session_dir", "x_myself"),
     "screen_name": str(get_config("x_myself_screen_name", "peterzhu1003") or "peterzhu1003")
     .strip()
     .lstrip("@"),
@@ -936,7 +936,7 @@ def main(mode: Optional[str] = None) -> None:
 if __name__ == "__main__":
     # 默认直接运行按顶部 RUN_MODE 执行（本模块是纯执行器，绝不会自行触发默认操作，只有在接到队列任务时才会动作）。
     # 如需单独跑下方某一个测试示例：先注释掉 `main()`，再取消对应示例块的注释后直接运行本文件即可。
-    main()
+    # main()
 
     # ==========================================================================
     # 示例 1：只读真机体检（验证 Chrome 指纹、登录态、通知嗅探，不会发任何内容）
@@ -946,7 +946,7 @@ if __name__ == "__main__":
     # ==========================================================================
     # 示例 2：打开正版 Chrome 窗口人工登录 X 账号或处理安全验证（关窗自动保存 Session）
     # ==========================================================================
-    # main("login")
+    main("login")
 
     # ==========================================================================
     # 示例 3：往队列塞一条主帖（纯文字或带图）并立即执行一次（并取回 post_id）

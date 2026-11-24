@@ -44,7 +44,7 @@ from parser.post_ingestion import (
     ensure_post_media_downloaded,
     prompt_version,
 )
-from parser.publish_state import AccountPublishStateStore
+from parser.publish_state import AccountPublishStateStore, classify_infra_backoff_error
 from parser.publisher_arena import (
     _check_account_health_guard,
     _collect_publish_candidates,
@@ -97,24 +97,11 @@ class TestPublishStateStore(unittest.TestCase):
             self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0), (True, ""))
             self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0), (True, ""))
 
-            # Auth-expired, HTTP 405/WAF, and transient failures record diagnostics but do NOT block publishing
-            store.record_failure(
-                "binance",
-                "ruru",
-                "页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。",
-                is_viral=False,
-                now=t0,
-            )
-            store.record_failure("binance", "ruru", "HTTP 405", is_viral=False, now=t0 + 1)
-            detail = store.record_failure("binance", "ruru", "timeout waiting for button", is_viral=False, now=t0 + 2)
+            # Transient timeout/button errors record diagnostics but do NOT block publishing
+            detail = store.record_failure("binance", "ruru", "timeout waiting for button", is_viral=False, now=t0)
             self.assertEqual(detail, "timeout waiting for button")
-            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 3), (True, ""))
-            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 3), (True, ""))
-
-            snap_fail = store.get_account_state("binance", "ruru")
-            self.assertEqual(snap_fail["consecutive_failures"], 3)
-            self.assertEqual(snap_fail["last_error_msg"], "timeout waiting for button")
-            self.assertEqual(snap_fail["last_error_time"], t0 + 2)
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 1), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 1), (True, ""))
 
             # Legacy future backoff_until / viral_backoff_until timestamps in state JSON are ignored and cleaned on write
             raw_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -124,32 +111,69 @@ class TestPublishStateStore(unittest.TestCase):
             raw_state["binance"]["ruru"]["viral_backoff_reason"] = "waf_challenge"
             state_path.write_text(json.dumps(raw_state), encoding="utf-8")
 
-            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 10), (True, ""))
-            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 10), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 2), (True, ""))
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 2), (True, ""))
 
-            store.record_failure("binance", "ruru", "HTTP 405", is_viral=True, now=t0 + 11)
-            snap_after_viral_fail = store.get_account_state("binance", "ruru")
-            self.assertNotIn("viral_backoff_until", snap_after_viral_fail)
-            self.assertNotIn("viral_backoff_reason", snap_after_viral_fail)
-            self.assertEqual(snap_after_viral_fail["viral_consecutive_failures"], 1)
+            # Ordinary non-WAF viral failure records count and cleans legacy viral_backoff_* without blocking
+            store.record_failure("binance", "ruru", "[业务拦截] 频率限制", is_viral=True, now=t0 + 5)
+            snap_after_biz_fail = store.get_account_state("binance", "ruru")
+            self.assertNotIn("viral_backoff_until", snap_after_biz_fail)
+            self.assertNotIn("viral_backoff_reason", snap_after_biz_fail)
+            self.assertEqual(snap_after_biz_fail["viral_consecutive_failures"], 1)
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 6), (True, ""))
 
-            # Success resets consecutive_failures, cleans legacy backoff keys, and enforces 3h account-level cooldown + 2h topic cooldown
-            t1 = t0 + 100
-            store.record_success("binance", "ruru", is_viral=False, topic="BTC", now=t1)
-            snap = store.get_account_state("binance", "ruru")
+            # HTTP 405 / WAF triggers stepped account-level backoff (30m -> 60m -> 120m cap) blocking both types on THAT account ONLY
+            store.record_failure("binance", "myself", "[WAF/人机验证] 广场页面返回 HTTP 405", is_viral=False, now=t0 + 10)
+            ok_ana, reason_waf = store.can_publish("binance", "myself", is_viral=False, now=t0 + 20)
+            ok_vir, _ = store.can_publish("binance", "myself", is_viral=True, now=t0 + 20)
+            self.assertFalse(ok_ana)
+            self.assertFalse(ok_vir)
+            self.assertIn("waf_challenge", reason_waf)
+            # Healthy peer account remains completely unaffected (fault-domain isolation)
+            self.assertEqual(store.can_publish("binance", "ruru", is_viral=False, now=t0 + 20), (True, ""))
+
+            # Auto-recovers after 1800s window expires; 2nd WAF backs off 3600s, 3rd+ caps at 7200s
+            self.assertEqual(store.can_publish("binance", "myself", is_viral=False, now=t0 + 10 + 1801), (True, ""))
+            store.record_failure("binance", "myself", "HTTP 405", is_viral=True, now=t0 + 2000)
+            self.assertFalse(store.can_publish("binance", "myself", is_viral=False, now=t0 + 2000 + 3500)[0])
+            self.assertTrue(store.can_publish("binance", "myself", is_viral=False, now=t0 + 2000 + 3601)[0])
+            store.record_failure("binance", "myself", "ChallengeRequiredError", is_viral=False, now=t0 + 6000)
+            self.assertFalse(store.can_publish("binance", "myself", is_viral=False, now=t0 + 6000 + 7100)[0])
+            self.assertTrue(store.can_publish("binance", "myself", is_viral=False, now=t0 + 6000 + 7201)[0])
+
+            # Auth expired triggers 60m (3600s) account backoff and auto-recovers
+            store.record_failure(
+                "binance",
+                "ruru",
+                "页面探测到登录入口或会话已超时，本地 Cookie 可能已过期失效，请先重新登录。",
+                is_viral=False,
+                now=t0 + 7000,
+            )
+            ok_auth, reason_auth = store.can_publish("binance", "ruru", is_viral=True, now=t0 + 7000 + 1800)
+            self.assertFalse(ok_auth)
+            self.assertIn("auth_expired", reason_auth)
+            self.assertTrue(store.can_publish("binance", "ruru", is_viral=True, now=t0 + 7000 + 3601)[0])
+
+            # Success resets backoff + consecutive_failures, cleans legacy keys, and enforces 3h account cooldown + 2h topic cooldown
+            t1 = t0 + 20_000
+            store.record_success("binance", "myself", is_viral=False, topic="BTC", now=t1)
+            snap = store.get_account_state("binance", "myself")
             self.assertNotIn("backoff_until", snap)
             self.assertNotIn("backoff_reason", snap)
+            self.assertEqual(snap["account_backoff_until"], 0)
+            self.assertEqual(snap["account_backoff_reason"], "")
+            self.assertEqual(snap["account_infra_failures"], 0)
             self.assertEqual(snap["consecutive_failures"], 0)
             self.assertEqual(snap["account_last_publish_time"], t1)
             self.assertEqual(snap["last_publish_type"], "analysis")
-            self.assertTrue(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 3600))
-            self.assertFalse(store.is_topic_in_cooldown("binance", "ruru", "BTC", now=t1 + 7201))
+            self.assertTrue(store.is_topic_in_cooldown("binance", "myself", "BTC", now=t1 + 3600))
+            self.assertFalse(store.is_topic_in_cooldown("binance", "myself", "BTC", now=t1 + 7201))
 
             # Analysis & viral share the same account-level global cooldown (3h)
-            ok_before_3h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 2 * 3600)
-            ok_viral_before_3h, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 2 * 3600)
-            ok_after_3h, _ = store.can_publish("binance", "ruru", is_viral=False, now=t1 + 3 * 3600 + 1)
-            ok_viral_after_3h, _ = store.can_publish("binance", "ruru", is_viral=True, now=t1 + 3 * 3600 + 1)
+            ok_before_3h, _ = store.can_publish("binance", "myself", is_viral=False, now=t1 + 2 * 3600)
+            ok_viral_before_3h, _ = store.can_publish("binance", "myself", is_viral=True, now=t1 + 2 * 3600)
+            ok_after_3h, _ = store.can_publish("binance", "myself", is_viral=False, now=t1 + 3 * 3600 + 1)
+            ok_viral_after_3h, _ = store.can_publish("binance", "myself", is_viral=True, now=t1 + 3 * 3600 + 1)
             self.assertFalse(ok_before_3h)
             self.assertFalse(ok_viral_before_3h)
             self.assertTrue(ok_after_3h)
@@ -1091,6 +1115,54 @@ class TestPublisherArena(unittest.TestCase):
             self.assertIn("recent_topics", captured_payload["prompt"])
             self.assertNotIn("account_view_baselines", captured_payload["prompt"])
             self.assertIn("最近发过ETH巨鲸爆仓吃瓜帖", captured_payload["prompt"])
+
+    def test_waf_challenge_backs_off_account_without_consuming_article_attempts(self):
+        from platforms.playwright_base import ChallengeRequiredError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountPublishStateStore(str(Path(tmp) / "waf_state.json"))
+            img_p = _create_tiny_png(Path(tmp), "waf.png")
+            art = {
+                "_id": "mongo_waf",
+                "article_id": "art_waf",
+                "source": "binance",
+                "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "creation_brief": {"original_post": {"text_content": "BTC 测试"}},
+                "post_id_list": ["p_waf"],
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "$BTC 高杠杆爆仓反差吃瓜",
+                    "selected_images": ["[IMAGE_1]"],
+                    "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "截图", "exchange_ui": "", "keep": True}],
+                    "viral_score": 8.6,
+                    "bait_comments": ["笑死"],
+                    "image_mapping": {"[IMAGE_1]": {"local_path": img_p, "original_url": "https://x/w.png", "content_id": "cid_waf", "exchange_ui": ""}},
+                },
+                "publish_records": {},
+            }
+            mock_mgr = MagicMock()
+            mock_mgr.find_articles.side_effect = [[], [art], [], []]
+            mock_mgr.collection_name = "generated_articles"
+            mock_col = MagicMock()
+            mock_mgr.db.get_collection.return_value = mock_col
+
+            self.assertEqual(classify_infra_backoff_error("[WAF/人机验证] 广场页面返回 HTTP 405"), "waf_challenge")
+            self.assertIsNone(classify_infra_backoff_error("timeout waiting for editor"))
+
+            with patch("parser.publisher_arena.PLATFORM_ACCOUNTS", {"binance": ["myself"]}), \
+                 patch("parser.publisher_arena.call_llm_json", return_value=({"selected_candidate_no": 1, "reason": "ok"}, {"ok": True, "model_used": "m1"})), \
+                 patch("parser.publisher_arena._execute_platform_post", side_effect=ChallengeRequiredError("HTTP 405")):
+                _publish_articles_for_platform(mock_mgr, "binance", ["BTC"], ARTICLE_TYPE_VIRAL, state_store=store)
+
+            # Account is now in WAF backoff; DB publish_records must NOT be marked failed or increment attempts
+            ok_next, reason_next = store.can_publish("binance", "myself", is_viral=False)
+            self.assertFalse(ok_next)
+            self.assertIn("waf_challenge", reason_next)
+            mock_col.update_one.assert_not_called()
+            self.assertEqual(art["publish_records"], {})
 
 
 class TestLazyMediaDownload(unittest.TestCase):

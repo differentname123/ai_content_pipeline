@@ -63,7 +63,11 @@ from parser.post_ingestion import (
     _is_valid_image_file,
     prompt_version,
 )
-from parser.publish_state import AccountPublishStateStore, default_state_store
+from parser.publish_state import (
+    AccountPublishStateStore,
+    classify_infra_backoff_error,
+    default_state_store,
+)
 from platforms.playwright_base import ChallengeRequiredError
 
 
@@ -681,6 +685,7 @@ def _persist_publish_result(
             if sel_meta.get("model_used"):
                 plat_record["selection_model_used"] = sel_meta["model_used"]
         else:
+            infra_kind = classify_infra_backoff_error(err_msg)
             error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"
             store.record_failure(
                 platform,
@@ -691,6 +696,9 @@ def _persist_publish_result(
                 wrapped_detail=error_detail,
             )
             account_state.update(store.get_account_state(platform, account))
+            if infra_kind:
+                # 账号级 WAF / 登录失效不消耗目标文章的尝试次数，也不将文章误标为 failed
+                return error_detail
             plat_record.update(
                 status="failed",
                 last_error=error_detail,
@@ -924,6 +932,8 @@ def _publish_articles_for_platform(
                 ) from exc
             if success:
                 candidates.pop(index)
+            infra_backoff_kind = None if success else classify_infra_backoff_error(err)
+            logged_attempts = record.get("attempts", 0) if infra_backoff_kind else attempts
             _log(
                 f"{rule['action']}/文章",
                 "本次处理结束",
@@ -934,7 +944,7 @@ def _publish_articles_for_platform(
                 主题=topic,
                 热币=matched_coin,
                 评分=info.get(rule["score"]),
-                尝试=f"{attempts}/{PUBLISH_MAX_ATTEMPTS}",
+                尝试=f"{logged_attempts}/{PUBLISH_MAX_ATTEMPTS}",
                 耗时=f"{time.monotonic() - started:.2f}秒",
                 结果=api_result,
                 说明="远端发布与本地回写完成" if success else error,

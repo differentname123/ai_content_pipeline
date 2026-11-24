@@ -5,8 +5,8 @@
 统一维护 `logs/runtime/account_publish_state.json`：
 1. 与既有状态字段 100% 向后兼容（`last_publish_time` / `viral_last_publish_time` / `topic_publish_history` / `last_error_*`）；
 2. 引入线程安全的 `RLock`、原子落盘（`save_json`）与进程内同账号并发占用守卫（`try_claim_account` / `release_account`）；
-3. 实行账号级全局发帖间隔冷却（合并分析帖与流量帖，避免双线程短时间连发被限流）与同币主题冷却，
-   不对发布失败设置退避阻塞窗口，使多账号发布前可零成本预检。
+3. 实行账号级全局发帖间隔冷却（合并分析帖与流量帖，避免双线程短时间连发被限流）与同币主题冷却；
+   仅对 HTTP 405/WAF 人机验证与登录态失效触发单账号独立、可自动恢复的基础设施退避冷却，普通超时与业务错误不设阻塞退避。
 """
 import os
 import threading
@@ -22,9 +22,40 @@ from common.common_utils import (
 from parser.config import (
     ACCOUNT_COOLDOWN_SECONDS,
     ACCOUNT_TOPIC_COOLDOWN_SECONDS,
+    AUTH_EXPIRED_BACKOFF_SECONDS,
     OKX_ACCOUNT_COOLDOWN_SECONDS,
     STATE_FILE,
+    WAF_BACKOFF_SCHEDULE_SECONDS,
 )
+
+
+_WAF_CHALLENGE_MARKERS = (
+    "[waf/人机验证]",
+    "http 405",
+    "人机验证",
+    "人机安全验证",
+    "challengerequirederror",
+)
+_AUTH_EXPIRED_MARKERS = (
+    "登录入口或会话已超时",
+    "cookie 可能已过期失效",
+    "请先重新登录",
+    "登录会话已超时",
+    "session has expired",
+)
+
+
+def classify_infra_backoff_error(error_msg: Any) -> Optional[str]:
+    """识别须触发单账号临时退避的基础设施拦截（WAF 人机验证 / 登录态失效），普通异常返回 None。"""
+    text = str(error_msg or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+    if any(marker in low for marker in _WAF_CHALLENGE_MARKERS):
+        return "waf_challenge"
+    if any(marker in low for marker in _AUTH_EXPIRED_MARKERS):
+        return "auth_expired"
+    return None
 
 
 def get_platform_cooldown_seconds(platform: str) -> int:
@@ -56,6 +87,9 @@ def ensure_account_state(
         "total_success": 0,
         "last_publish_time": 0,
         "account_last_publish_time": 0,
+        "account_backoff_until": 0,
+        "account_backoff_reason": "",
+        "account_infra_failures": 0,
         "last_publish_type": "",
         "last_error_msg": "",
         "last_error_time": 0,
@@ -141,6 +175,12 @@ class AccountPublishStateStore:
         remaining = cooldown - (now_ts - last_pub)
         if remaining > 0:
             return False, f"账号全局发布冷却中 (剩余{int(remaining)}秒)"
+
+        backoff_until = float(account_state.get("account_backoff_until") or 0.0)
+        backoff_remaining = backoff_until - now_ts
+        if backoff_remaining > 0:
+            backoff_reason = str(account_state.get("account_backoff_reason") or "infra_backoff")
+            return False, f"账号风控/会话退避冷却中 [{backoff_reason}] (剩余{int(backoff_remaining)}秒)"
 
         return True, ""
 
@@ -240,6 +280,9 @@ class AccountPublishStateStore:
             account_state[f"{prefix}last_publish_time"] = now_ts
             account_state["account_last_publish_time"] = now_ts
             account_state["last_publish_type"] = "viral" if is_viral else "analysis"
+            account_state["account_backoff_until"] = 0
+            account_state["account_backoff_reason"] = ""
+            account_state["account_infra_failures"] = 0
             account_state.pop(f"{prefix}backoff_until", None)
             account_state.pop(f"{prefix}backoff_reason", None)
             account_state[f"{prefix}consecutive_failures"] = 0
@@ -269,13 +312,14 @@ class AccountPublishStateStore:
         wrapped_detail: Optional[str] = None,
     ) -> str:
         """
-        记录发布失败明细、时间与连续失败计数（不设置任何故障退避阻塞窗口，并清理历史遗留退避字段）。
-        返回 `error_detail`。
+        记录发布失败明细与连续失败计数；仅当属于 WAF/人机验证或登录态失效时设置账号级可恢复退避窗口，
+        并清理旧遗留按类型分开的退避字段。返回 `error_detail`。
         """
         now_ts = time.time() if now is None else float(now)
         prefix = _state_prefix(is_viral)
         raw_err = str(error_msg or "")
         error_detail = wrapped_detail if wrapped_detail is not None else raw_err
+        infra_kind = classify_infra_backoff_error(raw_err or error_detail)
 
         with self._lock:
             state = self._read_raw()
@@ -287,6 +331,18 @@ class AccountPublishStateStore:
             account_state[f"{prefix}consecutive_failures"] = (
                 int(account_state.get(f"{prefix}consecutive_failures") or 0) + 1
             )
+            if infra_kind == "waf_challenge":
+                infra_fails = int(account_state.get("account_infra_failures") or 0) + 1
+                schedule_idx = min(infra_fails - 1, len(WAF_BACKOFF_SCHEDULE_SECONDS) - 1)
+                delay_sec = int(WAF_BACKOFF_SCHEDULE_SECONDS[max(0, schedule_idx)])
+                account_state["account_infra_failures"] = infra_fails
+                account_state["account_backoff_until"] = now_ts + delay_sec
+                account_state["account_backoff_reason"] = "waf_challenge"
+            elif infra_kind == "auth_expired":
+                infra_fails = int(account_state.get("account_infra_failures") or 0) + 1
+                account_state["account_infra_failures"] = infra_fails
+                account_state["account_backoff_until"] = now_ts + int(AUTH_EXPIRED_BACKOFF_SECONDS)
+                account_state["account_backoff_reason"] = "auth_expired"
             save_json(self.state_file, state)
         return error_detail
 
