@@ -20,6 +20,7 @@ from common.common_utils import (
     resolve_session_dir,
     setup_logger,
 )
+from parser.config import ARTICLE_TYPE_ANALYSIS, ARTICLE_TYPE_VIRAL
 from platforms.binance_api import (
     fetch_binance_feed,
     fetch_binance_future_hot_coins,
@@ -242,6 +243,31 @@ class BinancePlatform:
     def decorate_analysis(self, text: str, topic: str) -> str:
         return add_hot_topic_to_article(text, topic)
 
+    def score_candidate_form(self, article_type: str, img_cnt: int, clean_len: int) -> float:
+        """
+        【保留过滤/加权原因说明】币安广场形态与篇幅实证分布加权（仅作用于发布选优阶段，解耦于内容生成）：
+        - 基于 30,000 条非蓝 V 原帖与自有账号实发统计：`>=2` 图从极短（<30 字）到 259 字均显著高于单图；
+          单图真正低谷位于不短不长的 `50~99` 字半截区间（中位曝光 77 / 自身号 91），而 `<50` 字单图神梗不预惩罚、交由总编结合画面视觉冲击裁判；
+          超过 `260` 字后曝光开始回落，予以温和衰减。
+        - 分析帖保持 `>=2` 图主力实锤加分、`140~255` 字饱满区间加分及超长 `>260` 字温和衰减。
+        """
+        if article_type == ARTICLE_TYPE_VIRAL:
+            if clean_len > 260:
+                return -0.5 + (1.0 if img_cnt >= 2 else 0.0)
+            if img_cnt >= 2:
+                return 1.0
+            return -0.5 if 50 <= clean_len < 100 else 0.0
+        if article_type == ARTICLE_TYPE_ANALYSIS:
+            bonus = 0.0
+            if img_cnt >= 2:
+                bonus += 0.8
+            if 140 <= clean_len <= 255:
+                bonus += 0.3
+            elif clean_len > 260:
+                bonus -= 0.5
+            return bonus
+        return 0.0
+
 
 class OkxPlatform:
     """OKX 星球 (Orbit) 适配器。"""
@@ -290,11 +316,24 @@ class OkxPlatform:
     def decorate_analysis(self, text: str, topic: str) -> str:
         return add_hot_topic_to_article(text, topic)
 
+    def score_candidate_form(self, article_type: str, img_cnt: int, clean_len: int) -> float:
+        """OKX 分发形态偏置保持中性（0.0），避免币安广场经验权重跨平台误污染。"""
+        return 0.0
+
 
 PLATFORMS: Dict[str, Any] = {
     PLATFORM_BINANCE: BinancePlatform(),
     PLATFORM_OKX: OkxPlatform(),
 }
+
+
+def score_platform_candidate_form(platform: str, article_type: str, img_cnt: int, clean_len: int) -> float:
+    """按目标平台返回图文形态加减权分值；未知平台安全降级为 0.0。"""
+    target = str(platform or "").strip().lower()
+    adapter = PLATFORMS.get(target)
+    if adapter is None or not hasattr(adapter, "score_candidate_form"):
+        return 0.0
+    return float(adapter.score_candidate_form(article_type, img_cnt, clean_len))
 
 
 def _get_account_session_dir(platform: str, account: str) -> str:

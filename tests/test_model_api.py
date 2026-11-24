@@ -286,6 +286,166 @@ class TestModelApi(unittest.TestCase):
             with model_api._MODEL_COOLDOWN_LOCK:
                 self.assertNotIn("antigravity-3.8-flash-high", model_api._MODEL_COOLDOWN_UNTIL)
 
+    def test_antigravity_fatal_error_classification_and_cross_process_quarantine(self):
+        import json
+        from app.ai_api import antigravity_client as ag
+
+        for msg in (
+            'HTTP 500: {"reason": "TOS_VIOLATION"}',
+            "This service has been disabled in this account",
+            "VALIDATION_REQUIRED",
+            "Please verify your account",
+            "error 3501 license missing",
+            "Missing license #3501",
+            "invalid_grant: Token has been expired or revoked",
+            "PERMISSION_DENIED (code 403): blocked",
+        ):
+            self.assertTrue(ag._is_fatal_account_error(RuntimeError(msg)), msg)
+
+        for transient in (
+            "调用本地 Antigravity LanguageServer (WaitForConversationFullyIdle) 响应超时 (120.0s)",
+            'HTTP 500: {"code":"internal","message":"internal: AgentState for abc"}',
+            "429 RESOURCE_EXHAUSTED",
+        ):
+            self.assertFalse(ag._is_fatal_account_error(RuntimeError(transient)), transient)
+
+        tmp = Path(self._tmp.name)
+        lock_dir = tmp / "locks"
+        sb_root = tmp / "sandboxes"
+        sb_dir = sb_root / "mock_sub_at_example.com"
+        tok_file = sb_dir / ".gemini" / "jetski-standalone-oauth-token"
+        tok_file.parent.mkdir(parents=True, exist_ok=True)
+        tok_file.write_text(json.dumps({"token": {"refresh_token": "tok_v1_0123456789abcd"}}), encoding="utf-8")
+
+        rpc_calls = []
+
+        def _fake_post_rpc(worker_self, method, payload, retry_discovery=True, timeout=None):
+            rpc_calls.append(method)
+            if method == "StartCascade":
+                return {"cascadeId": "cid-1"}
+            if method == "WaitForConversationFullyIdle":
+                raise RuntimeError("PERMISSION_DENIED (code 403): This service has been disabled for violation of Terms of Service.")
+            return {}
+
+        with patch.object(ag, "GLOBAL_LOCK_DIR", lock_dir), \
+             patch.object(ag, "SANDBOX_ROOT_DIR", sb_root), \
+             patch.object(ag, "sync_all_known_accounts_to_sandboxes", return_value={"mock_sub@example.com": sb_dir}), \
+             patch.object(ag.AntigravityClient, "_post_rpc_inner", new=_fake_post_rpc), \
+             patch.object(ag.AntigravityClient, "_wait_for_stagger_slot", return_value=None):
+            pool1 = ag.AntigravityPoolClient(account_pool=["mock_sub@example.com"])
+            with self.assertRaises(RuntimeError):
+                pool1.ask_with_usage("hello", model="antigravity-3.8-flash-high")
+            self.assertEqual(rpc_calls.count("StartCascade"), 1)
+
+            q_file = lock_dir / "ag_quarantine_mock_sub_at_example.com.json"
+            self.assertTrue(q_file.exists())
+
+            # Fresh pool instance (simulating separate process) must reject in 0ms with 0 RPC calls
+            rpc_calls.clear()
+            pool2 = ag.AntigravityPoolClient(account_pool=["mock_sub@example.com"])
+            with self.assertRaises(ag.AntigravityQueueBusyError):
+                pool2.ask_with_usage("hello again", model="antigravity-3.8-flash-high")
+            self.assertEqual(rpc_calls, [])
+
+            # Direct AntigravityClient pre-acquired slot check must not leak semaphore
+            direct = pool2._get_worker("mock_sub@example.com")
+            pre_fd = direct.try_claim_idle_slot()
+            self.assertIsNotNone(pre_fd)
+            with self.assertRaises(ag.AntigravityQueueBusyError):
+                direct.ask_with_usage("direct", _pre_acquired_fd=pre_fd)
+            # All 4 slots must remain acquirable (none leaked)
+            fds = [direct.try_claim_idle_slot() for _ in range(direct._max_concurrency)]
+            self.assertTrue(all(fd is not None for fd in fds))
+            for fd in fds:
+                direct._unlock_fd(fd)
+                import os
+                os.close(fd)
+                direct._concurrency_sem.release()
+
+            # get_pool_status must report quarantined without calling GetUserStatus
+            rows = pool2.get_pool_status()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("已熔断隔离", rows[0]["status"])
+
+            # Replacing refresh_token must auto-clear quarantine
+            tok_file.write_text(json.dumps({"token": {"refresh_token": "tok_v2_newtoken9999"}}), encoding="utf-8")
+            self.assertIsNone(direct.is_quarantined())
+            self.assertFalse(q_file.exists())
+
+    def test_antigravity_stagger_before_send_and_disable_telemetry_flag(self):
+        from app.ai_api import antigravity_client as ag
+
+        tmp = Path(self._tmp.name)
+        lock_dir = tmp / "locks2"
+        sb_root = tmp / "sandboxes2"
+        sb_dir = sb_root / "stagger_at_example.com"
+        sb_dir.mkdir(parents=True, exist_ok=True)
+
+        call_order = []
+
+        def _fake_stagger(client_self):
+            call_order.append("stagger")
+
+        def _fake_post_rpc(client_self, method, payload, retry_discovery=True, timeout=None):
+            call_order.append(method)
+            if method == "StartCascade":
+                return {"cascadeId": "cid-stagger"}
+            if method == "WaitForConversationFullyIdle":
+                return {"timedOut": False}
+            if method == "GetCascadeTrajectory":
+                return {
+                    "trajectory": {
+                        "steps": [
+                            {
+                                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                                "plannerResponse": {"response": "ok"},
+                                "metadata": {"modelUsage": {"inputTokens": 2, "outputTokens": 1}},
+                            }
+                        ]
+                    }
+                }
+            return {}
+
+        with patch.object(ag, "GLOBAL_LOCK_DIR", lock_dir), \
+             patch.object(ag, "SANDBOX_ROOT_DIR", sb_root), \
+             patch.object(ag.AntigravityClient, "_wait_for_stagger_slot", new=_fake_stagger), \
+             patch.object(ag.AntigravityClient, "_post_rpc_inner", new=_fake_post_rpc):
+            client = ag.AntigravityClient(sub_account_email="stagger@example.com")
+            reply, _ = client.ask_with_usage("test order", model="antigravity-3.8-flash-high")
+            self.assertEqual(reply, "ok")
+            self.assertGreater(call_order.index("stagger"), call_order.index("StartCascade"))
+            self.assertLess(call_order.index("stagger"), call_order.index("SendUserCascadeMessage"))
+            self.assertEqual(call_order.index("stagger") + 1, call_order.index("SendUserCascadeMessage"))
+
+        # Verify --disable_telemetry passed when starting language_server.exe
+        fake_ls = tmp / "language_server.exe"
+        fake_ls.write_bytes(b"")
+        spawned_args = []
+
+        class FakeProc:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        def _fake_popen(args, **kwargs):
+            spawned_args.append(list(args))
+            (sb_dir / "language_server_sandbox.log").write_text(
+                "Language server listening on random port at 55555 for HTTP\nAuth succeeded\n",
+                encoding="utf-8",
+            )
+            return FakeProc()
+
+        with patch.object(ag, "DEFAULT_LS_BIN", fake_ls), \
+             patch.object(ag.AntigravityClient, "_detect_ide_version", return_value="2.34.0"), \
+             patch.object(ag.subprocess, "Popen", side_effect=_fake_popen), \
+             patch.object(ag.AntigravityClient, "_verify_and_bind_connection", return_value=(55555, "tok")):
+            client = ag.AntigravityClient(sub_account_email="stagger@example.com")
+            port, _ = client._start_sandbox_or_headless_server(sandbox_dir=sb_dir)
+            self.assertEqual(port, 55555)
+            self.assertEqual(len(spawned_args), 1)
+            self.assertIn("--disable_telemetry", spawned_args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

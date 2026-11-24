@@ -9,7 +9,7 @@
    - `generate_comments_from_post(post_doc, ...)`      : 纯内存解耦核心入口（支持标准 `harvested_social_posts` 结构、轻量自定义字典或纯文本）；
    - `generate_comments_for_x_post(post_url_or_id, ...)`: 传入任意 X 帖子链接或推文 ID，默认通过 `x_xiaohao_browser_session_dir` 实时拉齐完整图文与评论后生成评论；
    - `generate_comments_for_post_key(post_key, ...)`   : 传入库内 `source:post_id`（跨 X / Reddit / HN / Binance / OKX 全平台通用）直接生成评论；
-3. 模型路由严格遵循 `PROJECT_PRINCIPLES.md`：统一走 `model=None` + `preset_model_group="medium"` 模型组负载均衡，绝不硬编码模型名。
+3. 模型路由严格遵循 `CORE_MODULE_RULES.md`：统一走 `model=None` + `preset_model_group="medium"` 模型组负载均衡，绝不硬编码模型名。
 """
 import copy
 import re
@@ -588,7 +588,7 @@ def generate_comments_from_post(
     - `target_language`  : `"auto"`（默认自动跟随原帖语种）或任意目标语种（如 `"en"`, `"zh-CN"`, `"zh-TW"`, `"ja"`, `"es"` 等）；
     - `style_hint`       : 可选的附加语调/人设微调提示（默认留空，完全按原帖语境自然生发）；
     - `candidate_count`  : 生成几条不同切入角度的候选评论（默认读取 `COMMENT_CREATOR_CONFIG["candidate_count"]` = 3）；
-    - `allow_video_posts`: 默认 `False`（遵循 `PROJECT_PRINCIPLES.md` 源头排除含视频帖，防止对未见画面瞎编）。
+    - `allow_video_posts`: 默认 `False`（遵循 `CORE_MODULE_RULES.md` 源头排除含视频帖，防止对未见画面瞎编）。
     """
     logger = get_pipeline_logger()
     cfg = dict(COMMENT_CREATOR_CONFIG)

@@ -7,7 +7,7 @@
 1. 开关平台：修改下方 `PLATFORM_SWITCHES` 字典（`True` 开启 / `False` 关闭）。
 2. 循环模式：默认直接在 IDE 运行本文件即进入「每 1 小时（3600 秒）自动拉取一轮」的常驻循环；
    若某次调试只想单次跑一轮就退出，将 `GLOBAL_SCHEDULE_CONFIG["continuous_loop"]` 改为 `False` 即可。
-3. 职责边界（详见根目录 `PROJECT_PRINCIPLES.md`）：
+3. 职责边界（详见根目录 `CORE_MODULE_RULES.md`）：
    - 免登优先、小号最小特权（严禁触碰主号 `x_myself`）；热门榜单 0 过滤全量拉取，不设时间硬删（默认 `hours_back=0`）与关键词个数截断；
    - 仅允许确定性的损坏死帖剔除与防封号/防限流保护，任何保留或新增的过滤/截断必须在代码处写明 `【保留过滤原因说明】`。
 4. 运维日志：统一输出至控制台与 `logs/harvester_runner.log`，仅打印高信息密度的拉取执行状态、

@@ -897,9 +897,8 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
         if not _is_valid_raw_post(post, require_local_media=False):
             continue
         hot_weight = view_count + like_count * 20 + comment_count * 50
-        # 实证大盘 >=2 图爆款率显著高于单图（30,000 篇大盘 2~3 图 vs 1 图），给予多图原帖温和优先权重
-        img_boost = 1.35 if len((post.get("media") or {}).get("images") or []) >= 2 else 1.0
-        candidates.append((post, hot_weight * img_boost, publish_time))
+        # 生成层与平台分发解耦：按客观互动热度入池，多图加权等平台偏好统一由发布层策略控制
+        candidates.append((post, hot_weight, publish_time))
 
     candidate_ids = [item[0].get("post_id") for item in candidates if item[0].get("post_id") is not None]
     processed_ids = get_remodeled_viral_post_ids(article_manager, POST_SOURCES, candidate_ids)

@@ -1,6 +1,6 @@
 # X 平台实证机制与自动化运营守则 (`X_PLATFORM_OPERATIONS.md`)
 
-本文档沉淀 **2026-11-21 ~ 2026-11-24** 对 X (Twitter) 推荐算法、官方政策、行业大样本研究以及本仓库历史数据与风控取证的交叉核验结论，作为 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md) 的姊妹宪章，指导后续上层业务开发、账号运营与底层自动化维护。
+本文档沉淀 **2026-11-21 ~ 2026-11-24** 对 X (Twitter) 推荐算法、官方政策、行业大样本研究以及本仓库历史数据与风控取证的交叉核验结论，作为 [`AGENTS.md`](AGENTS.md)、[`CORE_MODULE_RULES.md`](CORE_MODULE_RULES.md) 与 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md) 的姊妹宪章，指导后续上层业务开发、账号运营与底层自动化维护。
 
 > [!IMPORTANT]
 > **铁律**：本文只记录有真实依据或高确定性的结论；所有“未经证实的猜想”**严禁写死成业务规则**，已标注为「工程安全余量」的参数属于防封保守护栏，而非 X 官方公布数值。

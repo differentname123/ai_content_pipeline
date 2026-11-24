@@ -3,7 +3,7 @@
 本项目是面向 **Binance 广场、OKX 星球 (Orbit) 与 X (Twitter)** 的自动化内容采集、多模态 AI 筛选创作、总编擂台选稿发布与高质量神评互动系统，支持 Windows / Linux / macOS 跨平台无人值守运行。
 
 > [!IMPORTANT]
-> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守 [`PROJECT_PRINCIPLES.md`](PROJECT_PRINCIPLES.md) 与 [`AGENTS.md`](AGENTS.md) 中的核心安全与架构红线（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。涉及币安广场运营调整请查阅 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md)；**涉及 X (Twitter) 内容运营、算法机制、风控红线与自动化执行规范，请务必先阅读实证守则 [`X_PLATFORM_OPERATIONS.md`](X_PLATFORM_OPERATIONS.md)**。
+> **开发与运维必读**：修改任何代码、配置或提示词前，必须先阅读并严格遵守全局抽象最高准则 [`AGENTS.md`](AGENTS.md) 与仓库级具体模块硬红线 [`CORE_MODULE_RULES.md`](CORE_MODULE_RULES.md)（免登优先、`x_myself` 主号采集物理隔离、`model=None` + `preset_model_group` 统一模型路由、`platforms/` 过滤注解完整等）。涉及币安广场运营调整请查阅 [`BINANCE_SQUARE_OPERATIONS.md`](BINANCE_SQUARE_OPERATIONS.md)；**涉及 X (Twitter) 内容运营、算法机制、风控红线与自动化执行规范，请务必先阅读实证守则 [`X_PLATFORM_OPERATIONS.md`](X_PLATFORM_OPERATIONS.md)**。
 
 ---
 
@@ -13,8 +13,8 @@
 
 ```text
 ai_content_pipeline/
-├── PROJECT_PRINCIPLES.md             # 设计理念与维护红线
-├── AGENTS.md                         # AI 协作者核心红线守则
+├── AGENTS.md                         # 项目开发最高准则（全局通用抽象原则与专项文档索引）
+├── CORE_MODULE_RULES.md              # 采集层、账号安全与公共底座具体模块红线
 ├── BINANCE_SQUARE_OPERATIONS.md      # 币安广场实证流量诊断与运营守则
 ├── X_PLATFORM_OPERATIONS.md          # X 平台实证机制、正负规则与自动化执行守则
 ├── requirements.txt                  # 运行时精准依赖清单

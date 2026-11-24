@@ -18,6 +18,7 @@ from parser.article_generator import (
     check_viral_article_info,
     execute_article_task,
     execute_viral_article_task,
+    extract_valid_viral_posts,
     generate_analysis_articles,
     generate_viral_articles,
     transform_mlus,
@@ -32,6 +33,7 @@ from parser.platform_adapters import (
     has_rival_exchange_ui,
     has_rival_keyword,
     normalize_exchange_ui,
+    score_platform_candidate_form,
     sync_published_metrics,
 )
 from parser.post_ingestion import (
@@ -910,8 +912,67 @@ class TestPublisherArena(unittest.TestCase):
                     {"post_id": "p_short", "publish_time": now - 3600, "engagement": {"view_count": 5000}},
                     {"post_id": "p_multi", "publish_time": now - 22 * 3600, "engagement": {"view_count": 5000}},
                 ]
-                cands, _, _ = _collect_publish_candidates(mock_mgr, "binance", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
-            self.assertEqual([c[0]["article_id"] for c in cands], ["v_multi2", "v_short1"])
+                cands_bn, _, _ = _collect_publish_candidates(mock_mgr, "binance", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
+                cands_okx, _, _ = _collect_publish_candidates(mock_mgr, "okx", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
+            self.assertEqual([c[0]["article_id"] for c in cands_bn], ["v_multi2", "v_short1"])
+            # OKX keeps neutral 0.0 platform bias -> raw viral_score 9.2 stays ahead of 8.5 (decoupled from Binance)
+            self.assertEqual([c[0]["article_id"] for c in cands_okx], ["v_short1", "v_multi2"])
+
+            # Verify exact Binance vs OKX form scoring curve across lengths & image counts
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 2, 40), 1.0)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 2, 200), 1.0)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 1, 35), 0.0)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 1, 75), -0.5)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 1, 160), 0.0)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 1, 280), -0.5)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_VIRAL, 2, 280), 0.5)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_ANALYSIS, 2, 180), 1.1)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_ANALYSIS, 2, 100), 0.8)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_ANALYSIS, 1, 180), 0.3)
+            self.assertAlmostEqual(score_platform_candidate_form("binance", ARTICLE_TYPE_ANALYSIS, 1, 280), -0.5)
+            self.assertAlmostEqual(score_platform_candidate_form("okx", ARTICLE_TYPE_VIRAL, 2, 40), 0.0)
+            self.assertAlmostEqual(score_platform_candidate_form("okx", ARTICLE_TYPE_VIRAL, 1, 75), 0.0)
+            self.assertAlmostEqual(score_platform_candidate_form("okx", ARTICLE_TYPE_ANALYSIS, 2, 180), 0.0)
+
+    def test_generation_viral_selection_is_platform_agnostic_and_preserves_short_gems(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = _create_tiny_png(Path(tmp), "g1.png")
+            img2 = _create_tiny_png(Path(tmp), "g2.png")
+            now = time.time()
+            # Higher-engagement 1-image short gem MUST beat lower-engagement 2-image post in generation selection (no 1.35x Binance img_boost)
+            p_short_1img = {
+                "source": "binance",
+                "post_id": "gen_short_top",
+                "publish_time": now - 600,
+                "author": {"username": "trader_a"},
+                "viral_screen": {"prompt_version": prompt_version, "keep": True, "event_key": ""},
+                "engagement": {"view_count": 20000, "like_count": 50, "comment_count": 20},
+                "content": {"text_content": "一句封神短梗\n[插图: https://x/1.png]"},
+                "media": {"images": ["https://x/1.png"], "local_mapping": {"https://x/1.png": img1}},
+            }
+            p_multi_2img = {
+                "source": "binance",
+                "post_id": "gen_multi_mid",
+                "publish_time": now - 300,
+                "author": {"username": "trader_b"},
+                "viral_screen": {"prompt_version": prompt_version, "keep": True, "event_key": ""},
+                "engagement": {"view_count": 17000, "like_count": 40, "comment_count": 15},
+                "content": {"text_content": "两图故事\n[插图: https://x/1.png][插图: https://x/2.png]"},
+                "media": {
+                    "images": ["https://x/1.png", "https://x/2.png"],
+                    "local_mapping": {"https://x/1.png": img1, "https://x/2.png": img2},
+                },
+            }
+            mock_art_mgr = MagicMock()
+            mock_art_mgr.find_articles.return_value = []
+            with patch("parser.article_generator.UniversalPostManager") as mock_upm, \
+                 patch("parser.article_generator.gen_db_object"), \
+                 patch("parser.article_generator._get_all_self_published_post_ids", return_value=set()):
+                mock_upm.return_value.find_posts_by_source.side_effect = (
+                    lambda src, **kw: [p_multi_2img, p_short_1img] if src == "binance" else []
+                )
+                selected = extract_valid_viral_posts(mock_art_mgr)
+            self.assertEqual([p["post_id"] for p in selected], ["gen_short_top", "gen_multi_mid"])
 
     def test_chief_editor_strips_scores_and_never_rewrites_draft(self):
         with tempfile.TemporaryDirectory() as tmp:

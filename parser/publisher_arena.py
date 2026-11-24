@@ -45,6 +45,7 @@ from parser.platform_adapters import (
     has_rival_keyword,
     logger,
     normalize_exchange_ui,
+    score_platform_candidate_form,
     sync_published_metrics,
 )
 from parser.post_ingestion import (
@@ -358,11 +359,10 @@ def _collect_publish_candidates(
             likes = int(eng.get("like_count", 0) or 0)
             comments = int(eng.get("comment_count", 0) or 0)
             hot_energy = views + likes * 30 + comments * 80
-            # 【保留过滤/加权原因说明】实证检验已证伪 >18h 延迟低流量假设，故移除高延迟惩罚；
-            # 按大盘 30,000 篇与自有健康帖统计规律：>=2 图且避开单图 <100 字死亡谷予以明显加权。
+            # 【保留过滤/加权原因说明】发布层按目标平台分布规律打分（生成层保持中立，仅此处叠加平台形态加减权）
             img_cnt = len(info.get(rule["images"]) or [])
             clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
-            form_bonus = 1.0 if img_cnt >= 2 else (-1.0 if clean_len < 100 else 0.0)
+            form_bonus = score_platform_candidate_form(platform, ARTICLE_TYPE_VIRAL, img_cnt, clean_len)
             return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + form_bonus
 
         candidates.sort(key=_viral_rank_key, reverse=True)
@@ -373,8 +373,8 @@ def _collect_publish_candidates(
             score = float(info.get(rule["score"], 0.0))
             img_cnt = len(info.get(rule["images"]) or [])
             clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
-            # 【保留过滤/加权原因说明】实证表明 2~3 张图 + >=140 字实质叙事显著提高分析帖曝光中位数与均评
-            form_bonus = 0.8 if (img_cnt >= 2 and clean_len >= 140) else 0.0
+            # 【保留过滤/加权原因说明】由平台适配器按目标平台决定形态与篇幅偏置
+            form_bonus = score_platform_candidate_form(platform, ARTICLE_TYPE_ANALYSIS, img_cnt, clean_len)
             return score + form_bonus
 
         candidates.sort(key=_analysis_rank_key, reverse=True)
