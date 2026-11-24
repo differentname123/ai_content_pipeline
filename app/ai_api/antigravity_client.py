@@ -1,21 +1,125 @@
 # -*- coding: utf-8 -*-
 """
-Antigravity Official Local Client (Multi-Account Sandbox Pool + High Concurrency + Native Cascade)
-==================================================================================================
+Antigravity Official Local Client (Multi-Account Sandbox Pool + Native Cascade)
+===============================================================================
 
-原理说明（为什么绝对安全、高并发、且大号小号 100% 物理隔离）：
-1. 本模块【绝不伪造】任何发往 Google 的请求头或 TLS 指纹，100% 由官方原版 `language_server.exe` 发起通信。
-2. 支持【多小号沙箱账号池（SUB_ACCOUNT_POOL）】：
-   - 池子中的每个小号都会在 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\` 下启动各自物理隔离的
-     官方 `language_server.exe` 进程（独立进程、独立端口、独立登录态文件、独立设备 UUID）；
-   - 桌面端大号（`EXCLUDED_MAIN_ACCOUNTS`）被严格排除在账号池之外，100% 绝不触碰大号；
-   - 每个小号独立享有 `max_concurrency_per_account=4` 的跨进程并发锁与独立错峰锁（单个小号支持最高 4 并发）；
-   - 调用方只需指定模型名（如 `antigravity-3.8-flash-high` 或 `antigravity-argon-high`），内部路由器会自动
-     识别哪些小号拥有该模型的调用权限与剩余额度，并从当前空闲槽位的小号中【随机选择】一个执行；
-   - 每次调用（无论成功或异常重试）均会返回并记录实际使用的小号邮箱与沙箱端口，方便溯源与成功率复盘。
-3. 所有请求（无论纯文本还是多模态图片）100% 严格向桌面客户端原生使用方式看齐：
-   统一走 `StartCascade` -> `SendUserCascadeMessage` -> `WaitForConversationFullyIdle` -> `GetCascadeTrajectory`，
-   并在 `finally` 中立即调用 `DeleteCascadeTrajectory` + `JetboxDeleteSummary` 自动无痕销毁会话。
+⚠️【当前状态（2026-11-25）：已停用权重，保留底座代码与全套实证复盘】
+本模块两侧调用方（`ai_content_pipeline/app/ai_api/model_api.py` 与
+`easy_shop_web/mobile_web/infrastructure/ai_api/model_api.py`）已于 2026-11-25 注释关闭全部
+`antigravity-*` 模型权重，暂停向 Google 消费级订阅账号分发业务流量。
+
+以下为 2026-11-22 ~ 11-25 连续线上实跑、全量账号核验与官方沙箱日志深挖的**一线血泪实证结论**。
+后续任何人若想优化、重启或重用本方案，**动手前务必先通读本节与代码内标注，严禁推倒已验证有效能力或重踩已证伪误区**。
+
+--------------------------------------------------------------------------------
+一、架构边界：官方 `language_server.exe` 能解决什么，不能解决什么
+--------------------------------------------------------------------------------
+1. 已解决（物理隔离与本地客户端指纹）：
+   - 100% 由官方原版 `language_server.exe` 直连 Google，绝不自建 TLS/HTTP 指纹；
+   - 每个小号独享 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<email>\\`（独立进程、端口、
+     `USERPROFILE`/`HOME`/`APPDATA`/`LOCALAPPDATA`、`installation_id`）；
+   - `EXCLUDED_MAIN_ACCOUNTS` + `GetUserStatus` 云端实名校验确保桌面端大号 100% 物理隔离。
+2. 不能解决（服务端行为风控与消费级订阅 ToS 限制）：
+   - Google AI Pro（包月消费级订阅）服务条款禁止无头自动化批处理/API 代理；
+   - Google 云端风控（`v1internal` 侧已见 `SafetySignals.SybillVerdicts` 等账号级判定）
+     不依赖客户端 Telemetry 上报即可直接观测到：单号并发/Token 速率、会话结构（空工作区
+     vs 真实代码仓库）、单轮对话即删、Prompt 业务形态（100% 长篇非编程 JSON 抽取）、
+     以及 OAuth Scope 不足引起的海量 403 报错。
+
+--------------------------------------------------------------------------------
+二、两次真实 `403 TOS_VIOLATION` 封号对照实证（均发生在消费级 Pro 账号）
+--------------------------------------------------------------------------------
+1. 样本 A — `just4mike@usa.com`（存活约 38 小时，累计成功 1,636 次 / 39,879,697 Tokens）：
+   - [低负载稳态期] `2026-11-22 16:03 ~ 11-23 20:59`（>30h）：约 14~67 次/小时（多数
+     20~45 次/小时），全程稳定无封号；
+   - [4 并发跃升期] `11-24 00:00` 拉高到单号 4 并发后，飙升至 85 -> 93 -> 136 -> 144(峰值，
+     3,658,366 Tokens/h) -> 114 -> 101 次/小时；约 6 小时后于 `2026-11-24 06:11:49`
+     被判 `PERMISSION_DENIED (code 403): TOS_VIOLATION`（最后成功时间 06:11:34）；
+   - 当时伴随混杂因素：启动未带 `--disable_telemetry`、错峰锁放在 `StartCascade` 前、
+     且同机 `antigravity-tools.exe` 存在 `/internal/warmup` 记录。
+
+2. 样本 B — `lourdesvega5@yahoo.com`（纯净对照实验：仅存活 3 小时 11 分钟，302 次 / 8,011,227 Tokens）：
+   - [实验控制变量] 运行时已携带 `--disable_telemetry`、错峰锁已移至 `SendUserCascadeMessage`
+     正前方、且 14:00~17:12 期间 `antigravity-tools.exe` 对该号发出的 `/internal/warmup` = **0 次**；
+   - [负载强度] `14:01:46` 启动即按 4 并发满载跑：14h 108 次(288 万 tok) -> 15h 103 次
+     (273 万 tok) -> 16h 86 次(227 万 tok) -> 17h 5 次；于 `2026-11-24 17:12:53.226` 被封
+     (`403 TOS_VIOLATION`)。
+   - [与同机健康官方桌面端 `language_server.log` 的关键硬指标对照]：
+     a) **删会话狂撞 320 次 403 Scope 不足（重大隐形硬伤）**：
+        `finally` 中每次调用 `DeleteCascadeTrajectory` 都会触发 `rap.go:1389 [voice-rap]`
+        向远端请求删除并报错 `PERMISSION_DENIED (code 403): Request had insufficient
+        authentication scopes`（3 小时 320 次，约每 35 秒撞 1 次 403；健康桌面端为 0 次）；
+     b) **第三方导入凭证缺 `auth/aicode` Scope**：
+        `lourdesvega5` 凭证来自 `~/.antigravity_tools/accounts/*.json`，缺少官方客户端
+        `https://www.googleapis.com/auth/aicode` Scope，启动即报 `aicode_scope.go:88` 告警
+        且每小时 `AICode FetchConfig` 撞 `403 ACCESS_TOKEN_SCOPE_INSUFFICIENT`（共 8 次）；
+     c) **标题生成导致上游流数量翻 2 倍 + 100% 一次性空会话**：
+        323 个 `StartCascade` 实际发出 `644` 次 `v1internal:streamGenerateContent?alt=sse`
+        （`conversation_title.go` 并发生 1 次标题生成，5 秒峰值连发 8 条 SSE 流）。对比健康桌面端
+        约 1.7h 仅建 4 个会话、平均每会话 4.25 轮提问 / 96 次含工具调用模型流；小号沙箱是
+        323 个空工作区会话、平均每会话严格 1.00 轮；
+     d) **高速删会话引发内部竞态**：
+        伴随 152 次 `pubsub: Publish after Close`、38 次 `snapshot` 调度失败、19 次
+        `stream reading error: context canceled`；
+     e) **历史污点与同机后台刷新**：
+        `lourdesvega5` 当日凌晨 04:07 在 `proxy_logs.db` 已有连续 9 次 `/internal/warmup -> 403`
+        历史案底（12:48 又预热 9 次），且跑数期间 `.antigravity_tools` 仍每 15 分钟自动刷新该号；
+        同机同出口 IP 下当时已有多个号因 `TOS_VIOLATION` 被封。
+
+3. 2026-11-24 全量小号核验快照（桌面大号 `zhuxiaohu98@gmail.com` 全程严格未触碰）：
+   - 已确认封禁/失效并落盘 24h 跨进程隔离（8 个）：`just4mike@usa.com`、`lourdesvega5@yahoo.com`、
+     `hangocbich966@gmail.com`、`kate.bergeron@usa.com`、`proxgemini096@gmail.com`（以上 5 个
+     `TOS_VIOLATION`）；`peaceinourtime@usa.com`（`VALIDATION_REQUIRED`）；`hafizhaziq1501@gmail.com`、
+     `richard.nowak@usa.com`（无有效订阅/许可证）；
+   - `.antigravity_tools` 中已标记 `disabled=True`（1 个）：`paschelsvetz946@gmail.com`（`invalid_grant`）；
+   - 当日实测仍在线（3 个，**严禁在未完成下方 P0 改造前直接放开跑当前批处理**）：
+     `guardianriedel689@gmail.com`、`hsuehpylant255@gmail.com`、`simmondszaleski@gmail.com`
+     （注：后两者与 `lourdesvega5` 同为从第三方工具导入的 127 位长 `refresh_token`，存在同款 Scope 隐患）。
+
+--------------------------------------------------------------------------------
+三、已完成加固清单（站在前人基础上：以下能力已落地并经单测/线上验证，请勿回退或重造）
+--------------------------------------------------------------------------------
+- [x] **跨进程致命 403 熔断器（`ag_quarantine_<account>.json`，已实战验证）**：
+      `_is_fatal_account_error` 识别 `TOS_VIOLATION`/`VALIDATION_REQUIRED`/`#3501`/`invalid_grant`/
+      `403 PERMISSION_DENIED` 后原子写盘隔离 24h（更换 `refresh_token` 自动清锁）。`lourdesvega5`
+      17:12:53 被封后，跨所有工作进程 8 小时内全部 0ms 跳过切备用模型、0 次再撞 Google。
+- [x] **零延迟队列满载快切**：队列繁忙/熔断统一抛出 `AntigravityQueueBusyError`，上层 `model_api`
+      不触发同模型重试，0ms 切走备用付费/Web 模型。
+- [x] **错峰锁紧贴真实发包点**：`_wait_for_stagger_slot()` 已置于 `SendUserCascadeMessage` 正前方
+      （修复了早期在 `StartCascade` 前错峰导致多请求穿透并撞车的漏洞）。
+- [x] **静默启动与遥测关闭**：`_start_sandbox_or_headless_server` 已传 `--disable_telemetry`、使用
+      `CREATE_NO_WINDOW + SW_HIDE` 防闪框、启动失败自动 `proc.kill()` 防僵尸进程，并及时关闭日志文件句柄。
+- [x] **跨进程 OS 文件锁与零僵尸**：`ag_slot_*`（并发槽位）、`ag_pacing_*`（错峰状态）、`ag_discovery_*`
+      （发现互斥）均为内核级文件锁，异常退出自动释放。
+
+--------------------------------------------------------------------------------
+四、已被证伪的误区（后续优化请勿再走以下弯路）
+--------------------------------------------------------------------------------
+- ❌ **误区 1**：“只用官方 `language_server.exe` 保证 TLS 指纹一致就不会封号” -> 已证伪。
+- ❌ **误区 2**：“加上 `--disable_telemetry` + 修错峰锁 + 避开 warmup 就能保住单号 4 并发满载” -> 已证伪
+  （`lourdesvega5` 在 0 次 warmup + 开 `--disable_telemetry` 下 3h11m 依然被封）。
+- ❌ **误区 3**：“从 `~/.antigravity_tools/accounts/*.json` 导入的 Token 与官方登录凭证完全等价” -> 已证伪
+  （缺失 `auth/aicode` Scope，会持续产生 `FetchConfig 403` 告警）。
+- ❌ **误区 4**：“每轮 `finally` 调用 `DeleteCascadeTrajectory` 无痕清会话更安全” -> 实测适得其反！
+  每次都会触发 `[voice-rap] 403 insufficient authentication scopes` 与大量后台竞态异常。
+
+--------------------------------------------------------------------------------
+五、后续若想重启实验或继续优化，必须先完成的前置改造（按优先级 P0）
+--------------------------------------------------------------------------------
+1. **[P0] 彻底去掉或重构 `DeleteCascadeTrajectory` 清理**：
+   验证为何触发 `[voice-rap] 403`；停用每轮立即删会话的强迫行为（改用有限会话复用或确认无远端
+   403 后再清理），同时避免与后台标题/状态快照线程竞争导致 `Publish after Close`。
+2. **[P0] 抛弃第三方残缺 Token，改用官方客户端完整登录归档**：
+   新号必须通过官方客户端登录并调用 `archive_current_desktop_account()` 写入完整 OAuth 凭证，
+   验证沙箱日志中 `aicode_scope.go` 与 `FetchConfig 403` 全部清零；同时确保未在其他反代工具中
+   被 warmup/403 污染，且在任何其他工具中彻底关闭该号的 `auto_refresh`。
+3. **[P0] 降低并发与加硬频控（放弃做 24x7 主力批处理）**：
+   `DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT` 退回 `1`（勿用 `4`），按真实上游流（注意 `StartCascade`
+   的标题生成会带来 2 倍 `streamGenerateContent`）加上跨进程每小时调用次数上限（参考 `just4mike`
+   在 20~45 次/h 低负载期可稳定运行 >30h，拉高到 85~144 次/h 后 6h 内被封的规律）。
+4. **[P0] 先拿单个干净号灰度观察 24~72 小时**：
+   绝不能直接把仅剩的 3 个健康号一起接入测试；先单号低权重验证沙箱日志“0 条 403 / 0 条 Scope 缺失
+   告警”且连续存活数天后再评估。
 """
 
 from __future__ import annotations
@@ -55,15 +159,18 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 
 # ==============================================================================
 # 【核心配置 2】小号沙箱白名单账号池（SUB_ACCOUNT_POOL）
-# - 严格采用白名单策略：仅使用下列显式配置的可用小号，不做自动探测扫描；
-# - 每个小号独立限制并发=4（单个小号支持最高 4 并发）。
+# - ⚠️ 实证警告（2026-11-24）：单号并发=4 已先后导致 just4mike（11-24 06:11）与
+#   lourdesvega5（11-24 17:12，开启 --disable_telemetry + 0 warmup 仅活 3h11m）吃 403 TOS 封禁！
+# - 其余 10 个账号核验结论：5 个 TOS_VIOLATION / 1 个 VALIDATION_REQUIRED / 2 个无有效许可证
+#   / 1 个 invalid_grant（paschelsvetz946）；仅剩 guardianriedel689、hsuehpylant255、
+#   simmondszaleski 尚在线（后两者同样来自第三方 127 位 token），重启用前必先将并发降回 1 并修复 P0！
 # ==============================================================================
 DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 4
 
 SUB_ACCOUNT_POOL: List[str] = [
-    "lourdesvega5@yahoo.com",       # Google AI Pro   (支持: 3.8-Flash)
-    # "just4mike@usa.com",          # Google AI Pro   (已封禁)
-    # "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
+    "lourdesvega5@yahoo.com",       # Google AI Pro   (2026-11-24 17:12:53 已封 TOS_VIOLATION，保留作状态占位)
+    # "just4mike@usa.com",          # Google AI Pro   (2026-11-24 06:11:49 已封 TOS_VIOLATION)
+    # "richard.nowak@usa.com",      # 已失效          (无有效许可证/订阅)
 ]
 
 # 若设为 None（默认），则启用上面的 SUB_ACCOUNT_POOL 多小号随机池；
@@ -319,6 +426,12 @@ def sync_all_known_accounts_to_sandboxes(overwrite_from_desktop: bool = False) -
                 pass
 
     # 3. 扫描 ~/.antigravity_tools/accounts/*.json
+    # ⚠️【实证坑点（2026-11-24）】：经日志对比确认，从第三方工具导入的 refresh_token + 下面拼装的
+    # 轻量 id_token（_build_minimal_id_token）缺少官方客户端所需的 OAuth Scope（如
+    # https://www.googleapis.com/auth/aicode）。沙箱启动 1 分钟内就会出现 aicode_scope.go:88
+    # 告警，并每小时产生 AICode FetchConfig 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT（同机官方桌面端
+    # 为 0 次）。若后续重启，强烈建议改用官方桌面客户端登录并调用 archive_current_desktop_account()
+    # 归档完整凭据，并停用 ~/.antigravity_tools 对测试号的后台 15 分钟自动刷新（auto_refresh）。
     if ANTIGRAVITY_TOOLS_ACCOUNTS_DIR.exists():
         for acc_file in ANTIGRAVITY_TOOLS_ACCOUNTS_DIR.glob("*.json"):
             try:
@@ -370,7 +483,7 @@ def archive_current_desktop_account() -> Optional[str]:
 class AntigravityClient:
     """
     基于官方本地 language_server.exe 的单账号沙箱客户端（或被 AntigravityPoolClient 调度的工作节点）。
-    - 每个小号拥有独立的 `language_server.exe` 沙箱进程、独立的跨进程并发锁（默认单号并发=2）与独立的错峰锁；
+    - 每个小号拥有独立的 `language_server.exe` 沙箱进程、独立的跨进程并发锁（上限由 `DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT` 控制，当前=4；⚠️ 重启用实测强烈建议先降为 1）与独立的错峰锁；
     - 连接建立时强制通过 `GetUserStatus` 校验云端返回的真实邮箱（`userStatus.email`），并自动缓存该账号支持的模型列表。
     """
 
@@ -605,7 +718,7 @@ class AntigravityClient:
     def try_claim_idle_slot(self) -> Optional[int]:
         """
         供多账号池调度器调用：非阻塞尝试抢占当前小号的一个空闲并发槽位。
-        若当前小号未满载（并发 < 2），立即返回锁文件 fd；若已满载，立即返回 None。
+        若当前小号未满载（并发 < `self._max_concurrency`），立即返回锁文件 fd；若已满载，立即返回 None。
         """
         if not self._concurrency_sem.acquire(blocking=False):
             return None
@@ -871,6 +984,8 @@ class AntigravityClient:
             args = [
                 str(DEFAULT_LS_BIN),
                 "--standalone",
+                # 【已完成加固】开启 --disable_telemetry 抑制客户端遥测；但 11-24 lourdesvega5
+                # 对照实测已证明：仅靠关闭遥测无法防止服务端行为/高频并发风控（3h11m 仍被封 TOS）。
                 "--disable_telemetry",
                 "--override_ide_name", "antigravity",
                 "--subclient_type", "hub",
@@ -1278,6 +1393,11 @@ class AntigravityClient:
                     if media:
                         send_payload["media"] = media
 
+                    # 【已完成加固】错峰锁必须紧贴在 SendUserCascadeMessage 正前方（不要放在 StartCascade 前），
+                    # 否则多并发长阻塞后会同时冲出发包。
+                    # ⚠️ 实证提醒：每调用 1 次 StartCascade + SendUserCascadeMessage，后台 conversation_title.go
+                    # 会自动并发额外发起 1 次标题生成，导致发往 Google 的 streamGenerateContent 实际流次数翻 2 倍
+                    # （lourdesvega5 沙箱 323 次请求 -> 644 条 SSE 流，5 秒峰值连发 8 条）。后续算频控必须按 2 倍算！
                     self._wait_for_stagger_slot()
                     self._post_rpc_inner(
                         "SendUserCascadeMessage",
@@ -1333,6 +1453,14 @@ class AntigravityClient:
                     }
                     return reply_text, usage_dict
                 finally:
+                    # ⚠️【P0 未修硬伤（2026-11-24 沙箱日志实锤）】后续若重启服务，此处必须最先重构！
+                    # lourdesvega5 3h11m 沙箱日志显示：每次调用后立刻执行 DeleteCascadeTrajectory 引发了：
+                    # 1) 320 次 rap.go:1389 [voice-rap] delete voice trajectories 报错：
+                    #    PERMISSION_DENIED (code 403): Request had insufficient authentication scopes
+                    #    （几乎每轮必撞 Google 远端 403，而同机官方桌面端为 0 次）；
+                    # 2) 152 次 pubsub: Publish after Close、38 次 snapshot 调度失败、19 次 context canceled
+                    #    （删会话与后台 conversation_title.go / agent executor 异步状态快照强抢锁）。
+                    # 本次仅停用权重，保持原调用链不变；下次优化需验证：不每轮远端删除（改有限会话复用或本地清理）。
                     for cleanup_method in ("DeleteCascadeTrajectory", "JetboxDeleteSummary"):
                         try:
                             self._post_rpc_inner(
