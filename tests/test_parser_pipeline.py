@@ -1371,6 +1371,155 @@ class TestLazyMediaDownload(unittest.TestCase):
             ok_over, _ = check_article_info(ana_info, mats, imap, ARTICLE_MAX_CHARS)
             self.assertFalse(ok_over)
 
+    def test_format_image_article_once_interleaves_and_prioritizes_newest(self):
+        from parser.mlu_pipeline import format_image_article_once
+
+        now = time.time()
+        posts = [
+            {
+                "source": "binance",
+                "post_id": "old_pre_1",
+                "publish_time": now - 36000,
+                "content": {"text_content": "旧待初筛帖[插图: https://x/1.png]"},
+                "media": {"images": ["https://x/1.png"]},
+            },
+            {
+                "source": "binance",
+                "post_id": "new_pre_1",
+                "publish_time": now - 60,
+                "content": {"text_content": "最新待初筛帖[插图: https://x/2.png]"},
+                "media": {"images": ["https://x/2.png"]},
+            },
+            {
+                "source": "okx",
+                "post_id": "ready_mlu_1",
+                "publish_time": now - 120,
+                "pre_screen": {"prompt_version": prompt_version, "no_evidence": False, "reason": "ok"},
+                "content": {"text_content": "已过初筛待精提帖[插图: https://x/3.png]"},
+                "media": {"images": ["https://x/3.png"]},
+            },
+        ]
+        mock_pm = MagicMock()
+        mock_pm.find_posts_by_source.side_effect = (
+            lambda src, **kw: [p for p in posts if p["source"] == src]
+        )
+        screened_order = []
+        formatted_ids = []
+
+        def _fake_batch(batch_posts, pm, max_pending=0):
+            from parser.mlu_pipeline import _sort_posts_newest_first, is_need_pre_screening
+            pending = _sort_posts_newest_first([p for p in batch_posts if is_need_pre_screening(p)])
+            screened_order.extend([p["post_id"] for p in pending[:max_pending]])
+            return len(pending), len(pending[:max_pending]), 0, 0
+
+        with patch("parser.mlu_pipeline.PRE_SCREEN_MAX_PER_ROUND", 1), \
+             patch("parser.mlu_pipeline.batch_pre_screen_posts", side_effect=_fake_batch), \
+             patch("parser.mlu_pipeline.process_and_save_single_post", side_effect=lambda p, pm: formatted_ids.append(p["post_id"])):
+            pre_pending, pre_pass, _, fmt_cnt, delay = format_image_article_once(post_manager=mock_pm)
+
+        # Newest pending post processed first even under pre_screen bound, AND downstream logic_mul extraction is NOT starved!
+        self.assertEqual(screened_order, ["new_pre_1"])
+        self.assertEqual(formatted_ids, ["ready_mlu_1"])
+        self.assertEqual((pre_pending, pre_pass, fmt_cnt), (2, 1, 1))
+        self.assertEqual(delay, 5)
+
+    def test_viral_zero_images_and_citation_leaks_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = _create_tiny_png(Path(tmp), "v_leak.png")
+            base_viral = {
+                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "图", "exchange_ui": "", "keep": False}],
+                "selected_images": [],
+                "global_truth": "全废图",
+                "feasibility_audit": "no",
+                "usable": True,
+                "topic_tag": "搞钱与盈亏",
+                "expression_strategy": "无",
+                "post_text": "缺少配图却放行",
+                "bait_comments": ["笑死"],
+                "viral_score": 7.5,
+            }
+            ok_zero, err_zero = check_viral_article_info(base_viral, ["[IMAGE_1]"], ARTICLE_MAX_CHARS)
+            self.assertFalse(ok_zero)
+            self.assertIn("至少需要保留 1 张有效图片", err_zero)
+
+            cite_viral = {
+                **base_viral,
+                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "新闻截图", "exchange_ui": "", "keep": True}],
+                "selected_images": ["[IMAGE_1]"],
+                "post_text": "美国司法部申请没收超 11 亿美元 USDC[cite: 1]。",
+            }
+            ok_cite, err_cite = check_viral_article_info(cite_viral, ["[IMAGE_1]"], ARTICLE_MAX_CHARS)
+            self.assertFalse(ok_cite)
+            self.assertIn("引用标注", err_cite)
+
+            mats = [{"id": "M1", "fact": "数据", "visual_evidence": {"placeholder": "[ASSET_IMG_1]", "what_it_shows": "K线"}}]
+            imap = {"[ASSET_IMG_1]": {"local_path": img1}}
+            ana_cite = {
+                "status": "ok",
+                "text": "ETF 资金继续流出[cite: 2]，守住前低观察。",
+                "god_comments": ["继续观察"],
+                "image_placeholders": ["[ASSET_IMG_1]"],
+                "used_material_ids": ["M1"],
+                "score": 8.0,
+                "reason": None,
+            }
+            ok_ana_cite, _ = check_article_info(ana_cite, mats, imap, ARTICLE_MAX_CHARS)
+            self.assertFalse(ok_ana_cite)
+
+    def test_analysis_format_avoids_duplicate_headline_coin_prefix(self):
+        # Inline coin occurrence later in sentence must NOT prepend a second "$NEAR " at start
+        near_art = {
+            "topic": "NEAR",
+            "article_info": {
+                "text": "大盘弱势里 NEAR 还在往 3.26 美元附近爬。",
+                "image_placeholders": [],
+                "image_mapping": {},
+            },
+        }
+        okx_near, _ = _format_analysis_post_content(near_art, platform="okx")
+        self.assertTrue(okx_near.startswith("大盘弱势里 $NEAR "), okx_near)
+        self.assertNotIn("$NEAR 大盘弱势里 $NEAR", okx_near)
+
+        # Article that omits coin symbol completely STILL gets "$SOL " prefix cleanly
+        no_coin_art = {
+            "topic": "SOL",
+            "article_info": {
+                "text": "现货主动买盘转强，守住 67.3 美元台阶。",
+                "image_placeholders": [],
+                "image_mapping": {},
+            },
+        }
+        bn_sol, _ = _format_analysis_post_content(no_coin_art, platform="binance")
+        self.assertTrue(bn_sol.startswith("$SOL 现货主动买盘转强"), bn_sol)
+
+    def test_extract_valid_viral_posts_caps_repeated_same_author(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = _create_tiny_png(Path(tmp), "auth1.png")
+            now = time.time()
+            spam_posts = [
+                {
+                    "source": "okx",
+                    "post_id": f"spam_{i}",
+                    "publish_time": now - i * 60,
+                    "author": {"author_id": "spammer_1"},
+                    "viral_screen": {"prompt_version": prompt_version, "keep": True, "event_key": f"ek_{i}"},
+                    "engagement": {"view_count": 20000 - i * 100, "like_count": 10, "comment_count": 5},
+                    "content": {"text_content": f"同作者连发第{i}条[插图: https://x/a{i}.png]"},
+                    "media": {"images": [f"https://x/a{i}.png"], "local_mapping": {f"https://x/a{i}.png": img1}},
+                }
+                for i in range(4)
+            ]
+            mock_art_mgr = MagicMock()
+            mock_art_mgr.find_articles.return_value = []
+            with patch("parser.article_generator.UniversalPostManager") as mock_upm, \
+                 patch("parser.article_generator.gen_db_object"), \
+                 patch("parser.article_generator._get_all_self_published_post_ids", return_value=set()):
+                mock_upm.return_value.find_posts_by_source.side_effect = (
+                    lambda src, **kw: spam_posts if src == "okx" else []
+                )
+                selected = extract_valid_viral_posts(mock_art_mgr)
+            self.assertEqual([p["post_id"] for p in selected], ["spam_0", "spam_1"])
+
 
 class TestPromptAbstractionHygiene(unittest.TestCase):
     def test_prompts_are_abstract_and_free_of_legacy_case_anchors(self):

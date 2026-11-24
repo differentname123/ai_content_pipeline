@@ -474,11 +474,15 @@ def _format_analysis_post_content(article: Dict[str, Any], platform: str = PLATF
             text,
             flags=re.IGNORECASE,
         )
+    body_has_topic_tag = bool(
+        has_coin_topic
+        and re.search(rf"(?<![A-Za-z0-9])\${re.escape(topic)}(?![A-Za-z0-9])", text, re.IGNORECASE)
+    )
     adapter = PLATFORMS[PLATFORM_BINANCE if platform == PLATFORM_BINANCE else PLATFORM_OKX]
     text = adapter.decorate_analysis(text, topic)
     if platform == PLATFORM_BINANCE:
         text += "\n\n👇"
-    if has_coin_topic and not text.upper().startswith(f"${topic}".upper()):
+    if has_coin_topic and not body_has_topic_tag:
         text = f"${topic} {text}"
     mapping = info.get("image_mapping") or {}
     paths = [

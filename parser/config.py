@@ -21,7 +21,7 @@ from common.common_utils import (
 # ==============================================================================
 # 1. 提示词版本与模板配置
 # ==============================================================================
-prompt_version = "1125-1"
+prompt_version = "1125-2"
 SELECTION_PROMPT_VERSION = "20261125-v9_platform_scorer_decoupled"
 
 PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
@@ -82,6 +82,9 @@ MAX_CONCURRENCY = 20
 LLM_MAX_RETRIES = 3
 PRE_SCREEN_BATCH_SIZE = 50
 PRE_SCREEN_CONCURRENCY = 5
+# 单轮交替流控上限：防止版本切换初期全量历史积压在初筛阶段阻塞下游最新原帖的论据精提与分析生成
+PRE_SCREEN_MAX_PER_ROUND = 1000
+MLU_FORMAT_MAX_PER_ROUND = 100
 
 VIRAL_STAGE1_BATCH_SIZE = 50
 VIRAL_POST_MAX_AGE_HOURS = 24

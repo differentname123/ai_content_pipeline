@@ -502,15 +502,15 @@ def _select_and_polish_best_candidate(
         article_manager,
         platform,
         target_accounts=target_accs,
-        limit=25,
+        limit=35,
         article_type=article_type,
     )
     # 仅保留极简一行防重摘要（过滤浏览量/账号均值噪声，防止小号或未成熟数据误导选品）
     recent_topics = [
-        f"{item.get('topic') or '热帖'} | {str(item.get('content') or '').strip()[:45]}"
+        f"{item.get('topic') or '热帖'} | {' '.join(str(item.get('content') or '').split())[:100]}"
         for item in historical_performance
         if str(item.get("content") or "").strip()
-    ][:25]
+    ][:35]
 
     arena_items = []
     for rank_no, idx in enumerate(valid_indices, 1):

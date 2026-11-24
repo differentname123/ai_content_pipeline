@@ -12,6 +12,7 @@
 """
 import json
 import random
+import re
 import threading
 import time
 from collections import Counter, defaultdict, deque
@@ -66,6 +67,25 @@ from parser.post_ingestion import (
     normalize_post_media,
     prompt_version,
 )
+
+# 统一拦截生成文本中泄漏的图片/视频占位符或搜索引用标注（例如 [cite: 1]）
+_LEAKED_ARTIFACT_RE = re.compile(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]|\[\s*cite\s*:[^\]]*\]", re.IGNORECASE)
+
+
+def _extract_author_key(post: Dict[str, Any]) -> str:
+    """提取标准化原帖作者键（无有效标识返回空串，避免缺失元信息时误拦）。"""
+    author = post.get("author") or {}
+    source = str(post.get("source") or "").strip().lower()
+    raw = str(
+        post.get("author_id")
+        or author.get("author_id")
+        or author.get("id")
+        or author.get("uid")
+        or author.get("username")
+        or post.get("username")
+        or ""
+    ).strip().lower()
+    return f"{source}:{raw}" if raw else ""
 
 
 # ==============================================================================
@@ -550,7 +570,6 @@ def check_article_info(
     max_chars: int,
 ) -> Tuple[bool, str]:
     """校验单币分析文章输出 `{status,text,god_comments,image_placeholders,used_material_ids,score,reason}`。"""
-    import re
 
     keys = {"status", "text", "god_comments", "image_placeholders", "used_material_ids", "score", "reason"}
     error = _key_error(article_info, keys, "文章")
@@ -583,8 +602,8 @@ def check_article_info(
         return False, "ok 正文不能为空"
     if len(re.sub(r"\s", "", text)) > max_chars:
         return False, f"正文非空白字符数超过 {max_chars}"
-    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
-        return False, "正文不能包含图片或视频占位符"
+    if _LEAKED_ARTIFACT_RE.search(text):
+        return False, "正文不能包含图片/视频占位符或外部引用标注"
     if type(article_info["score"]) not in (int, float) or not 0 <= article_info["score"] <= 10:
         return False, "score 必须是 0—10 的数值，不能是布尔值"
     if article_info["reason"] is not None:
@@ -865,10 +884,21 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
         or []
     )
     used_event_keys: Counter = Counter()
+    used_author_keys: Counter = Counter()
+    author_key_by_pid = {
+        str(p.get("post_id")).strip(): _extract_author_key(p)
+        for p in posts
+        if p.get("post_id") is not None
+    }
     for art in recent_viral_articles:
         ek = (((art.get("creation_brief") or {}).get("stage1_screen") or {}).get("event_key") or "").strip()
         if ek:
             used_event_keys[ek] += 1
+        for spid in (art.get("post_id_list") or []):
+            akey = author_key_by_pid.get(str(spid).strip(), "")
+            if akey:
+                used_author_keys[akey] += 1
+                break
 
     candidates = []
     for post in posts:
@@ -907,27 +937,32 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
     unprocessed = [item for item in candidates if str(item[0].get("post_id", "")).strip() not in processed_ids]
     unprocessed.sort(key=lambda item: (item[1], item[2]), reverse=True)
 
-    result, event_skipped = [], 0
+    result, event_skipped, author_skipped = [], 0, 0
     for post, _, _ in unprocessed:
         event_key = ((post.get("viral_screen") or {}).get("event_key") or "").strip()
         if event_key and used_event_keys[event_key] >= 2:
             event_skipped += 1
             continue
+        author_key = _extract_author_key(post)
+        if author_key and used_author_keys[author_key] >= 2:
+            author_skipped += 1
+            continue
         if event_key:
             used_event_keys[event_key] += 1
+        if author_key:
+            used_author_keys[author_key] += 1
         result.append(post)
 
     logger.info(
         f"[高流量/选材] 已筛选待重塑候选帖 | 扫描: [{len(posts)}] | 粗筛达标: [{len(candidates)}] "
         f"| 已处理跳过: [{len(candidates) - len(unprocessed)}] | 同源热点冷却跳过: [{event_skipped}] "
-        f"| 本轮待精改: [{len(result)}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
+        f"| 同作者限额跳过: [{author_skipped}] | 本轮待精改: [{len(result)}] | 耗时: [{time.monotonic() - started:.2f} 秒]"
     )
     return result
 
 
 def check_viral_article_info(raw_info: Any, placeholders: Sequence[str], max_chars: int) -> Tuple[bool, str]:
     """校验高流量二阶段重塑输出的全部字段、覆盖性与枚举约束。"""
-    import re
 
     expected_keys = {
         "image_semantics",
@@ -1001,6 +1036,8 @@ def check_viral_article_info(raw_info: Any, placeholders: Sequence[str], max_cha
     selected_images = raw_info["selected_images"]
     if not isinstance(selected_images, list) or any(not isinstance(item, str) or not item for item in selected_images):
         return False, "selected_images 必须是非空字符串组成的列表"
+    if not selected_images:
+        return False, "usable 为 true 时至少需要保留 1 张有效图片（无可用配图应判 usable=false）"
     if len(selected_images) != len(set(selected_images)):
         return False, "selected_images 不允许重复"
     if len(selected_images) > 5:
@@ -1018,8 +1055,8 @@ def check_viral_article_info(raw_info: Any, placeholders: Sequence[str], max_cha
         return False, "post_text 必须是非空字符串"
     if len(re.sub(r"\s", "", text)) > max_chars:
         return False, f"post_text 非空白字符数超过 {max_chars}"
-    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
-        return False, "post_text 不能包含图片或视频占位符"
+    if _LEAKED_ARTIFACT_RE.search(text):
+        return False, "post_text 不能包含图片/视频占位符或外部引用标注"
 
     comments = raw_info["bait_comments"]
     if (

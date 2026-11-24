@@ -25,17 +25,32 @@ from parser.post_ingestion import (
     MAX_CONCURRENCY,
     MEDIA_PATTERN,
     MLU_EXTRACT_PROMPT_NAME,
+    MLU_FORMAT_MAX_PER_ROUND,
     POST_MAX_AGE_HOURS,
     POST_QUERY_LIMIT,
     PRE_SCREEN_BATCH_SIZE,
     PRE_SCREEN_CONCURRENCY,
+    PRE_SCREEN_MAX_PER_ROUND,
     PRE_SCREEN_PROMPT_NAME,
     _is_valid_raw_post,
     _key_error,
+    _publish_time_seconds,
     ensure_post_media_downloaded,
     normalize_post_media,
     prompt_version,
 )
+
+
+def _post_publish_ts_or_zero(post: Dict[str, Any]) -> float:
+    try:
+        return float(_publish_time_seconds(post.get("publish_time", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sort_posts_newest_first(posts: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按发布时间倒序排列，优先保障最新热点原帖快速穿过初筛与论据精提。"""
+    return sorted(posts, key=_post_publish_ts_or_zero, reverse=True)
 
 
 def is_need_pre_screening(post: Dict[str, Any]) -> bool:
@@ -313,24 +328,29 @@ def run_concurrent_screening_batches(
     prompt_name: str,
     batch_size: int,
     action: str,
+    max_pending: int = 0,
 ) -> Tuple[int, int, int, int]:
-    """公共并发批量纯文本筛查调度器，返回 `(待筛数, 通过数, 淘汰数, 失败批次数)`。"""
-    pending = [post for post in posts if predicate(post)]
+    """公共并发批量纯文本筛查调度器，返回 `(待筛总积压数, 通过数, 淘汰数, 失败批次数)`。"""
+    pending = _sort_posts_newest_first([post for post in posts if predicate(post)])
     if not pending:
         logger.debug(f"[{action}/计划] 当前无待筛新帖 | 扫描: [{len(posts)}]")
         return 0, 0, 0, 0
+
+    total_pending = len(pending)
+    batch_pending = pending[:max_pending] if max_pending > 0 and total_pending > max_pending else pending
 
     prompt, _meta = render_prompt_template(prompt_name)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError(f"{action}提示词为空或读取失败: {prompt_name}")
 
-    batches = [pending[index : index + batch_size] for index in range(0, len(pending), batch_size)]
+    batches = [batch_pending[index : index + batch_size] for index in range(0, len(batch_pending), batch_size)]
     _log(
         f"{action}/计划",
         "批量文本筛查就绪",
         扫描=len(posts),
-        待筛=len(pending),
-        跳过=len(posts) - len(pending),
+        待筛总量=total_pending,
+        本轮处理=len(batch_pending),
+        跳过=len(posts) - total_pending,
         批次=len(batches),
         单批上限=batch_size,
         并发=PRE_SCREEN_CONCURRENCY,
@@ -359,17 +379,22 @@ def run_concurrent_screening_batches(
     _log(
         f"{action}/汇总",
         "本轮筛查结束",
-        待筛=len(pending),
+        待筛总量=total_pending,
+        本轮处理=len(batch_pending),
         通过=passed,
         淘汰=rejected,
         失败批次=failed,
         耗时=f"{time.monotonic() - started:.2f}秒",
     )
-    return len(pending), passed, rejected, failed
+    return total_pending, passed, rejected, failed
 
 
-def batch_pre_screen_posts(posts: Sequence[Dict[str, Any]], post_manager: Any) -> Tuple[int, int, int, int]:
-    """每批 50 帖并发初筛分析原帖并原地更新 `pre_screen`。"""
+def batch_pre_screen_posts(
+    posts: Sequence[Dict[str, Any]],
+    post_manager: Any,
+    max_pending: int = 0,
+) -> Tuple[int, int, int, int]:
+    """每批 50 帖并发初筛分析原帖并原地更新 `pre_screen`（支持按最新优先限额分轮执行）。"""
     return run_concurrent_screening_batches(
         posts,
         post_manager,
@@ -378,11 +403,12 @@ def batch_pre_screen_posts(posts: Sequence[Dict[str, Any]], post_manager: Any) -
         PRE_SCREEN_PROMPT_NAME,
         PRE_SCREEN_BATCH_SIZE,
         "初筛",
+        max_pending=max_pending,
     )
 
 
 def format_image_article_once(post_manager: Optional[Any] = None) -> Tuple[int, int, int, int, int]:
-    """单轮执行分析原帖初筛与并发多模态论据提取，返回 `(待初筛数, 通过数, 淘汰数, 精提数, 建议休眠秒)`。"""
+    """单轮交替执行最新优先限额初筛与多模态论据精提，返回 `(待初筛总量, 通过数, 淘汰数, 本轮精提数, 建议休眠秒)`。"""
     started = time.monotonic()
     if post_manager is None:
         post_manager = UniversalPostManager(gen_db_object())
@@ -401,19 +427,27 @@ def format_image_article_once(post_manager: Optional[Any] = None) -> Tuple[int, 
         logger.info("[分析筛查/轮询] 库内暂无近50h原帖 | 下次扫描: [60s后]")
         return 0, 0, 0, 0, 60
 
-    pre_pending, pre_pass, pre_rej, _ = batch_pre_screen_posts(posts, post_manager) or (0, 0, 0, 0)
-    valid_posts = [post for post in posts if is_need_formatting(post)]
+    pre_pending, pre_pass, pre_rej, _ = (
+        batch_pre_screen_posts(posts, post_manager, max_pending=PRE_SCREEN_MAX_PER_ROUND) or (0, 0, 0, 0)
+    )
+    all_valid_posts = _sort_posts_newest_first([post for post in posts if is_need_formatting(post)])
+    valid_posts = all_valid_posts[:MLU_FORMAT_MAX_PER_ROUND]
     if valid_posts:
         logger.info(
-            f"[论据提取/计划] 启动多模态论据精提 | 扫描原帖: [{len(posts)}] | 待精提: [{len(valid_posts)}] "
-            f"| 并发上限: [{MAX_CONCURRENCY}]"
+            f"[论据提取/计划] 启动多模态论据精提 | 扫描原帖: [{len(posts)}] | 待精提总量: [{len(all_valid_posts)}] "
+            f"| 本轮精提: [{len(valid_posts)}] | 并发上限: [{MAX_CONCURRENCY}]"
         )
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
             futures = [executor.submit(process_and_save_single_post, post, post_manager) for post in valid_posts]
             for future in as_completed(futures):
                 future.result()
 
-    delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 60
+    has_backlog = (
+        pre_pending > PRE_SCREEN_MAX_PER_ROUND
+        or len(all_valid_posts) > MLU_FORMAT_MAX_PER_ROUND
+        or any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches)
+    )
+    delay = 5 if has_backlog else 60
     if pre_pending == 0 and not valid_posts:
         logger.info(
             f"[分析筛查/轮询] 本轮无新增待处理分析原帖 | 库内近50h原帖: [{len(posts)}] "
