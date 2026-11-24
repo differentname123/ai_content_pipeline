@@ -15,15 +15,18 @@ from parser.article_generator import (
     _convert_viral_article_info,
     build_article_task,
     build_viral_article_task,
+    check_article_info,
     check_viral_article_info,
     execute_article_task,
     execute_viral_article_task,
+    extract_and_group_valid_evidences,
     extract_valid_viral_posts,
     generate_analysis_articles,
     generate_viral_articles,
+    get_remodeled_viral_post_ids,
     transform_mlus,
 )
-from parser.mlu_pipeline import check_format_info
+from parser.mlu_pipeline import check_format_info, is_need_formatting, is_need_pre_screening
 from parser.platform_adapters import (
     BinancePlatform,
     OkxPlatform,
@@ -33,10 +36,12 @@ from parser.platform_adapters import (
     has_rival_exchange_ui,
     has_rival_keyword,
     normalize_exchange_ui,
+    score_platform_candidate,
     score_platform_candidate_form,
     sync_published_metrics,
 )
 from parser.post_ingestion import (
+    ARTICLE_MAX_CHARS,
     ARTICLE_TYPE_ANALYSIS,
     ARTICLE_TYPE_VIRAL,
     _fetch_hot_posts,
@@ -1052,6 +1057,7 @@ class TestPublisherArena(unittest.TestCase):
 
             self.assertEqual(idx, 0)
             self.assertNotIn("9.9", captured_prompt["text"])
+            self.assertIn("platform_fit_score", captured_prompt["text"])
             self.assertEqual(art["article_info"]["text"], "原始干净正文")
             self.assertEqual(art["article_info"]["god_comments"], ["稳健观点"])
             mock_col.update_one.assert_not_called()
@@ -1231,6 +1237,140 @@ class TestLazyMediaDownload(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(c.get("download_media") is False for c in calls))
 
+    def test_single_prompt_version_invalidates_all_stages_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = _create_tiny_png(Path(tmp), "single_ver.png")
+            now = time.time()
+            old_ver = f"{prompt_version}-legacy"
+            # 1. Old-version logic_mul/pre_screen MUST trigger re-screening and re-formatting (no deadlock)
+            post_old_all = {
+                "source": "binance",
+                "post_id": "single_old_1",
+                "publish_time": now - 3600,
+                "pre_screen": {"prompt_version": old_ver, "no_evidence": False},
+                "logic_mul": {
+                    "prompt_version": old_ver,
+                    "evidences": [
+                        {
+                            "target_coin": "BTC",
+                            "stance": "看多",
+                            "dimension": "资金流",
+                            "core_fact": "大户净流入",
+                            "logic_link": "买盘托底",
+                            "raw_hook": "",
+                            "impact_weight": 5,
+                            "shelf_life": "days",
+                            "images": [{"image_id": "[IMAGE_1]", "usable": True, "context": "资金图"}],
+                        }
+                    ],
+                },
+                "content": {"text_content": "BTC资金流强势\n[插图: https://x/mlu.png]"},
+                "media": {"images": ["https://x/mlu.png"], "local_mapping": {"https://x/mlu.png": img1}},
+            }
+            self.assertTrue(is_need_pre_screening(post_old_all))
+            self.assertFalse(is_need_formatting(post_old_all))
+
+            # Once pre_screen updates to prompt_version, old logic_mul STILL gets re-extracted cleanly
+            post_old_mlu_only = dict(post_old_all, pre_screen={"prompt_version": prompt_version, "no_evidence": False})
+            self.assertFalse(is_need_pre_screening(post_old_mlu_only))
+            self.assertTrue(is_need_formatting(post_old_mlu_only))
+
+            post_cur = dict(
+                post_old_mlu_only,
+                post_id="single_cur_1",
+                logic_mul={**post_old_all["logic_mul"], "prompt_version": prompt_version},
+            )
+            self.assertFalse(is_need_pre_screening(post_cur))
+            self.assertFalse(is_need_formatting(post_cur))
+
+            # 2. Upstream extractor filter rejects old-ver evidences and admits prompt_version evidences
+            mock_art_mgr = MagicMock()
+            mock_art_mgr.find_articles.return_value = []
+            with patch("parser.article_generator.get_hot_coin", return_value=["BTC"]), \
+                 patch("parser.article_generator.PLATFORMS", {"okx": MagicMock(hot_coins=MagicMock(return_value=[]))}), \
+                 patch("parser.article_generator.UniversalPostManager") as mock_upm, \
+                 patch("parser.article_generator.gen_db_object"), \
+                 patch("parser.article_generator._get_all_self_published_post_ids", return_value=set()):
+                mock_upm.return_value.find_posts_by_source.side_effect = (
+                    lambda src, **kw: [post_old_all, post_cur] if src == "binance" else []
+                )
+                grouped = extract_and_group_valid_evidences(mock_art_mgr)
+            self.assertEqual([e["source_post_id"] for e in grouped["BTC"]["看多"]], ["single_cur_1"])
+
+            # 3. get_remodeled_viral_post_ids filters by current prompt_version so old generations do not block regeneration
+            get_remodeled_viral_post_ids(mock_art_mgr, "binance", ["v1"])
+            _, kwargs = mock_art_mgr.find_articles.call_args
+            self.assertEqual(kwargs["query"]["prompt_version"], prompt_version)
+
+    def test_platform_candidate_scoring_ssot_separates_binance_and_okx(self):
+        clean_2p_ana = "第一段交待核心矛盾，资金已经连买三天，现价压在关键支撑与筹码密集区附近，短期抛压正在出清。\n\n" + ("补充链上实锤与筹码异动细节。" * 8)
+        wall_ana = "一整坨没有空行换气的长文字墙" * 11
+        short_split_viral = "今日两百万\n\n直接沉默"
+        trailing_q_text = "今天盘面真走弱了吗？"
+
+        s_clean, bd_clean = score_platform_candidate("binance", ARTICLE_TYPE_ANALYSIS, clean_2p_ana, 2)
+        s_wall, bd_wall = score_platform_candidate("binance", ARTICLE_TYPE_ANALYSIS, wall_ana, 2)
+        self.assertGreater(s_clean, s_wall)
+        self.assertAlmostEqual(bd_clean["readability"], 0.2)
+        self.assertAlmostEqual(bd_wall["readability"], -0.4)
+
+        s_q, bd_q = score_platform_candidate("binance", ARTICLE_TYPE_VIRAL, trailing_q_text, 1)
+        self.assertAlmostEqual(bd_q["question"], -0.4)
+
+        s_split, bd_split = score_platform_candidate("binance", ARTICLE_TYPE_VIRAL, short_split_viral, 1)
+        self.assertAlmostEqual(bd_split["readability"], -0.3)
+
+        s_over400, _ = score_platform_candidate("binance", ARTICLE_TYPE_ANALYSIS, "字" * 420, 1)
+        self.assertLess(s_over400, -0.5)
+
+        # OKX stays completely neutral on Binance form/question rules
+        s_okx_140, bd_okx_140 = score_platform_candidate("okx", ARTICLE_TYPE_ANALYSIS, wall_ana + "？", 1)
+        self.assertAlmostEqual(bd_okx_140["form"], 0.0)
+        self.assertAlmostEqual(bd_okx_140["question"], 0.0)
+        self.assertAlmostEqual(s_okx_140, 0.0)
+
+        s_okx_240, _ = score_platform_candidate("okx", ARTICLE_TYPE_ANALYSIS, "长段" * 120, 1)
+        self.assertAlmostEqual(s_okx_240, -0.3)
+
+    def test_generation_accepts_natural_long_article_above_260(self):
+        self.assertGreaterEqual(ARTICLE_MAX_CHARS, 800)
+        long_320 = "深度复盘正文" + ("，核心指标与盘面支撑交错演变" * 24)
+        self.assertGreater(len(long_320), 260)
+        with tempfile.TemporaryDirectory() as tmp:
+            img_p = _create_tiny_png(Path(tmp), "long_ok.png")
+            mats = [{"id": "M1", "fact": "链上", "visual_evidence": {"placeholder": "[ASSET_IMG_1]", "what_it_shows": "链上"}}]
+            imap = {"[ASSET_IMG_1]": {"local_path": img_p}}
+            ana_info = {
+                "status": "ok",
+                "text": long_320,
+                "god_comments": ["写得透"],
+                "image_placeholders": ["[ASSET_IMG_1]"],
+                "used_material_ids": ["M1"],
+                "score": 8.5,
+                "reason": None,
+            }
+            ok_ana, err_ana = check_article_info(ana_info, mats, imap, ARTICLE_MAX_CHARS)
+            self.assertTrue(ok_ana, err_ana)
+
+            vir_info = {
+                "image_semantics": [{"id": "[IMAGE_1]", "semantic_role": "图", "exchange_ui": "", "keep": True}],
+                "selected_images": ["[IMAGE_1]"],
+                "global_truth": "真实长故事",
+                "feasibility_audit": "ok",
+                "usable": True,
+                "topic_tag": "搞钱与盈亏",
+                "expression_strategy": "保留完整故事",
+                "post_text": long_320,
+                "bait_comments": ["精彩"],
+                "viral_score": 8.5,
+            }
+            ok_vir, err_vir = check_viral_article_info(vir_info, ["[IMAGE_1]"], ARTICLE_MAX_CHARS)
+            self.assertTrue(ok_vir, err_vir)
+
+            ana_info["text"] = "字" * (ARTICLE_MAX_CHARS + 10)
+            ok_over, _ = check_article_info(ana_info, mats, imap, ARTICLE_MAX_CHARS)
+            self.assertFalse(ok_over)
+
 
 class TestPromptAbstractionHygiene(unittest.TestCase):
     def test_prompts_are_abstract_and_free_of_legacy_case_anchors(self):
@@ -1278,6 +1418,23 @@ class TestPromptAbstractionHygiene(unittest.TestCase):
             self.assertTrue(text.strip(), f"Empty prompt: {pname}")
             for anchor in forbidden_case_anchors:
                 self.assertNotIn(anchor, text, f"Found legacy concrete anchor {anchor!r} in {pname}")
+
+    def test_generation_prompts_are_free_of_platform_layout_quotas(self):
+        from common.llm_gateway import render_prompt_template
+        from parser.config import ARTICLE_PROMPT_NAME, VIRAL_STAGE2_PROMPT_NAME
+
+        forbidden_platform_quotas = (
+            "150~240",
+            "<=260",
+            "2~3 个短段",
+            "优先挑 2~3 张",
+            "约 110 字",
+            "超 120 字",
+        )
+        for pname in (ARTICLE_PROMPT_NAME, VIRAL_STAGE2_PROMPT_NAME):
+            text, _ = render_prompt_template(pname)
+            for quota in forbidden_platform_quotas:
+                self.assertNotIn(quota, text, f"Found platform-coupled quota {quota!r} in generation prompt {pname}")
 
 
 if __name__ == "__main__":

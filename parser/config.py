@@ -21,8 +21,8 @@ from common.common_utils import (
 # ==============================================================================
 # 1. 提示词版本与模板配置
 # ==============================================================================
-prompt_version = "1124-1"
-SELECTION_PROMPT_VERSION = "20261124-v7_breathable_layout"
+prompt_version = "1125-1"
+SELECTION_PROMPT_VERSION = "20261125-v9_platform_scorer_decoupled"
 
 PRE_SCREEN_PROMPT_NAME = "内容生成方案_分析类MLU初筛.txt"
 MLU_EXTRACT_PROMPT_NAME = "内容生成方案_分析类MLU提取.txt"
@@ -98,7 +98,7 @@ ARTICLE_TYPE_VIRAL = "viral"
 ARTICLE_MATERIAL_LIMIT = 10
 ARTICLE_MIN_MATERIALS = 5
 ARTICLE_POST_USAGE_LIMIT = 2
-ARTICLE_MAX_CHARS = 260
+ARTICLE_MAX_CHARS = 800  # 生成层物理防失控上限；具体平台甜区字数偏置由发布层平台评分模型独立决定
 ARTICLE_VARIANTS = 1
 ARTICLE_CONCURRENCY = 5
 ARTICLE_GENERATION_INTERVAL_SECONDS = 1200

@@ -597,8 +597,8 @@ def check_article_info(
         return False, "used_material_ids 必须引用实际存在的素材且不能为空"
     if image_mapping and not selected_images:
         return False, "ok 状态下必须至少选择 1 张配图（image_placeholders 不能为空）"
-    if len(selected_images) > 3:
-        return False, "最多使用 3 张图片"
+    if len(selected_images) > 4:
+        return False, "最多使用 4 张图片"
     allowed_images = set()
     for material_id in used_ids:
         visual = material_by_id[material_id]["visual_evidence"]
@@ -810,7 +810,7 @@ def build_article_task(
 # 四、娱乐高流量第二阶段：原图验货与重塑
 # ==============================================================================
 def get_remodeled_viral_post_ids(article_manager: Any, source: Any, post_ids: Sequence[Any]) -> set:
-    """获取已执行过高流量二阶段 (status=ok/skip) 的原帖 ID 集合。"""
+    """获取当前版本下已执行过高流量二阶段 (status=ok/skip) 的原帖 ID 集合。"""
     raw_ids = list(dict.fromkeys(post_ids))
     if not raw_ids:
         return set()
@@ -823,6 +823,7 @@ def get_remodeled_viral_post_ids(article_manager: Any, source: Any, post_ids: Se
             query={
                 "source": source_query,
                 "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
                 "status": {"$in": ["ok", "skip"]},
                 "post_id_list": {"$in": query_ids},
             },
@@ -855,6 +856,7 @@ def extract_valid_viral_posts(article_manager: Any) -> List[Dict[str, Any]]:
             query={
                 "source": {"$in": list(POST_SOURCES)},
                 "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
                 "status": "ok",
                 "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
             },

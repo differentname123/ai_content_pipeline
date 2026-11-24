@@ -45,6 +45,7 @@ from parser.platform_adapters import (
     has_rival_keyword,
     logger,
     normalize_exchange_ui,
+    score_platform_candidate,
     score_platform_candidate_form,
     sync_published_metrics,
 )
@@ -363,11 +364,12 @@ def _collect_publish_candidates(
             likes = int(eng.get("like_count", 0) or 0)
             comments = int(eng.get("comment_count", 0) or 0)
             hot_energy = views + likes * 30 + comments * 80
-            # 【保留过滤/加权原因说明】发布层按目标平台分布规律打分（生成层保持中立，仅此处叠加平台形态加减权）
+            # 【保留过滤/加权原因说明】发布层按目标平台分布规律与版式可读性打分（生成层保持平台中立）
             img_cnt = len(info.get(rule["images"]) or [])
-            clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
-            form_bonus = score_platform_candidate_form(platform, ARTICLE_TYPE_VIRAL, img_cnt, clean_len)
-            return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + form_bonus
+            raw_text = str(info.get(rule["text"]) or "")
+            p_score, p_breakdown = score_platform_candidate(platform, ARTICLE_TYPE_VIRAL, raw_text, img_cnt)
+            art["_platform_score_meta"] = {"score": p_score, "breakdown": p_breakdown}
+            return v_score + math.log10(max(hot_energy, 1000)) * 1.2 + p_score
 
         candidates.sort(key=_viral_rank_key, reverse=True)
     else:
@@ -376,10 +378,11 @@ def _collect_publish_candidates(
             info = art["article_info"]
             score = float(info.get(rule["score"], 0.0))
             img_cnt = len(info.get(rule["images"]) or [])
-            clean_len = len("".join(str(info.get(rule["text"]) or "").split()))
-            # 【保留过滤/加权原因说明】由平台适配器按目标平台决定形态与篇幅偏置
-            form_bonus = score_platform_candidate_form(platform, ARTICLE_TYPE_ANALYSIS, img_cnt, clean_len)
-            return score + form_bonus
+            raw_text = str(info.get(rule["text"]) or "")
+            # 【保留过滤/加权原因说明】由平台适配器按目标平台决定形态、版式与篇幅偏置
+            p_score, p_breakdown = score_platform_candidate(platform, ARTICLE_TYPE_ANALYSIS, raw_text, img_cnt)
+            art["_platform_score_meta"] = {"score": p_score, "breakdown": p_breakdown}
+            return score + p_score
 
         candidates.sort(key=_analysis_rank_key, reverse=True)
     return candidates, len(raw), stats
@@ -521,7 +524,12 @@ def _select_and_polish_best_candidate(
             ]
             post_txt = info.get("post_text", "") or ""
             sel_imgs = info.get("selected_images") or []
-            # 严格剔除内部打分，避免干扰总编审美判断
+            p_meta = art.get("_platform_score_meta")
+            if not isinstance(p_meta, dict):
+                ps, pbd = score_platform_candidate(platform, ARTICLE_TYPE_VIRAL, post_txt, len(sel_imgs))
+                p_meta = {"score": ps, "breakdown": pbd}
+                art["_platform_score_meta"] = p_meta
+            # 严格剔除内部打分，仅附带目标平台客观适配度供总编统筹内容质量与渠道契合度
             arena_items.append(
                 {
                     "candidate_no": rank_no,
@@ -529,6 +537,8 @@ def _select_and_polish_best_candidate(
                     "source_platform": art.get("source") or "",
                     "image_count": len(sel_imgs),
                     "char_count": len("".join(post_txt.split())),
+                    "platform_fit_score": p_meta.get("score", 0.0),
+                    "platform_fit_notes": (p_meta.get("breakdown") or {}).get("notes") or [],
                     "kept_images_desc": img_roles,
                     "draft_text": post_txt,
                     "draft_comments": info.get("bait_comments", []),
@@ -548,7 +558,12 @@ def _select_and_polish_best_candidate(
                     if isinstance(v, dict) and v.get("placeholder") in selected_phs_set and v.get("what_it_shows"):
                         img_descs.append(v["what_it_shows"])
             draft_txt = info.get("text", "") or ""
-            # 严格剔除内部打分，仅保留客观盘面初稿与配图描述
+            p_meta = art.get("_platform_score_meta")
+            if not isinstance(p_meta, dict):
+                ps, pbd = score_platform_candidate(platform, ARTICLE_TYPE_ANALYSIS, draft_txt, len(selected_phs))
+                p_meta = {"score": ps, "breakdown": pbd}
+                art["_platform_score_meta"] = p_meta
+            # 严格剔除内部打分，仅保留客观盘面初稿、配图描述与目标平台适配分
             arena_items.append(
                 {
                     "candidate_no": rank_no,
@@ -556,6 +571,8 @@ def _select_and_polish_best_candidate(
                     "stance": art.get("stance"),
                     "image_count": len(selected_phs),
                     "char_count": len("".join(draft_txt.split())),
+                    "platform_fit_score": p_meta.get("score", 0.0),
+                    "platform_fit_notes": (p_meta.get("breakdown") or {}).get("notes") or [],
                     "kept_images_desc": img_descs,
                     "draft_text": draft_txt,
                     "draft_comments": info.get("god_comments", []),
@@ -594,12 +611,15 @@ def _select_and_polish_best_candidate(
         chosen_art, _, chosen_coin = candidates[chosen_idx]
 
         # 经对照实验证实：盲眼总编只选不改可避免无图改写失真与幻觉，原汁原味保留上游看图初稿与神评
+        chosen_p_meta = chosen_art.get("_platform_score_meta") or {}
         chosen_art["_selection_meta"] = {
             "prompt_version": SELECTION_PROMPT_VERSION,
             "reason": str(parsed.get("reason") or ""),
             "model_used": str(trace.get("model_used") or ""),
             "selected_candidate_no": cand_no,
             "candidate_pool_size": len(valid_indices),
+            "platform_fit_score": chosen_p_meta.get("score"),
+            "platform_fit_breakdown": chosen_p_meta.get("breakdown"),
             "selected_at": time.time(),
         }
         _log(
@@ -684,6 +704,10 @@ def _persist_publish_result(
                 plat_record["selection_reason"] = sel_meta["reason"]
             if sel_meta.get("model_used"):
                 plat_record["selection_model_used"] = sel_meta["model_used"]
+            if sel_meta.get("platform_fit_score") is not None:
+                plat_record["platform_fit_score"] = sel_meta["platform_fit_score"]
+            if sel_meta.get("platform_fit_breakdown"):
+                plat_record["platform_fit_breakdown"] = sel_meta["platform_fit_breakdown"]
         else:
             infra_kind = classify_infra_backoff_error(err_msg)
             error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"

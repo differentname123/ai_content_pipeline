@@ -40,7 +40,8 @@ from parser.post_ingestion import (
 
 def is_need_pre_screening(post: Dict[str, Any]) -> bool:
     """判定原帖是否需要进行分析类纯文本初筛。"""
-    if post.get("logic_mul"):
+    logic = post.get("logic_mul")
+    if isinstance(logic, dict) and logic.get("prompt_version") == prompt_version:
         return False
     screen = post.get("pre_screen")
     if (
@@ -53,10 +54,11 @@ def is_need_pre_screening(post: Dict[str, Any]) -> bool:
 
 
 def is_need_formatting(post: Dict[str, Any]) -> bool:
-    """判定原帖是否已通过当前版本初筛且尚无 `logic_mul`，需要多模态精提。"""
+    """判定原帖是否已通过当前版本初筛且尚无当前版本 `logic_mul`，需要多模态精提。"""
     screen = post.get("pre_screen")
+    logic = post.get("logic_mul")
     if (
-        post.get("logic_mul")
+        (isinstance(logic, dict) and logic.get("prompt_version") == prompt_version)
         or not isinstance(screen, dict)
         or screen.get("prompt_version") != prompt_version
         or screen.get("no_evidence") is not False

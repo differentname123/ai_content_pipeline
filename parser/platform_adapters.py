@@ -268,6 +268,56 @@ class BinancePlatform:
             return bonus
         return 0.0
 
+    def score_candidate(self, article_type: str, text: str, img_cnt: int) -> Tuple[float, Dict[str, Any]]:
+        """
+        【同语义单一真源】币安广场候选综合适配评分：
+        集中承载形态甜区、尾问号降权与移动端版式呼吸感评估，使上游生成层保持平台中立。
+        """
+        layout = _inspect_text_layout(text)
+        clean_len = layout["clean_len"]
+        form_score = float(self.score_candidate_form(article_type, img_cnt, clean_len))
+        notes: List[str] = []
+
+        if clean_len > 400:
+            form_score -= 0.5
+            notes.append(f"偏长({clean_len}字>400，曝光衰减)")
+        elif clean_len > 260:
+            notes.append(f"超出260字甜区({clean_len}字)")
+
+        if article_type == ARTICLE_TYPE_ANALYSIS and 0 < clean_len < 110:
+            form_score -= 0.3
+            notes.append(f"分析偏短({clean_len}字<110)")
+        elif article_type == ARTICLE_TYPE_VIRAL and img_cnt <= 1 and 50 <= clean_len < 100:
+            notes.append("单图半截区间(50~99字)")
+
+        if img_cnt >= 2:
+            notes.append(f"多图加权({img_cnt}图)")
+
+        question_score = -0.4 if layout["trailing_question"] else 0.0
+        if layout["trailing_question"]:
+            notes.append("尾句带问号(降权)")
+
+        readability_score = 0.0
+        if clean_len >= 130 and layout["max_para_len"] >= 130:
+            readability_score = -0.4
+            notes.append(f"单段过密文字墙(最长段{layout['max_para_len']}字)")
+        elif clean_len >= 130 and layout["para_count"] >= 2 and layout["max_para_len"] <= 115:
+            readability_score = 0.2
+            notes.append("分段呼吸感佳")
+        elif clean_len < 75 and layout["para_count"] > 1:
+            readability_score = -0.3
+            notes.append("短梗强行拆段")
+
+        total = round(form_score + question_score + readability_score, 2)
+        return total, {
+            "form": round(form_score, 2),
+            "question": round(question_score, 2),
+            "readability": round(readability_score, 2),
+            **layout,
+            "img_cnt": img_cnt,
+            "notes": notes,
+        }
+
 
 class OkxPlatform:
     """OKX 星球 (Orbit) 适配器。"""
@@ -320,11 +370,37 @@ class OkxPlatform:
         """OKX 分发形态偏置保持中性（0.0），避免币安广场经验权重跨平台误污染。"""
         return 0.0
 
+    def score_candidate(self, article_type: str, text: str, img_cnt: int) -> Tuple[float, Dict[str, Any]]:
+        """OKX 分发保持对币安形态与问号规律完全中立，仅在极端过长单段时做轻微可读性提示。"""
+        layout = _inspect_text_layout(text)
+        readability_score = -0.3 if (layout["clean_len"] >= 220 and layout["max_para_len"] >= 220) else 0.0
+        notes = [f"极长单段({layout['max_para_len']}字)"] if readability_score < 0 else []
+        return round(readability_score, 2), {
+            "form": 0.0,
+            "question": 0.0,
+            "readability": round(readability_score, 2),
+            **layout,
+            "img_cnt": img_cnt,
+            "notes": notes,
+        }
+
 
 PLATFORMS: Dict[str, Any] = {
     PLATFORM_BINANCE: BinancePlatform(),
     PLATFORM_OKX: OkxPlatform(),
 }
+
+
+def _inspect_text_layout(text: str) -> Dict[str, Any]:
+    """提取正文长度、分段节奏与尾句问号等客观版式特征。"""
+    raw = str(text or "")
+    paras = [p.strip() for p in re.split(r"\n\s*\n", raw.strip()) if p.strip()]
+    return {
+        "clean_len": len("".join(raw.split())),
+        "para_count": len(paras),
+        "max_para_len": max((len("".join(p.split())) for p in paras), default=0),
+        "trailing_question": raw.rstrip().endswith(("?", "？")),
+    }
 
 
 def score_platform_candidate_form(platform: str, article_type: str, img_cnt: int, clean_len: int) -> float:
@@ -334,6 +410,16 @@ def score_platform_candidate_form(platform: str, article_type: str, img_cnt: int
     if adapter is None or not hasattr(adapter, "score_candidate_form"):
         return 0.0
     return float(adapter.score_candidate_form(article_type, img_cnt, clean_len))
+
+
+def score_platform_candidate(platform: str, article_type: str, text: str, img_cnt: int) -> Tuple[float, Dict[str, Any]]:
+    """分发层平台适配总评分入口（形态 + 版式可读性 + 平台特征）；未知平台安全降级为 0.0。"""
+    target = str(platform or "").strip().lower()
+    adapter = PLATFORMS.get(target)
+    if adapter is not None and hasattr(adapter, "score_candidate"):
+        return adapter.score_candidate(article_type, text, img_cnt)
+    layout = _inspect_text_layout(text)
+    return 0.0, {"form": 0.0, "question": 0.0, "readability": 0.0, **layout, "img_cnt": img_cnt, "notes": []}
 
 
 def _get_account_session_dir(platform: str, account: str) -> str:
