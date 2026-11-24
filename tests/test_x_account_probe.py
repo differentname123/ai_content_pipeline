@@ -595,9 +595,41 @@ class TestXAccountProbe(unittest.TestCase):
             ],
         }
         rendered = probe.format_probe_report(report)
+        self.assertIn("🟢 ✅", rendered)
         self.assertIn("搜索可见已恢复", rendered)
+        self.assertIn("🔴", rendered)
         self.assertIn("仍处于 Search Ban", rendered)
         self.assertIn("987654321", rendered)
+        self.assertIn("[有效]", rendered)
+
+        # Strict invariant: when NO account has recovered, ZERO green icons appear anywhere (even when NASA control passed)
+        all_banned_report = {
+            "checked_at": "2026-11-25 02:00:00",
+            "observer_session_dir": r"W:\temp\x_xiaohao",
+            "observer_ok": True,
+            "observer_error": "",
+            "calibration": {"performed": True, "control_handle": "NASA", "passed": True},
+            "targets": [
+                {
+                    "alias": "x_dahao",
+                    "handle": "2434954452qqc",
+                    "verdict": "SEARCH_BANNED",
+                    "profile": {"profile_state": "ALIVE", "followers": 682, "following": 0, "tweets": 315},
+                    "search": {"search_state": "HIDDEN", "detail": "DOM emptyState: No results", "tweets": []},
+                },
+                {
+                    "alias": "x_myself",
+                    "handle": "peterzhu1003",
+                    "verdict": "SEARCH_BANNED",
+                    "profile": {"profile_state": "ALIVE", "followers": 34, "following": 202, "tweets": 192},
+                    "search": {"search_state": "HIDDEN", "detail": "DOM emptyState: No results", "tweets": []},
+                },
+            ],
+        }
+        rendered_banned = probe.format_probe_report(all_banned_report)
+        for green_ch in ("✅", "🟢", "🟩", "✔", "🎉"):
+            self.assertNotIn(green_ch, rendered_banned)
+        self.assertIn("🔴", rendered_banned)
 
     def test_headless_burner_session_rejects_monitored_dirs(self):
         for bad in (r"W:\temp\x_myself", r"W:\temp\x_dahao", ""):

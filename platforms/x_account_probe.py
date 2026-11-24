@@ -1100,16 +1100,16 @@ def probe_x_accounts(
 # ==============================================================================
 
 _VERDICT_LABELS: Dict[str, Tuple[str, str]] = {
-    "VISIBLE_OK": ("✅ 搜索可见已恢复", "Search Ban 已解除，可按计划开始低频温和观察/复出。"),
-    "SEARCH_BANNED": ("🚫 仍处于 Search Ban（搜索屏蔽）", "继续保持零写入静默等待，切勿发帖/发评试探。"),
-    "PROFILE_UNAVAILABLE": ("⛔ 主页异常/疑似冻结", "公开主页不可访问，建议登录确认账号安全状态后再决策。"),
-    "OBSERVER_ERROR": ("⚠️ 观察者会话异常（本次结论作废）", "观察者账号本身未就绪或浏览器目录被占用，未产生有效判定。"),
-    "UNCERTAIN": ("❓ 结果存疑（空白对照未通过或超时）", "本次未误判封禁，建议稍后重试；不要据此结论贸然用被测号操作。"),
+    "VISIBLE_OK": ("🟢 ✅ 【已解封】搜索可见已恢复", "Search Ban 已解除，可按计划开始低频温和观察/复出。"),
+    "SEARCH_BANNED": ("🔴 【未解封】仍处于 Search Ban（搜索屏蔽）", "继续保持零写入静默等待，切勿发帖/发评试探。"),
+    "PROFILE_UNAVAILABLE": ("🔴 【异常】主页异常/疑似冻结", "公开主页不可访问，建议登录确认账号安全状态后再决策。"),
+    "OBSERVER_ERROR": ("❌ 【作废】观察者会话异常（本次结论作废）", "观察者账号本身未就绪或浏览器目录被占用，未产生有效判定。"),
+    "UNCERTAIN": ("🔴 【存疑/未解封】空白对照未通过或超时", "本次未判定解封，建议稍后重试；不要据此结论贸然用被测号操作。"),
 }
 
 
 def format_probe_report(report: Dict[str, Any]) -> str:
-    """格式化清晰简明的中文状态报告。"""
+    """格式化清晰简明的中文状态报告（绿色图标仅留给账号真正恢复 `VISIBLE_OK`）。"""
     mode_label = "后台无窗口静默" if report.get("headless", HEADLESS) else "有头窗口"
     browser_label = "已关闭(0残余Chrome占用)" if report.get("observer_ok") else "异常中断"
     lines = [
@@ -1118,11 +1118,11 @@ def format_probe_report(report: Dict[str, Any]) -> str:
         f"观察者目录: {report.get('observer_session_dir', '')} | 浏览器状态: {browser_label}",
     ]
     if report.get("observer_error"):
-        lines.append(f"⚠️ 观察者异常: {report['observer_error']}")
+        lines.append(f"❌ 观察者异常: {report['observer_error']}")
 
     cal = report.get("calibration") or {}
     if cal.get("performed"):
-        cal_text = "✅ 通过" if cal.get("passed") else "❌ 未通过（已自动降级为存疑，防误报）"
+        cal_text = "[有效]（观察者搜索功能正常，非误报）" if cal.get("passed") else "❌ 未通过（已自动降级为存疑，防误报）"
         lines.append(f"空白对照校准 (@{cal.get('control_handle', '')}): {cal_text}")
     else:
         lines.append("空白对照校准: 无需执行（所有已出结果账号均直接搜出帖子或观察者未就绪）")
