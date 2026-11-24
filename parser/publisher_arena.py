@@ -7,7 +7,7 @@
    账号级全局间隔冷却（合并分析与流量帖）并通过 `try_claim_account` 防止双线程并发连发撞车；
    全平台无可用账号时立即跳过，**零 DB 查询、零指标同步、零总编大模型调用**；
 2. 7 天跨文章类型视觉内容去重 (`content_id` dHash + URL + 本地路径) 与 2 小时同账号同币冷却；
-3. 跨平台竞品内容与截图界面分流规范：校验文本竞品词及选中配图 `exchange_ui`，严禁竞品交易所界面发往对方平台，并保留 OKX 排除 OKX 原创帖规范；
+3. 跨平台竞品内容与同源隔离规范：Binance 与 OKX 流量帖均严禁发布同平台来源（`source == target`）的站内洗稿帖，同时校验文本竞品词及选中配图 `exchange_ui`/描述，确保不露出对方平台明显标识；
 4. 总编横向擂台：拉取近 50 条历史战报与互动数据，剥离内部评分后经由 `common.llm_gateway.call_llm_json`
    (`model=None, preset_model_group="medium"`) 选稿，记录真实 `selection_model_used` 并回写数据库。
 """
@@ -43,6 +43,7 @@ from parser.platform_adapters import (
     _safe_get_latest_price,
     has_rival_exchange_ui,
     has_rival_keyword,
+    infer_exchange_ui_from_description,
     logger,
     normalize_exchange_ui,
     score_platform_candidate,
@@ -55,7 +56,6 @@ from parser.post_ingestion import (
     ARTICLE_TYPE_ANALYSIS,
     ARTICLE_TYPE_VIRAL,
     IMAGE_DEDUP_LOOKBACK_HOURS,
-    OKX_SOURCE,
     PUBLISH_MAX_ATTEMPTS,
     PUBLISH_POLL_SECONDS,
     PUBLISH_RULES,
@@ -98,13 +98,21 @@ def _extract_selected_image_exchange_uis(article: Dict[str, Any]) -> List[str]:
         for item in (info.get("image_semantics") or [])
         if isinstance(item, dict) and item.get("id")
     }
+    role_by_id = {
+        item.get("id"): item.get("semantic_role")
+        for item in (info.get("image_semantics") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
     uis: List[str] = []
     for key in placeholders:
         meta = mapping.get(key)
         raw_ui = meta.get("exchange_ui") if isinstance(meta, dict) else None
         if raw_ui is None:
             raw_ui = sem_by_id.get(key)
-        uis.append(normalize_exchange_ui(raw_ui))
+        ui = normalize_exchange_ui(raw_ui)
+        if not ui:
+            ui = infer_exchange_ui_from_description(role_by_id.get(key))
+        uis.append(ui)
     return uis
 
 
@@ -292,10 +300,13 @@ def _collect_publish_candidates(
             stats["attempts"] += 1
             continue
 
-        # 跨平台流量分发规范：OKX 仅搬运 Binance 高流量爆款，避免发 OKX 原创同源帖
-        if viral and platform == PLATFORM_OKX:
+        # 【保留过滤原因说明】严禁同平台搬运：单帖洗稿流量帖若原帖来源与目标发布平台相同（或来源缺失），
+        # 极易触发站内原图指纹/同源查重限流；Binance 仅发异源帖（如 OKX），OKX 仅发异源帖（如 Binance），
+        # 并叠加竞品词与竞品图界面过滤，确保不露出对方平台明显标识。
+        target_platform = str(platform or "").strip().lower()
+        if viral and target_platform in (PLATFORM_BINANCE, PLATFORM_OKX):
             article_source = str(article.get("source") or "").strip().lower()
-            if article_source == OKX_SOURCE.lower():
+            if not article_source or article_source == target_platform:
                 stats["source_conflict"] += 1
                 continue
 

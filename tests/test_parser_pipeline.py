@@ -35,6 +35,7 @@ from parser.platform_adapters import (
     _format_viral_post_content,
     has_rival_exchange_ui,
     has_rival_keyword,
+    infer_exchange_ui_from_description,
     normalize_exchange_ui,
     score_platform_candidate,
     score_platform_candidate_form,
@@ -236,6 +237,7 @@ class TestPublishStateStore(unittest.TestCase):
 class TestPlatformAdapters(unittest.TestCase):
     def test_has_rival_keyword(self):
         self.assertTrue(has_rival_keyword("binance", "我在 OKX 上交易"))
+        self.assertTrue(has_rival_keyword("binance", "我在 OKEX 交易"))
         self.assertTrue(has_rival_keyword("binance", "欧易最新公告"))
         self.assertTrue(has_rival_keyword("binance", "欧意最新公告"))
         self.assertTrue(has_rival_keyword("binance", "Bybit 跟单爆了"))
@@ -248,6 +250,10 @@ class TestPlatformAdapters(unittest.TestCase):
         self.assertFalse(has_rival_keyword("binance", "Binance BTC setup"))
         self.assertFalse(has_rival_keyword("binance", "navigate this high volatility"))
         self.assertTrue(has_rival_keyword("okx", "在币安看到一个信号"))
+        self.assertTrue(has_rival_keyword("okx", "Binance 合约截图"))
+        self.assertTrue(has_rival_keyword("okx", "Bybit 跟单翻车"))
+        self.assertTrue(has_rival_keyword("okx", "Bitget 账户爆仓"))
+        self.assertTrue(has_rival_keyword("okx", "火币老图"))
         self.assertFalse(has_rival_keyword("okx", "OKX ETH setup"))
         self.assertFalse(has_rival_keyword("okx", "$BNB 突破前高"))
 
@@ -262,6 +268,11 @@ class TestPlatformAdapters(unittest.TestCase):
         self.assertEqual(normalize_exchange_ui("欧易"), "okx")
         self.assertEqual(normalize_exchange_ui("Bybit"), "bybit")
         self.assertEqual(normalize_exchange_ui("某不知名App 界面"), "other")
+
+        self.assertEqual(infer_exchange_ui_from_description("展示币安广场创作者卡片与收益"), "binance")
+        self.assertEqual(infer_exchange_ui_from_description("欧易 App 永续持仓页截图"), "okx")
+        self.assertEqual(infer_exchange_ui_from_description("Bybit contract page"), "bybit")
+        self.assertEqual(infer_exchange_ui_from_description("TradingView K线图，右下角有 @张三 水印"), "")
 
         self.assertFalse(has_rival_exchange_ui("binance", ["", "binance"]))
         self.assertTrue(has_rival_exchange_ui("binance", ["binance", "okx"]))
@@ -729,9 +740,18 @@ class TestPublisherArena(unittest.TestCase):
             img_clean = _create_tiny_png(Path(tmp), "ui_clean.png")
             img_legacy = _create_tiny_png(Path(tmp), "ui_legacy.png")
 
-            def _make_viral(aid, img_path, ui, post_text, orig_text="原帖提到 $JCT", source="binance", include_ui_field=True):
+            def _make_viral(
+                aid,
+                img_path,
+                ui,
+                post_text,
+                orig_text="原帖提到 $JCT",
+                source="okx",
+                include_ui_field=True,
+                semantic_role="截图",
+            ):
                 meta = {"local_path": img_path, "original_url": f"https://img/{aid}.png", "content_id": f"cid_{aid}"}
-                sem = {"id": "[IMAGE_1]", "semantic_role": "截图", "keep": True}
+                sem = {"id": "[IMAGE_1]", "semantic_role": semantic_role, "keep": True}
                 if include_ui_field:
                     meta["exchange_ui"] = ui
                     sem["exchange_ui"] = ui
@@ -756,18 +776,28 @@ class TestPublisherArena(unittest.TestCase):
                     "publish_records": {},
                 }
 
-            arts = [
-                _make_viral("v_okx_ui", img_okx, "okx", "麻吉大哥昨晚又加仓爆掉 2000 万刀"),
-                _make_viral("v_bn_ui", img_bn, "binance", "SOL 跌破前低引发连环止损"),
-                _make_viral("v_clean", img_clean, "", "昨晚全网吃瓜现场"),
-                _make_viral("v_legacy", img_legacy, "", "$ETH 资金费率转负了", include_ui_field=False),
+            bn_pool = [
+                _make_viral("v_okx_ui", img_okx, "okx", "麻吉大哥昨晚又加仓爆掉 2000 万刀", source="x"),
+                _make_viral(
+                    "v_role_okx",
+                    img_okx,
+                    "",
+                    "山顶套牢图",
+                    source="okx",
+                    semantic_role="欧易 App 永续持仓页截图",
+                ),
+                _make_viral("v_same_bn", img_clean, "", "币安站内原帖", source="binance"),
+                _make_viral("v_bn_ui", img_bn, "binance", "SOL 跌破前低引发连环止损", source="okx"),
+                _make_viral("v_clean", img_clean, "", "昨晚全网吃瓜现场", source="okx"),
+                _make_viral("v_legacy", img_legacy, "", "$ETH 资金费率转负了", source="okx", include_ui_field=False),
             ]
             mock_mgr = MagicMock()
-            mock_mgr.find_articles.return_value = arts
+            mock_mgr.find_articles.return_value = bn_pool
             mock_mgr.db = MagicMock()
 
             bn_cands, _, bn_stats = _collect_publish_candidates(mock_mgr, "binance", ["JCT"], set(), ARTICLE_TYPE_VIRAL)
-            self.assertEqual(bn_stats["rival_image_ui"], 1)
+            self.assertEqual(bn_stats["rival_image_ui"], 2)
+            self.assertEqual(bn_stats["source_conflict"], 1)
             bn_by_id = {c[0]["article_id"]: c[2] for c in bn_cands}
             self.assertEqual(set(bn_by_id.keys()), {"v_bn_ui", "v_clean", "v_legacy"})
             # Original noisy JCT does NOT pollute clean post_text; SOL & ETH extracted cleanly; pure story keeps ""
@@ -775,8 +805,25 @@ class TestPublisherArena(unittest.TestCase):
             self.assertEqual(bn_by_id["v_clean"], "")
             self.assertEqual(bn_by_id["v_legacy"], "ETH")
 
+            okx_pool = [
+                _make_viral("v_okx_ui", img_okx, "okx", "麻吉大哥昨晚又加仓爆掉 2000 万刀", source="binance"),
+                _make_viral("v_bn_ui", img_bn, "binance", "SOL 跌破前低引发连环止损", source="binance"),
+                _make_viral(
+                    "v_role_bn",
+                    img_bn,
+                    "",
+                    "行情异动图",
+                    source="binance",
+                    semantic_role="币安广场创作者带单主页截图",
+                ),
+                _make_viral("v_same_okx", img_clean, "", "欧易站内原帖", source="okx"),
+                _make_viral("v_clean", img_clean, "", "昨晚全网吃瓜现场", source="binance"),
+                _make_viral("v_legacy", img_legacy, "", "$ETH 资金费率转负了", source="binance", include_ui_field=False),
+            ]
+            mock_mgr.find_articles.return_value = okx_pool
             okx_cands, _, okx_stats = _collect_publish_candidates(mock_mgr, "okx", ["JCT"], set(), ARTICLE_TYPE_VIRAL)
-            self.assertEqual(okx_stats["rival_image_ui"], 1)
+            self.assertEqual(okx_stats["rival_image_ui"], 2)
+            self.assertEqual(okx_stats["source_conflict"], 1)
             okx_ids = {c[0]["article_id"] for c in okx_cands}
             self.assertEqual(okx_ids, {"v_okx_ui", "v_clean", "v_legacy"})
 
@@ -787,7 +834,7 @@ class TestPublisherArena(unittest.TestCase):
             art = {
                 "_id": "mongo_1",
                 "article_id": "art_claim",
-                "source": "binance",
+                "source": "okx",
                 "type": ARTICLE_TYPE_VIRAL,
                 "prompt_version": prompt_version,
                 "status": "ok",
@@ -829,6 +876,7 @@ class TestPublisherArena(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             img_b = _create_tiny_png(Path(tmp), "bin.png")
             img_o = _create_tiny_png(Path(tmp), "okx.png")
+            img_u = _create_tiny_png(Path(tmp), "unk.png")
             art_binance = {
                 "source": "binance",
                 "type": ARTICLE_TYPE_VIRAL,
@@ -865,21 +913,92 @@ class TestPublisherArena(unittest.TestCase):
                 },
                 "publish_records": {},
             }
+            art_unknown_src = {
+                "source": "",
+                "type": ARTICLE_TYPE_VIRAL,
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "creation_brief": {"original_post": {"text_content": "未知来源"}},
+                "post_id_list": ["u1"],
+                "article_info": {
+                    "status": "ok",
+                    "usable": True,
+                    "post_text": "来源缺失测试帖",
+                    "selected_images": ["[IMAGE_1]"],
+                    "viral_score": 9.0,
+                    "bait_comments": ["啊"],
+                    "image_mapping": {"[IMAGE_1]": {"local_path": img_u, "original_url": "https://u/1.png", "content_id": "cid_u"}},
+                },
+                "publish_records": {},
+            }
             mock_mgr = MagicMock()
-            mock_mgr.find_articles.return_value = [art_okx, art_binance]
+            mock_mgr.find_articles.return_value = [art_okx, art_binance, art_unknown_src]
             mock_mgr.db = MagicMock()
 
-            cands, raw_cnt, stats = _collect_publish_candidates(
+            okx_cands, okx_raw, okx_stats = _collect_publish_candidates(
                 mock_mgr,
                 "okx",
                 ["BTC"],
                 set(),
                 ARTICLE_TYPE_VIRAL,
             )
-            self.assertEqual(raw_cnt, 2)
-            self.assertEqual(stats["source_conflict"], 1)
-            self.assertEqual(len(cands), 1)
-            self.assertEqual(cands[0][0]["source"], "binance")
+            self.assertEqual(okx_raw, 3)
+            self.assertEqual(okx_stats["source_conflict"], 2)
+            self.assertEqual(len(okx_cands), 1)
+            self.assertEqual(okx_cands[0][0]["source"], "binance")
+
+            # Binance 仅发异源流量帖（跳过 binance 与空来源），保留 okx 来源
+            art_okx_clean = {
+                **art_okx,
+                "article_info": {**art_okx["article_info"], "post_text": "大盘突现异常波动"},
+            }
+            mock_mgr.find_articles.return_value = [art_okx_clean, art_binance, art_unknown_src]
+            bn_cands, bn_raw, bn_stats = _collect_publish_candidates(
+                mock_mgr,
+                "binance",
+                ["BTC"],
+                set(),
+                ARTICLE_TYPE_VIRAL,
+            )
+            self.assertEqual(bn_raw, 3)
+            self.assertEqual(bn_stats["source_conflict"], 2)
+            self.assertEqual(len(bn_cands), 1)
+            self.assertEqual(bn_cands[0][0]["source"], "okx")
+
+            # 多源合成分析帖不受 source_conflict 拦截
+            art_analysis = {
+                "source": "binance",
+                "type": ARTICLE_TYPE_ANALYSIS,
+                "topic": "BTC",
+                "prompt_version": prompt_version,
+                "status": "ok",
+                "article_info": {
+                    "status": "ok",
+                    "text": "$BTC 多维分析正文",
+                    "image_placeholders": ["[ASSET_IMG_1]"],
+                    "score": 8.8,
+                    "god_comments": ["稳健"],
+                    "image_mapping": {
+                        "[ASSET_IMG_1]": {
+                            "local_path": img_b,
+                            "original_url": "https://b/a1.png",
+                            "content_id": "cid_a1",
+                            "exchange_ui": "binance",
+                        }
+                    },
+                },
+                "publish_records": {},
+            }
+            mock_mgr.find_articles.return_value = [art_analysis]
+            an_cands, _, an_stats = _collect_publish_candidates(
+                mock_mgr,
+                "binance",
+                ["BTC"],
+                set(),
+                ARTICLE_TYPE_ANALYSIS,
+            )
+            self.assertEqual(an_stats["source_conflict"], 0)
+            self.assertEqual(len(an_cands), 1)
 
     def test_ranking_favors_multi_img_and_no_18h_penalty(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -927,7 +1046,6 @@ class TestPublisherArena(unittest.TestCase):
                 "publish_records": {},
             }
             mock_mgr = MagicMock()
-            mock_mgr.find_articles.return_value = [art_short_1img, art_multi_2img]
             mock_mgr.db = MagicMock()
             mock_post_col = MagicMock()
             mock_post_col.find.return_value = [
@@ -941,7 +1059,12 @@ class TestPublisherArena(unittest.TestCase):
                     {"post_id": "p_short", "publish_time": now - 3600, "engagement": {"view_count": 5000}},
                     {"post_id": "p_multi", "publish_time": now - 22 * 3600, "engagement": {"view_count": 5000}},
                 ]
+                mock_mgr.find_articles.return_value = [
+                    {**art_short_1img, "source": "okx"},
+                    {**art_multi_2img, "source": "okx"},
+                ]
                 cands_bn, _, _ = _collect_publish_candidates(mock_mgr, "binance", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
+                mock_mgr.find_articles.return_value = [art_short_1img, art_multi_2img]
                 cands_okx, _, _ = _collect_publish_candidates(mock_mgr, "okx", ["BTC"], set(), ARTICLE_TYPE_VIRAL)
             self.assertEqual([c[0]["article_id"] for c in cands_bn], ["v_multi2", "v_short1"])
             # OKX keeps neutral 0.0 platform bias -> raw viral_score 9.2 stays ahead of 8.5 (decoupled from Binance)
@@ -1131,7 +1254,7 @@ class TestPublisherArena(unittest.TestCase):
             art = {
                 "_id": "mongo_waf",
                 "article_id": "art_waf",
-                "source": "binance",
+                "source": "okx",
                 "type": ARTICLE_TYPE_VIRAL,
                 "prompt_version": prompt_version,
                 "status": "ok",

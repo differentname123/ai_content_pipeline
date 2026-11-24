@@ -94,7 +94,7 @@
 
 ### 严格禁止的 5 件事（红线清单）
 1. **严禁重启矩阵互赞/互评（`hudong` 保持关闭）**：绝不用自有小号互相点赞、评论、收藏刷交互数据。
-2. **严禁跨平台混发竞品界面图或竞品词**：向 Binance 发帖严禁带 OKX/Bybit 等 UI 截图及 `okx / 欧易 / okb` 等关键词；向 OKX 发帖严禁带 Binance UI 截图及 `binance / 币安`。
+2. **严禁同源站内搬运与混发竞品界面/关键词**：严格实行对称跨平台分流——流量帖在 Binance 端仅发异源帖（如 OKX 来源）、OKX 端仅发异源帖（如 Binance 来源），单平台严禁发布同源洗稿帖；向 Binance 发帖严禁带 OKX/OKEX/Bybit/Bitget/HTX/MEXC/Gate.io 等竞品 UI 截图及 `okx / okex / 欧易 / 欧意 / okb / 火币` 等关键词；向 OKX 发帖严禁带 Binance 等竞品 UI 截图及 `binance / 币安 / bybit / bitget / htx / 火币` 等关键词（多源合成分析帖 `analysis` 不受 `source_conflict` 限制，仍严格校验竞品词与竞品 UI）。
 3. **严禁同账号在 2 小时内连续发帖**（无论是 `分析 + 流量` 还是同类型连发）。
 4. **严禁发“语言池错配”与“绝对收益承诺”账号人设**：中文号 `accountLang` 必须为 `"cn"`；账号简介严禁出现“100% 胜率”“稳赚印钞机”等诱导性收益承诺（如 `ruru` 当前简介需改为中性表述）。
 5. **慎重合规过滤（只拦实质违规，严禁按形式大面积误杀）**：
@@ -147,7 +147,7 @@
 
 | 实证规则 | 落地代码 / 提示词位置 |
 | :--- | :--- |
-| 生成与发布解耦：按目标平台分布规律形态打分与跨平台界面/关键词拦截 | [platform_adapters.py](parser/platform_adapters.py)（`score_candidate_form` / `score_platform_candidate_form` / `normalize_exchange_ui` / `has_rival_exchange_ui` / `has_rival_keyword`）、[publisher_arena.py](parser/publisher_arena.py) |
+| 生成与发布解耦：对称跨平台同源隔离（A 平台仅发 B 平台流量帖）、按目标平台形态打分与竞品图界面（含 `semantic_role` 兜底识别）/关键词拦截 | [platform_adapters.py](parser/platform_adapters.py)（`score_candidate_form` / `score_platform_candidate_form` / `normalize_exchange_ui` / `infer_exchange_ui_from_description` / `has_rival_exchange_ui` / `has_rival_keyword`）、[publisher_arena.py](parser/publisher_arena.py) |
 | 生成层保持平台中立与纯正质量（无 `<100` 注水限制、无 `1.35x` 偏置、去空评论、权重/时效透传） | [article_generator.py](parser/article_generator.py)（`transform_mlus` / `build_article_task` / `extract_valid_viral_posts` / `build_viral_article_task`） |
 | 反注水与保护极简高爆发短梗、淘汰残缺单图与 AI 说教套话 | [内容生成方案_娱乐类_单帖洗稿和神评生成.txt](prompt/内容生成方案_娱乐类_单帖洗稿和神评生成.txt)、[内容生成方案_娱乐类_发布前总编精选.txt](prompt/内容生成方案_娱乐类_发布前总编精选.txt)、[内容生成方案_分析类_发布前总编精选.txt](prompt/内容生成方案_分析类_发布前总编精选.txt) |
 | 异常号 `qiqi` 隔离与零网络健康守卫 + 账号级合并冷却 | [common_utils.py](common/common_utils.py)（`BINANCE_ACCOUNTS`）、[config.py](parser/config.py)、[publish_state.py](parser/publish_state.py)、[publisher_arena.py](parser/publisher_arena.py) |

@@ -42,7 +42,17 @@ logger = setup_logger(app_name="media_format")
 BEIJING_TZ = timezone(timedelta(hours=8))
 COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
 _BINANCE_RIVAL_OKB_PATTERN = re.compile(r"(?<![a-z0-9])okb(?![a-z0-9])")
-_BINANCE_RIVAL_ENGLISH_BRANDS = re.compile(r"(?<![a-z0-9])(okx|bybit|bitget|htx|mexc|gate\.io)(?![a-z0-9])")
+_BINANCE_RIVAL_ENGLISH_BRANDS = re.compile(r"(?<![a-z0-9])(okx|okex|bybit|bitget|htx|mexc|gate\.io)(?![a-z0-9])")
+_OKX_RIVAL_ENGLISH_BRANDS = re.compile(r"(?<![a-z0-9])(binance|bybit|bitget|htx|mexc|gate\.io)(?![a-z0-9])")
+_DESC_UI_RULES: Tuple[Tuple[str, Tuple[str, ...], Optional[re.Pattern]], ...] = (
+    ("binance", ("币安",), re.compile(r"(?<![a-z0-9])binance(?![a-z0-9])")),
+    ("okx", ("欧易", "欧意"), re.compile(r"(?<![a-z0-9])(okx|okex)(?![a-z0-9])")),
+    ("bybit", (), re.compile(r"(?<![a-z0-9])bybit(?![a-z0-9])")),
+    ("bitget", (), re.compile(r"(?<![a-z0-9])bitget(?![a-z0-9])")),
+    ("htx", ("火币",), re.compile(r"(?<![a-z0-9])htx(?![a-z0-9])")),
+    ("mexc", (), re.compile(r"(?<![a-z0-9])mexc(?![a-z0-9])")),
+    ("gate.io", (), re.compile(r"(?<![a-z0-9])gate\.io(?![a-z0-9])")),
+)
 BINANCE_CORE_ANALYSIS_COINS = ("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "FIL", "DOT")
 _EMPTY_EXCHANGE_UI_VALUES = {"none", "null", "unknown", "n/a", "na", "无", "无交易所", "未知"}
 _EXCHANGE_UI_ALIASES = {
@@ -133,6 +143,17 @@ def normalize_exchange_ui(value: Any) -> str:
     return "other"
 
 
+def infer_exchange_ui_from_description(description: Any) -> str:
+    """当结构化 `exchange_ui` 漏标为空时，从图片语义描述中兜底识别明确露出的交易所品牌名。"""
+    if not isinstance(description, str) or not description.strip():
+        return ""
+    lower = description.lower()
+    for ui, zh_terms, en_pattern in _DESC_UI_RULES:
+        if any(term in lower for term in zh_terms) or (en_pattern is not None and en_pattern.search(lower)):
+            return ui
+    return ""
+
+
 def has_rival_exchange_ui(platform: str, exchange_ui_list: Sequence[Any]) -> bool:
     """仅对交易所内容平台（Binance / OKX）拦截明确露出竞品交易所界面的配图；X 等非交易所平台放行。"""
     target = str(platform or "").strip().lower()
@@ -158,7 +179,11 @@ def has_rival_keyword(platform: str, text: str) -> bool:
             or bool(_BINANCE_RIVAL_OKB_PATTERN.search(lower))
         )
     if platform == PLATFORM_OKX:
-        return "binance" in lower or "币安" in lower
+        return (
+            "币安" in lower
+            or "火币" in lower
+            or bool(_OKX_RIVAL_ENGLISH_BRANDS.search(lower))
+        )
     return False
 
 
