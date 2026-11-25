@@ -1709,5 +1709,212 @@ class TestPromptAbstractionHygiene(unittest.TestCase):
                 self.assertNotIn(quota, text, f"Found platform-coupled quota {quota!r} in generation prompt {pname}")
 
 
+class TestTelemetryAndMetricsTimeline(unittest.TestCase):
+    def test_emit_telemetry_event_writes_jsonl_and_never_raises(self):
+        from parser.telemetry import TELEMETRY_LOG_FILE, emit_telemetry_event, reset_telemetry_handler_for_test
+
+        orig_path = TELEMETRY_LOG_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_log = str(Path(tmp) / "events.jsonl")
+            reset_telemetry_handler_for_test(tmp_log)
+            try:
+                ok = emit_telemetry_event("publish_result", {"platform": "binance", "post_id": "123", "unused": None}, now_ts=1_800_000_000.0)
+                self.assertTrue(ok)
+                reset_telemetry_handler_for_test(orig_path)
+                lines = Path(tmp_log).read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(lines), 1)
+                obj = json.loads(lines[0])
+                self.assertEqual(obj["event"], "publish_result")
+                self.assertEqual(obj["platform"], "binance")
+                self.assertEqual(obj["post_id"], "123")
+                self.assertNotIn("unused", obj)
+                # Invalid path should swallow I/O errors cleanly and return False
+                bad_ok = emit_telemetry_event("test_err", {"a": 1}, log_path=str(Path(tmp)))
+                self.assertFalse(bad_ok)
+            finally:
+                reset_telemetry_handler_for_test(orig_path)
+
+    def test_metrics_timeline_records_growth_curve_dedups_and_caps(self):
+        now = 1_800_000_000.0
+        pub_t = now - 1800  # 30m old -> 15m interval
+        docs = [
+            {
+                "article_id": "a_curve",
+                "type": ARTICLE_TYPE_VIRAL,
+                "article_info": {"post_text": "冷启动曲线样本"},
+                "publish_records": {"binance": {"post_id": "201", "published_by": "myself", "publish_time": pub_t, "view_count": None}},
+            },
+            {
+                "article_id": "a_del",
+                "type": ARTICLE_TYPE_VIRAL,
+                "article_info": {"post_text": "被删样本"},
+                "publish_records": {"binance": {"post_id": "202", "published_by": "ruru", "publish_time": pub_t, "view_count": None}},
+            },
+            {
+                "article_id": "a_okx_miss",
+                "type": ARTICLE_TYPE_VIRAL,
+                "article_info": {"post_text": "OKX 审核未过样本"},
+                "publish_records": {"okx": {"post_id": "301", "published_by": "nana", "publish_time": pub_t, "view_count": None}},
+            },
+        ]
+        mock_mgr = MagicMock(spec=["upsert_articles"])
+
+        def _fake_bn(pid):
+            if pid == "201":
+                return {
+                    "contentStatus": 2,
+                    "viewCount": 120,
+                    "likeCount": 1,
+                    "commentCount": 0,
+                    "shareCount": 2,
+                    "recommend": True,
+                    "lan": "cn",
+                    "detectedLang": "zh-CN",
+                    "coinPairList": ["$BTC "],
+                    "tradeWidgets": [{"coin": "BTC"}],
+                }
+            return None
+
+        with patch("parser.platform_adapters.fetch_binance_post_detail", side_effect=_fake_bn), \
+             patch("parser.platform_adapters.emit_telemetry_event") as mock_emit:
+            sync_published_metrics(mock_mgr, "binance", docs[:2], now_ts=now)
+            # Within 5 minutes (less than 8m min gap), same state -> no duplicate timeline point even if forced
+            sync_published_metrics(mock_mgr, "binance", docs[:1], now_ts=now + 300)
+            # 16 minutes later -> passes 15m early refresh interval and appends point 2
+            with patch("parser.platform_adapters.fetch_binance_post_detail", return_value={"contentStatus": 2, "viewCount": 195, "likeCount": 2, "commentCount": 1, "shareCount": 2, "recommend": True}):
+                sync_published_metrics(mock_mgr, "binance", docs[:1], now_ts=now + 960)
+
+        rec = docs[0]["publish_records"]["binance"]
+        self.assertEqual(rec["live_state"], "ok")
+        self.assertEqual(rec["share_count"], 2)
+        self.assertEqual(rec["coin_pair_list"], ["$BTC "])
+        self.assertEqual(rec["trade_widget_count"], 1)
+        self.assertEqual(len(rec["metrics_timeline"]), 2)
+        self.assertEqual([pt["v"] for pt in rec["metrics_timeline"]], [120, 195])
+        # Second emit on post 201 should compute delta_v = 75
+        deltas = [call.args[1].get("delta_v") for call in mock_emit.call_args_list if call.args[1].get("post_id") == "201"]
+        self.assertIn(75, deltas)
+        self.assertEqual(docs[1]["publish_records"]["binance"]["live_state"], "deleted")
+
+        with patch("parser.platform_adapters.fetch_okx_post_detail", return_value=None), \
+             patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "okx", docs[2:], now_ts=now)
+        self.assertEqual(docs[2]["publish_records"]["okx"]["live_state"], "missing")
+
+        # Cap check: pre-populate 24 points and append 25th -> capped at 24
+        rec["metrics_timeline"] = [{"ts": int(now + i * 600), "age_m": float(i * 10), "v": i, "state": "ok", "status": 2, "rec": True} for i in range(24)]
+        with patch("parser.platform_adapters.fetch_binance_post_detail", return_value={"contentStatus": 2, "viewCount": 999, "likeCount": 3, "commentCount": 1, "shareCount": 2, "recommend": True}), \
+             patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", docs[:1], now_ts=now + 24 * 600 + 7500)
+        self.assertEqual(len(rec["metrics_timeline"]), 24)
+        self.assertEqual(rec["metrics_timeline"][-1]["v"], 999)
+
+    def test_persist_publish_result_writes_publish_snapshot_and_telemetry(self):
+        from parser.publisher_arena import _persist_publish_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountPublishStateStore(str(Path(tmp) / "pub_snap.json"))
+            now = 1_800_000_000.0
+            art = {
+                "article_id": "art_snap_1",
+                "source": "okx",
+                "model_name": "gpt-6-luna",
+                "prompt_version": prompt_version,
+                "post_id_list": ["src_okx_1"],
+                "article_info": {
+                    "selected_images": ["[IMAGE_1]"],
+                    "image_mapping": {"[IMAGE_1]": {"exchange_ui": ""}},
+                },
+                "_selection_meta": {
+                    "prompt_version": "sel-v1",
+                    "reason": "anti-clutter",
+                    "model_used": "editor-m1",
+                    "candidate_pool_size": 18,
+                    "selected_candidate_no": 3,
+                    "platform_fit_score": 1.2,
+                },
+                "_source_engagement": {"view_count": 12000, "like_count": 88, "comment_count": 19},
+                "_source_publish_time": now - 5 * 3600,
+            }
+            mock_mgr = MagicMock(spec=["upsert_articles"])
+            acc_state: Dict[str, Any] = {}
+            rec: Dict[str, Any] = {}
+            with patch("parser.publisher_arena.emit_telemetry_event") as mock_emit:
+                _persist_publish_result(
+                    mock_mgr,
+                    "binance",
+                    "myself",
+                    acc_state,
+                    art,
+                    rec,
+                    True,
+                    "3990001",
+                    1,
+                    now,
+                    "搞钱与盈亏",
+                    None,
+                    None,
+                    ARTICLE_TYPE_VIRAL,
+                    "BTC",
+                    state_store=store,
+                    final_char_len=145,
+                    final_img_cnt=2,
+                )
+            snap = rec["publish_snapshot"]
+            self.assertEqual(snap["source_platform"], "okx")
+            self.assertEqual(snap["source_views"], 12000)
+            self.assertEqual(snap["source_delay_hours"], 5.0)
+            self.assertEqual(snap["arena_pool_size"], 18)
+            self.assertEqual(snap["arena_rank"], 3)
+            self.assertEqual(snap["final_char_len"], 145)
+            self.assertEqual(snap["final_img_cnt"], 2)
+            mock_emit.assert_called_once()
+            self.assertEqual(mock_emit.call_args.args[0], "publish_result")
+
+    def test_sync_recent_metrics_once_and_report_builder(self):
+        from parser.maintenance_tasks import build_publish_telemetry_report, sync_recent_metrics_once
+
+        now = 1_800_000_000.0
+        bn_doc = {
+            "article_id": "a_rep_1",
+            "type": ARTICLE_TYPE_VIRAL,
+            "source": "okx",
+            "status": "ok",
+            "article_info": {"post_text": "测试报告帖"},
+            "publish_records": {
+                "binance": {
+                    "status": "success",
+                    "published_by": "myself",
+                    "publish_time": now - 3600,
+                    "post_id": "9001",
+                    "view_count": 320,
+                    "like_count": 2,
+                    "comment_count": 1,
+                    "share_count": 0,
+                    "recommend": True,
+                    "content_status": 2,
+                    "live_state": "ok",
+                    "platform_fit_score": 1.2,
+                    "metrics_synced_at": now - 100,
+                    "metrics_timeline": [
+                        {"ts": int(now - 2400), "age_m": 20.0, "v": 150, "state": "ok"},
+                        {"ts": int(now - 100), "age_m": 58.3, "v": 320, "state": "ok"},
+                    ],
+                    "publish_snapshot": {"source_views": 25000},
+                }
+            },
+        }
+        mock_mgr = MagicMock(spec=["find_articles", "upsert_articles"])
+        mock_mgr.find_articles.side_effect = [[bn_doc], [], [bn_doc], []]
+        with patch("parser.platform_adapters.fetch_binance_post_detail", return_value=None):
+            summary = sync_recent_metrics_once(mock_mgr, lookback_hours=24, now_ts=now)
+        self.assertEqual(summary["binance"]["scanned"], 1)
+        self.assertEqual(summary["okx"]["scanned"], 0)
+        report = build_publish_telemetry_report(mock_mgr, hours=24, sync_first=False, now_ts=now)
+        self.assertIn("pid=9001", report)
+        self.assertIn("20m:150 -> 58m:320", report)
+        self.assertIn("分组汇总", report)
+
+
 if __name__ == "__main__":
     unittest.main()

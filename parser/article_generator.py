@@ -33,6 +33,7 @@ from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPost
 from parser.config import ANALYSIS_GENERATION_INTERVAL_SECONDS
 from parser.mlu_pipeline import _resolve_prompt_pair, run_concurrent_screening_batches
 from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _log, get_hot_coin, logger, normalize_exchange_ui
+from parser.telemetry import emit_telemetry_event
 from parser.post_ingestion import (
     ARTICLE_CONCURRENCY,
     ARTICLE_GENERATION_INTERVAL_SECONDS,
@@ -1395,6 +1396,7 @@ def generate_analysis_articles_once() -> List[Dict[str, Any]]:
     )
     results, raised, model_skips = _execute_article_tasks(tasks, execute_article_task, manager, "单币分析")
     counts = Counter(item.get("status") for item in results)
+    elapsed_s = round(time.monotonic() - started, 2)
     _log(
         "单币分析/汇总",
         "本轮单币分析生成结束",
@@ -1403,7 +1405,19 @@ def generate_analysis_articles_once() -> List[Dict[str, Any]]:
         模型跳过=model_skips,
         论据不足跳过=local_skips,
         失败=counts["error"] + raised,
-        耗时=f"{time.monotonic() - started:.2f}s",
+        耗时=f"{elapsed_s:.2f}s",
+    )
+    emit_telemetry_event(
+        "gen_round",
+        {
+            "stage": "analysis",
+            "total": len(tasks) - local_skips,
+            "ok": counts["ok"],
+            "skip": model_skips,
+            "local_skip": local_skips,
+            "err": counts["error"] + raised,
+            "elapsed_s": elapsed_s,
+        },
     )
     return results
 
@@ -1429,6 +1443,7 @@ def generate_viral_articles_once() -> List[Dict[str, Any]]:
     )
     results, raised, _ = _execute_article_tasks(tasks, execute_viral_article_task, manager, "高流量")
     counts = Counter(item.get("status") for item in results)
+    elapsed_s = round(time.monotonic() - started, 2)
     _log(
         "高流量/汇总",
         "本轮精改结束",
@@ -1436,7 +1451,18 @@ def generate_viral_articles_once() -> List[Dict[str, Any]]:
         成功=counts["ok"],
         二阶段淘汰=counts["skip"],
         失败=counts["error"] + raised,
-        耗时=f"{time.monotonic() - started:.2f}s",
+        耗时=f"{elapsed_s:.2f}s",
+    )
+    emit_telemetry_event(
+        "gen_round",
+        {
+            "stage": "viral",
+            "total": len(tasks),
+            "ok": counts["ok"],
+            "skip": counts["skip"],
+            "err": counts["error"] + raised,
+            "elapsed_s": elapsed_s,
+        },
     )
     return results
 

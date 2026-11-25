@@ -69,6 +69,7 @@ from parser.publish_state import (
     classify_infra_backoff_error,
     default_state_store,
 )
+from parser.telemetry import emit_telemetry_event
 from platforms.playwright_base import ChallengeRequiredError
 
 
@@ -371,6 +372,7 @@ def _collect_publish_candidates(
             pid_str = str((art.get("post_id_list") or [""])[0])
             eng = eng_map.get(pid_str) or {}
             art["_source_engagement"] = eng
+            art["_source_publish_time"] = src_pub_time_map.get(pid_str)
             views = int(eng.get("view_count", 0) or 0)
             likes = int(eng.get("like_count", 0) or 0)
             comments = int(eng.get("comment_count", 0) or 0)
@@ -676,12 +678,15 @@ def _persist_publish_result(
     matched_coin: Optional[str] = None,
     *,
     state_store: Optional[AccountPublishStateStore] = None,
+    final_char_len: Optional[int] = None,
+    final_img_cnt: Optional[int] = None,
 ) -> str:
     """持久化账号状态与数据库 `publish_records`。"""
     store = state_store or default_state_store
     viral = article_type == ARTICLE_TYPE_VIRAL
     error_detail = ""
     problems, saved = [], []
+    sel_meta = article.get("_selection_meta") or {}
 
     try:
         if success:
@@ -708,7 +713,6 @@ def _persist_publish_result(
             plat_record.setdefault("interacted", False)
             plat_record.setdefault("interaction_time", None)
             plat_record.setdefault("comment_interact_info", {})
-            sel_meta = article.get("_selection_meta") or {}
             if sel_meta.get("prompt_version"):
                 plat_record["selection_prompt_version"] = sel_meta["prompt_version"]
             if sel_meta.get("reason"):
@@ -719,6 +723,38 @@ def _persist_publish_result(
                 plat_record["platform_fit_score"] = sel_meta["platform_fit_score"]
             if sel_meta.get("platform_fit_breakdown"):
                 plat_record["platform_fit_breakdown"] = sel_meta["platform_fit_breakdown"]
+
+            publish_snapshot: Dict[str, Any] = {
+                "article_type": article_type,
+                "prompt_version": article.get("prompt_version"),
+                "gen_model": article.get("model_name"),
+                "source_platform": article.get("source"),
+                "source_post_ids": [str(x) for x in (article.get("post_id_list") or [])[:5]],
+                "selected_image_uis": _extract_selected_image_exchange_uis(article),
+                "arena_pool_size": sel_meta.get("candidate_pool_size"),
+                "arena_rank": sel_meta.get("selected_candidate_no"),
+                "final_char_len": final_char_len,
+                "final_img_cnt": final_img_cnt,
+            }
+            if viral:
+                src_eng = article.get("_source_engagement") or {}
+                if isinstance(src_eng, dict):
+                    publish_snapshot["source_views"] = src_eng.get("view_count")
+                    publish_snapshot["source_likes"] = src_eng.get("like_count")
+                    publish_snapshot["source_comments"] = src_eng.get("comment_count")
+                raw_src_pt = article.get("_source_publish_time")
+                if raw_src_pt is not None and not isinstance(raw_src_pt, bool):
+                    try:
+                        src_pt = float(raw_src_pt)
+                        if src_pt > 1e11:
+                            src_pt /= 1000.0
+                        if src_pt > 0:
+                            publish_snapshot["source_delay_hours"] = round(max(0.0, now - src_pt) / 3600.0, 1)
+                    except (TypeError, ValueError):
+                        pass
+            plat_record["publish_snapshot"] = {
+                key: value for key, value in publish_snapshot.items() if value is not None
+            }
         else:
             infra_kind = classify_infra_backoff_error(err_msg)
             error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"
@@ -732,6 +768,19 @@ def _persist_publish_result(
             )
             account_state.update(store.get_account_state(platform, account))
             if infra_kind:
+                emit_telemetry_event(
+                    "publish_result",
+                    {
+                        "platform": platform,
+                        "account": account,
+                        "article_type": article_type,
+                        "article_id": article.get("article_id"),
+                        "success": False,
+                        "infra_backoff": infra_kind,
+                        "error": error_detail[:200],
+                    },
+                    now_ts=now,
+                )
                 # 账号级 WAF / 登录失效不消耗目标文章的尝试次数，也不将文章误标为 failed
                 return error_detail
             plat_record.update(
@@ -773,6 +822,28 @@ def _persist_publish_result(
     if problems:
         details = "; ".join(f"{label}: {type(exc).__name__}: {exc}" for label, exc in problems)
         raise RuntimeError(f"{details} | 已保存: [{', '.join(saved) or '无'}]") from problems[0][1]
+    emit_telemetry_event(
+        "publish_result",
+        {
+            "platform": platform,
+            "account": account,
+            "article_type": article_type,
+            "article_id": article.get("article_id"),
+            "post_id": post_id if success else None,
+            "success": bool(success),
+            "topic": topic,
+            "matched_coin": matched_coin,
+            "source_platform": article.get("source"),
+            "gen_model": article.get("model_name"),
+            "selection_model": sel_meta.get("model_used"),
+            "platform_fit_score": sel_meta.get("platform_fit_score"),
+            "final_char_len": final_char_len,
+            "final_img_cnt": final_img_cnt,
+            "attempts": attempts,
+            "error": error_detail[:200] if not success else None,
+        },
+        now_ts=now,
+    )
     return error_detail
 
 
@@ -858,6 +929,18 @@ def _publish_articles_for_platform(
         占用图片=len(set(used_primary)),
         可用账号=len(eligible_accounts),
         总账号=len(accounts),
+    )
+    emit_telemetry_event(
+        "publish_funnel",
+        {
+            "platform": platform,
+            "article_type": article_type,
+            "raw": raw_count,
+            "passed": len(candidates),
+            "eligible_accounts": len(eligible_accounts),
+            "filters": {k: int(v) for k, v in stats.items() if v > 0},
+        },
+        now_ts=now,
     )
 
     platform_state = store.load_state().get(platform, {})
@@ -958,6 +1041,8 @@ def _publish_articles_for_platform(
                     article_type,
                     matched_coin,
                     state_store=store,
+                    final_char_len=len(text),
+                    final_img_cnt=len(paths),
                 )
             except Exception as exc:
                 raise RuntimeError(

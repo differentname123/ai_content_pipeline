@@ -29,6 +29,7 @@ TASK_SWITCHES: Dict[str, bool] = {
     "single_analysis_pub": True,   # 单币分析文章发布（总编擂台）
     "viral_gen": True,             # 娱乐高流量二阶段洗稿生成
     "viral_pub": True,             # 娱乐高流量文章发布（总编擂台）
+    "metrics_sync": True,          # 已发帖流量曲线定时回访埋点（免登只读）
     "hudong": False,               # 评论区点赞/互评（默认关闭）
     "delete_old_post": False,      # 逆向行情/超期历史清理（默认关闭）
 }
@@ -42,7 +43,14 @@ from parser.article_generator import (
     screen_viral_posts,
     screen_viral_posts_once,
 )
-from parser.maintenance_tasks import _delete_old_posts_once, _hudong_once, delete_old_post, hudong
+from parser.maintenance_tasks import (
+    _delete_old_posts_once,
+    _hudong_once,
+    delete_old_post,
+    hudong,
+    sync_recent_metrics,
+    sync_recent_metrics_once,
+)
 from parser.mlu_pipeline import format_image_article, format_image_article_once
 from parser.platform_adapters import logger
 from parser.post_ingestion import fetch_all_hot_posts, fetch_all_hot_posts_once
@@ -63,6 +71,7 @@ TASK_REGISTRY = {
     "single_analysis_pub": (auto_publish_articles, publish_analysis_once),
     "viral_gen": (generate_viral_articles, generate_viral_articles_once),
     "viral_pub": (auto_publish_viral_articles, publish_viral_once),
+    "metrics_sync": (sync_recent_metrics, sync_recent_metrics_once),
     "hudong": (hudong, _hudong_once),
     "delete_old_post": (delete_old_post, _delete_old_posts_once),
 }

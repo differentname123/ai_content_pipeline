@@ -21,6 +21,7 @@ from common.common_utils import (
     setup_logger,
 )
 from parser.config import ARTICLE_TYPE_ANALYSIS, ARTICLE_TYPE_VIRAL
+from parser.telemetry import emit_telemetry_event
 from platforms.binance_api import (
     fetch_binance_feed,
     fetch_binance_future_hot_coins,
@@ -67,9 +68,13 @@ _EXCHANGE_UI_ALIASES = {
 _VALID_EXCHANGE_UI_RE = re.compile(r"^[a-z0-9_-]+$")
 
 METRICS_FIRST_SYNC_MIN_AGE_SECONDS = 600
+METRICS_EARLY_REFRESH_INTERVAL_SECONDS = 900      # 发布后 10m ~ 60m：每 15 分钟加密采样冷启动曲线
+METRICS_MID_REFRESH_INTERVAL_SECONDS = 3600       # 发布后 1h ~ 6h：每 60 分钟跟踪二次推荐走势
 METRICS_MATURE_AGE_SECONDS = 24 * 3600
 METRICS_REFRESH_INTERVAL_SECONDS = 2 * 3600
 METRICS_MAX_REFRESH_AGE_SECONDS = 48 * 3600
+METRICS_TIMELINE_MAX_POINTS = 24
+METRICS_TIMELINE_MIN_GAP_SECONDS = 480
 
 _HOT_COIN_CACHE: Dict[str, Any] = {"ts": 0.0, "coins": []}
 _HOT_COIN_LOCK = threading.Lock()
@@ -556,6 +561,74 @@ def _safe_get_latest_price(platform: str, topic: Optional[str]) -> Optional[floa
         return None
 
 
+def _required_refresh_interval_seconds(age_sec: float) -> int:
+    """按帖龄自适应调整回访频率：前 1 小时 15m 加密采样，1~6 小时 60m，6~48 小时 2h。"""
+    if age_sec < 3600:
+        return METRICS_EARLY_REFRESH_INTERVAL_SECONDS
+    if age_sec < 6 * 3600:
+        return METRICS_MID_REFRESH_INTERVAL_SECONDS
+    return METRICS_REFRESH_INTERVAL_SECONDS
+
+
+def _append_metrics_timeline_point(
+    rec: Dict[str, Any],
+    *,
+    cur_ts: float,
+    age_sec: float,
+    views: Optional[Any],
+    likes: Optional[Any],
+    comments: Optional[Any],
+    shares: Optional[Any],
+    recommend: Optional[Any],
+    status_code: Optional[Any],
+    live_state: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    """追加有界流量轨迹采样点（最多保留 24 点；8 分钟内状态未变不重复写）。"""
+    timeline = rec.get("metrics_timeline")
+    if not isinstance(timeline, list):
+        timeline = []
+        rec["metrics_timeline"] = timeline
+
+    prev_numeric_v: Optional[int] = None
+    for item in reversed(timeline):
+        if isinstance(item, dict):
+            raw_v = item.get("v")
+            if isinstance(raw_v, (int, float)) and not isinstance(raw_v, bool):
+                prev_numeric_v = int(raw_v)
+                break
+
+    delta_v: Optional[int] = None
+    if isinstance(views, (int, float)) and not isinstance(views, bool) and prev_numeric_v is not None:
+        delta_v = int(views) - prev_numeric_v
+
+    if timeline and isinstance(timeline[-1], dict):
+        last = timeline[-1]
+        same_state = (
+            last.get("status") == status_code
+            and last.get("state") == live_state
+            and last.get("rec") == recommend
+        )
+        if (cur_ts - float(last.get("ts") or 0.0)) < METRICS_TIMELINE_MIN_GAP_SECONDS and same_state:
+            return None, delta_v
+
+    point: Dict[str, Any] = {
+        "ts": int(cur_ts),
+        "at": datetime.fromtimestamp(cur_ts, tz=BEIJING_TZ).strftime("%m-%d %H:%M"),
+        "age_m": round(age_sec / 60.0, 1),
+        "v": views,
+        "l": likes,
+        "c": comments,
+        "s": shares,
+        "rec": recommend,
+        "status": status_code,
+        "state": live_state,
+    }
+    timeline.append(point)
+    if len(timeline) > METRICS_TIMELINE_MAX_POINTS:
+        del timeline[:-METRICS_TIMELINE_MAX_POINTS]
+    return point, delta_v
+
+
 def sync_published_metrics(
     article_manager: Any,
     platform: str,
@@ -564,15 +637,18 @@ def sync_published_metrics(
     now_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
-    为已发布历史文章免登只读同步真实阅读/点赞/评论数（48h 内周期刷新、成熟前不冻僵），
-    回写至数据库后返回供总编擂台参考的历史战报列表。
+    为已发布历史文章免登只读同步真实阅读/点赞/评论/状态与成长曲线 (`metrics_timeline`)，
+    48h 内按帖龄自适应加密采样、成熟前不冻僵，回写至数据库后返回历史战报列表。
     """
     cur_ts = time.time() if now_ts is None else float(now_ts)
     history_items: List[Dict[str, Any]] = []
     need_upsert: List[Dict[str, Any]] = []
 
     for d in docs:
-        rec = (d.get("publish_records") or {}).get(platform) or {}
+        pub_records = d.setdefault("publish_records", {}) if isinstance(d, dict) else {}
+        rec = pub_records.get(platform)
+        if not isinstance(rec, dict):
+            rec = {}
         info = d.get("article_info") or {}
         text = (info.get("post_text") or info.get("text") or "").strip().replace("\n", " ")
         if not text:
@@ -586,16 +662,23 @@ def sync_published_metrics(
         pub_time = (raw_pub_time / 1000.0) if raw_pub_time > 1e11 else float(raw_pub_time)
         age_sec = max(0.0, cur_ts - pub_time) if pub_time > 0 else 0.0
         last_synced = float(rec.get("metrics_synced_at") or 0.0)
+        refresh_interval = _required_refresh_interval_seconds(age_sec)
+        settled_missing = rec.get("live_state") in ("deleted", "missing") and age_sec >= 2 * 3600
 
         need_sync = bool(
             pid
             and str(pid) != "None"
             and pub_time > 0
+            and not settled_missing
             and (
-                (views is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS)
+                (
+                    views is None
+                    and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS
+                    and (last_synced == 0.0 or (cur_ts - last_synced) >= refresh_interval)
+                )
                 or (
                     METRICS_FIRST_SYNC_MIN_AGE_SECONDS <= age_sec <= METRICS_MAX_REFRESH_AGE_SECONDS
-                    and (cur_ts - last_synced) >= METRICS_REFRESH_INTERVAL_SECONDS
+                    and (cur_ts - last_synced) >= refresh_interval
                 )
                 or (
                     age_sec > METRICS_MAX_REFRESH_AGE_SECONDS
@@ -613,24 +696,167 @@ def sync_published_metrics(
                     detail = fetch_binance_post_detail(str(pid))
                     if isinstance(detail, dict):
                         content_status = detail.get("contentStatus")
+                        recommend = detail.get("recommend")
+                        shares = detail.get("shareCount", 0) if content_status == 2 else rec.get("share_count")
                         if content_status == 2:
                             views = rec["view_count"] = detail.get("viewCount", 0)
                             likes = rec["like_count"] = detail.get("likeCount", 0)
                             comments = rec["comment_count"] = detail.get("commentCount", 0)
+                            rec["share_count"] = shares
                         if content_status is not None:
+                            live_state = "ok" if content_status == 2 else ("hidden" if content_status == 5 else f"status_{content_status}")
                             rec["content_status"] = content_status
-                            rec["recommend"] = detail.get("recommend")
+                            rec["recommend"] = recommend
                             rec["lan"] = detail.get("lan")
                             rec["detected_lang"] = detail.get("detectedLang")
+                            if "coinPairList" in detail:
+                                rec["coin_pair_list"] = detail.get("coinPairList")
+                            if "tradeWidgets" in detail:
+                                rec["trade_widget_count"] = len(detail.get("tradeWidgets") or [])
+                            rec["live_state"] = live_state
                             rec["metrics_synced_at"] = cur_ts
+                            _, delta_v = _append_metrics_timeline_point(
+                                rec,
+                                cur_ts=cur_ts,
+                                age_sec=age_sec,
+                                views=views,
+                                likes=likes,
+                                comments=comments,
+                                shares=shares,
+                                recommend=recommend,
+                                status_code=content_status,
+                                live_state=live_state,
+                            )
+                            pub_records[platform] = rec
+                            emit_telemetry_event(
+                                "metrics_point",
+                                {
+                                    "platform": platform,
+                                    "account": rec.get("published_by"),
+                                    "article_type": d.get("type"),
+                                    "article_id": d.get("article_id"),
+                                    "post_id": str(pid),
+                                    "age_m": round(age_sec / 60.0, 1),
+                                    "views": views,
+                                    "delta_v": delta_v,
+                                    "likes": likes,
+                                    "comments": comments,
+                                    "shares": shares,
+                                    "recommend": recommend,
+                                    "status_code": content_status,
+                                    "live_state": live_state,
+                                },
+                                now_ts=cur_ts,
+                            )
                             need_upsert.append(d)
+                    elif detail is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS:
+                        rec["live_state"] = "deleted"
+                        rec["metrics_synced_at"] = cur_ts
+                        _, delta_v = _append_metrics_timeline_point(
+                            rec,
+                            cur_ts=cur_ts,
+                            age_sec=age_sec,
+                            views=None,
+                            likes=None,
+                            comments=None,
+                            shares=None,
+                            recommend=None,
+                            status_code=None,
+                            live_state="deleted",
+                        )
+                        pub_records[platform] = rec
+                        emit_telemetry_event(
+                            "metrics_point",
+                            {
+                                "platform": platform,
+                                "account": rec.get("published_by"),
+                                "article_type": d.get("type"),
+                                "article_id": d.get("article_id"),
+                                "post_id": str(pid),
+                                "age_m": round(age_sec / 60.0, 1),
+                                "delta_v": delta_v,
+                                "live_state": "deleted",
+                            },
+                            now_ts=cur_ts,
+                        )
+                        need_upsert.append(d)
                 elif platform == PLATFORM_OKX:
                     detail = fetch_okx_post_detail(str(pid))
-                    if detail and detail.get("reviewState") == 2:
-                        views = rec["view_count"] = detail.get("viewCount", 0)
-                        likes = rec["like_count"] = detail.get("likeCount", 0)
-                        comments = rec["comment_count"] = detail.get("commentNum", 0)
+                    if isinstance(detail, dict):
+                        review_state = detail.get("reviewState")
+                        rec["review_state"] = review_state
                         rec["metrics_synced_at"] = cur_ts
+                        if review_state == 2:
+                            views = rec["view_count"] = detail.get("viewCount", 0)
+                            likes = rec["like_count"] = detail.get("likeCount", 0)
+                            comments = rec["comment_count"] = detail.get("commentNum", 0)
+                            live_state = "ok"
+                        else:
+                            live_state = f"review_{review_state}"
+                        rec["live_state"] = live_state
+                        _, delta_v = _append_metrics_timeline_point(
+                            rec,
+                            cur_ts=cur_ts,
+                            age_sec=age_sec,
+                            views=views,
+                            likes=likes,
+                            comments=comments,
+                            shares=None,
+                            recommend=None,
+                            status_code=review_state,
+                            live_state=live_state,
+                        )
+                        pub_records[platform] = rec
+                        emit_telemetry_event(
+                            "metrics_point",
+                            {
+                                "platform": platform,
+                                "account": rec.get("published_by"),
+                                "article_type": d.get("type"),
+                                "article_id": d.get("article_id"),
+                                "post_id": str(pid),
+                                "age_m": round(age_sec / 60.0, 1),
+                                "views": views,
+                                "delta_v": delta_v,
+                                "likes": likes,
+                                "comments": comments,
+                                "status_code": review_state,
+                                "live_state": live_state,
+                            },
+                            now_ts=cur_ts,
+                        )
+                        need_upsert.append(d)
+                    elif detail is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS:
+                        rec["review_state"] = None
+                        rec["live_state"] = "missing"
+                        rec["metrics_synced_at"] = cur_ts
+                        _, delta_v = _append_metrics_timeline_point(
+                            rec,
+                            cur_ts=cur_ts,
+                            age_sec=age_sec,
+                            views=None,
+                            likes=None,
+                            comments=None,
+                            shares=None,
+                            recommend=None,
+                            status_code=None,
+                            live_state="missing",
+                        )
+                        pub_records[platform] = rec
+                        emit_telemetry_event(
+                            "metrics_point",
+                            {
+                                "platform": platform,
+                                "account": rec.get("published_by"),
+                                "article_type": d.get("type"),
+                                "article_id": d.get("article_id"),
+                                "post_id": str(pid),
+                                "age_m": round(age_sec / 60.0, 1),
+                                "delta_v": delta_v,
+                                "live_state": "missing",
+                            },
+                            now_ts=cur_ts,
+                        )
                         need_upsert.append(d)
             except Exception as exc:
                 logger.debug(f"[发布/指标同步] 拉取 {platform} 帖子 {pid} 详情失败(已降级跳过): {exc}")

@@ -7,6 +7,7 @@
 2. 按逆向行情/超时自动删帖 (`delete_old_post`, `_delete_old_posts_once`) 与按时间段精准批量删帖 (`delete_posts_by_account_and_time`)；
 3. 手动批量重洗与人工质量抽样复盘工具 (`clear_all_media_format_batch`, `get_need_check_*`, `query_hot_posts_by_keyword`)。
 """
+import argparse
 import random
 import threading
 import time
@@ -27,9 +28,9 @@ from common.common_utils import (
 from common.daemon import run_daemon_loop
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
-from parser.config import INTERACTION_CONFIG
+from parser.config import INTERACTION_CONFIG, METRICS_SYNC_INTERVAL_SECONDS
 from parser.mlu_pipeline import build_pre_screen_item
-from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _get_account_session_dir, _log, logger
+from parser.platform_adapters import BEIJING_TZ, PLATFORMS, _get_account_session_dir, _log, logger, sync_published_metrics
 from parser.post_ingestion import (
     ARTICLE_TYPE_VIRAL,
     DELETE_INTERVAL_SEC,
@@ -1052,11 +1053,217 @@ def get_need_check_viral_article_info(
     return review_list
 
 
+def sync_recent_metrics_once(
+    article_manager: Optional[Any] = None,
+    *,
+    lookback_hours: int = 72,
+    limit_per_platform: int = 60,
+    now_ts: Optional[float] = None,
+) -> Dict[str, Dict[str, int]]:
+    """独立后台流量回访：免登只读拉取近期已发帖曲线并写回 `publish_records.<platform>.metrics_timeline`。"""
+    mgr = article_manager or GeneratedArticleManager(gen_db_object())
+    cur_ts = time.time() if now_ts is None else float(now_ts)
+    cutoff = cur_ts - max(1, int(lookback_hours)) * 3600
+    summary: Dict[str, Dict[str, int]] = {}
+
+    for platform in (PLATFORM_BINANCE, PLATFORM_OKX):
+        docs = (
+            mgr.find_articles(
+                query={
+                    "status": "ok",
+                    f"publish_records.{platform}.status": "success",
+                    f"publish_records.{platform}.publish_time": {"$gte": cutoff},
+                },
+                sort=[(f"publish_records.{platform}.publish_time", -1)],
+                limit=limit_per_platform,
+            )
+            or []
+        )
+        prev_synced = {
+            idx: ((doc.get("publish_records") or {}).get(platform) or {}).get("metrics_synced_at")
+            for idx, doc in enumerate(docs)
+            if isinstance(doc, dict)
+        }
+        if docs:
+            sync_published_metrics(mgr, platform, docs, now_ts=cur_ts)
+
+        updated = 0
+        missing_or_hidden = 0
+        for idx, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            rec = (doc.get("publish_records") or {}).get(platform) or {}
+            if rec.get("metrics_synced_at") != prev_synced.get(idx):
+                updated += 1
+            if rec.get("live_state") in ("deleted", "missing", "hidden"):
+                missing_or_hidden += 1
+
+        summary[platform] = {
+            "scanned": len(docs),
+            "updated": updated,
+            "missing_or_hidden": missing_or_hidden,
+        }
+        _log(
+            "指标追踪/汇总",
+            "本轮已发帖流量曲线回访完成",
+            平台=platform,
+            扫描=len(docs),
+            更新=updated,
+            异常或被删=missing_or_hidden,
+        )
+    return summary
+
+
+def sync_recent_metrics(stop_event: Optional[threading.Event] = None, max_rounds: int = 0) -> None:
+    """定时后台回访已发帖阅读与互动增长曲线。"""
+    mgr = GeneratedArticleManager(gen_db_object())
+    run_daemon_loop(
+        lambda _round_idx: sync_recent_metrics_once(mgr),
+        interval_seconds=METRICS_SYNC_INTERVAL_SECONDS,
+        jitter_ratio=0.1,
+        error_backoff_seconds=120,
+        name="指标追踪",
+        logger_obj=logger,
+        max_rounds=max_rounds,
+        stop_event=stop_event,
+    )
+
+
+def _format_timeline_curve(timeline: Any) -> str:
+    if not isinstance(timeline, list) or not timeline:
+        return "暂无曲线"
+    parts: List[str] = []
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        age_m = item.get("age_m")
+        age_label = f"{int(round(float(age_m)))}m" if isinstance(age_m, (int, float)) else "?"
+        val = item.get("v")
+        if val is None:
+            val_label = str(item.get("state") or "?")
+        else:
+            val_label = str(int(val))
+        parts.append(f"{age_label}:{val_label}")
+    return " -> ".join(parts) if parts else "暂无曲线"
+
+
+def build_publish_telemetry_report(
+    article_manager: Optional[Any] = None,
+    *,
+    hours: int = 24,
+    sync_first: bool = True,
+    now_ts: Optional[float] = None,
+) -> str:
+    """生成一行一帖 + 分组汇总的简洁复盘战报（含生命周期增长曲线与异常状态标记）。"""
+    mgr = article_manager or GeneratedArticleManager(gen_db_object())
+    cur_ts = time.time() if now_ts is None else float(now_ts)
+    if sync_first:
+        sync_recent_metrics_once(mgr, lookback_hours=max(int(hours), 48), now_ts=cur_ts)
+
+    cutoff = cur_ts - max(1, int(hours)) * 3600
+    rows: List[Tuple[float, str, Dict[str, Any], Dict[str, Any]]] = []
+    for platform in (PLATFORM_BINANCE, PLATFORM_OKX):
+        docs = (
+            mgr.find_articles(
+                query={
+                    "status": "ok",
+                    f"publish_records.{platform}.status": "success",
+                    f"publish_records.{platform}.publish_time": {"$gte": cutoff},
+                },
+                sort=[(f"publish_records.{platform}.publish_time", -1)],
+                limit=200,
+            )
+            or []
+        )
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            rec = (doc.get("publish_records") or {}).get(platform) or {}
+            raw_pt = rec.get("publish_time") or 0
+            pt = (raw_pt / 1000.0) if float(raw_pt) > 1e11 else float(raw_pt)
+            if pt >= cutoff:
+                rows.append((pt, platform, rec, doc))
+    rows.sort(key=lambda x: x[0])
+
+    header_time = datetime.fromtimestamp(cur_ts, tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    lines: List[str] = [f"=== 近 {hours}h 发布效果与流量曲线复盘 ({header_time} CST, 共 {len(rows)} 篇) ==="]
+    grouped: Dict[Tuple[str, str, str], List[Tuple[Optional[int], int, int, bool]]] = defaultdict(list)
+
+    for pt, platform, rec, doc in rows:
+        age_h = max(0.0, (cur_ts - pt) / 3600.0)
+        acc = str(rec.get("published_by") or "?")
+        atype = str(doc.get("type") or "?")
+        src = str(doc.get("source") or "?")
+        pid = str(rec.get("post_id") or "?")
+        v = rec.get("view_count")
+        l = int(rec.get("like_count") or 0)
+        c = int(rec.get("comment_count") or 0)
+        s = int(rec.get("share_count") or 0)
+        state = str(rec.get("live_state") or ("ok" if v is not None else "pending"))
+        is_bad = state in ("deleted", "missing", "hidden") or (rec.get("recommend") is False)
+        snap = rec.get("publish_snapshot") or {}
+        src_v = snap.get("source_views")
+        fit = rec.get("platform_fit_score")
+        pairs = rec.get("coin_pair_list")
+        extra = []
+        if platform == PLATFORM_BINANCE:
+            extra.append(f"rec={rec.get('recommend')}/cs={rec.get('content_status')}")
+            extra.append(f"pairs={pairs}")
+        else:
+            extra.append(f"rev={rec.get('review_state')}")
+        if fit is not None:
+            extra.append(f"fit={fit}")
+        if src_v is not None:
+            extra.append(f"src_v={src_v}")
+
+        pt_str = datetime.fromtimestamp(pt, tz=BEIJING_TZ).strftime("%m-%d %H:%M")
+        curve_str = _format_timeline_curve(rec.get("metrics_timeline"))
+        flag = ""
+        if state in ("deleted", "missing", "hidden"):
+            flag = f" [!{state}]"
+        elif age_h >= 2.0 and isinstance(v, (int, float)) and v < 50:
+            flag = " [!低流停滞]"
+        elif isinstance(v, (int, float)) and v >= 500:
+            flag = " [★高流]"
+
+        lines.append(
+            f"[{pt_str}] ({age_h:4.1f}h) {platform.upper():7s} {acc:6s} {atype:8s} src={src:7s} "
+            f"pid={pid} v={v} l={l} c={c} s={s} state={state} {' '.join(extra)}{flag}\n"
+            f"    curve: {curve_str}"
+        )
+        numeric_v = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        grouped[(platform, acc, atype)].append((numeric_v, l, c, is_bad))
+
+    lines.append("\n=== 分组汇总 (platform / account / type) ===")
+    for (platform, acc, atype), entries in sorted(grouped.items()):
+        views_list = sorted(x[0] for x in entries if x[0] is not None)
+        med = views_list[len(views_list) // 2] if views_list else None
+        avg = round(sum(views_list) / len(views_list), 1) if views_list else None
+        total_l = sum(x[1] for x in entries)
+        total_c = sum(x[2] for x in entries)
+        bad_cnt = sum(1 for x in entries if x[3])
+        lines.append(
+            f"  {platform:7s} / {acc:6s} / {atype:8s}: n={len(entries)} live={len(views_list)} "
+            f"bad/del={bad_cnt} med_v={med} avg_v={avg} likes={total_l} comments={total_c}"
+        )
+    return "\n".join(lines)
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="已发帖流量回访与复盘战报工具")
+    parser.add_argument("--report-hours", type=int, default=24, help="输出最近 N 小时的发帖复盘战报（默认 24）")
+    parser.add_argument("--no-sync", action="store_true", help="跳过远端同步，仅读取本地库内已落盘轨迹")
+    args = parser.parse_args(argv)
+    print(build_publish_telemetry_report(hours=args.report_hours, sync_first=not args.no_sync))
+    return 0
+
+
 __all__ = [
     "INTERACTION_CONFIG",
     "_article_delete_reason",
     "_delete_old_posts_once",
     "_hudong_once",
+    "build_publish_telemetry_report",
     "clean_article_records",
     "clear_all_media_format_batch",
     "delete_old_post",
@@ -1067,4 +1274,10 @@ __all__ = [
     "hudong",
     "interact_comment",
     "query_hot_posts_by_keyword",
+    "sync_recent_metrics",
+    "sync_recent_metrics_once",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
