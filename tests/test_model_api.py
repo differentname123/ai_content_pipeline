@@ -81,10 +81,56 @@ class TestModelApi(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_model_lists_remain_intact(self):
-        self.assertGreater(len(model_api.HIGH_MODEL_LIST), 0)
-        self.assertGreater(len(model_api.MEDIUM_MODEL_LIST), 0)
-        self.assertGreater(len(model_api.LOW_MODEL_LIST), 0)
-        self.assertTrue(any(m["权重"] > 0 for m in model_api.LOW_MODEL_LIST))
+        for group in (model_api.HIGH_MODEL_LIST, model_api.MEDIUM_MODEL_LIST, model_api.LOW_MODEL_LIST):
+            self.assertGreater(len(group), 0)
+            for entry in group:
+                self.assertIn("无附件权重", entry)
+                self.assertIn("有附件权重", entry)
+            self.assertEqual(sum(m["无附件权重"] for m in group), 100)
+            self.assertEqual(sum(m["有附件权重"] for m in group), 100)
+
+        low_by_name = {m["model_name"]: m for m in model_api.LOW_MODEL_LIST}
+        med_by_name = {m["model_name"]: m for m in model_api.MEDIUM_MODEL_LIST}
+        high_by_name = {m["model_name"]: m for m in model_api.HIGH_MODEL_LIST}
+        self.assertGreater(low_by_name["gpt-5.6-max"]["无附件权重"], 0)
+        self.assertEqual(low_by_name["gpt-5.6-max"]["有附件权重"], 0)
+        self.assertEqual(high_by_name["gpt-6.1-sol-max"]["无附件权重"], 0)
+        self.assertEqual(high_by_name["gpt-6.1-sol-max"]["有附件权重"], 0)
+        self.assertEqual(med_by_name["gpt-6-codex-luna-max"]["无附件权重"], 0)
+        self.assertEqual(med_by_name["gpt-6-codex-luna-max"]["有附件权重"], 0)
+        self.assertEqual(low_by_name["gpt-6-codex-luna"]["无附件权重"], 0)
+        self.assertEqual(low_by_name["gpt-6-codex-luna"]["有附件权重"], 0)
+
+    def test_attachment_aware_weights_and_zero_weight_exclusion(self):
+        no_att = model_api._select_models(None, None, "low", has_attachment=False)
+        with_att = model_api._select_models(None, None, "low", has_attachment=True)
+        self.assertIn("gpt-5.6-max", no_att)
+        self.assertNotIn("gpt-5.6-max", with_att)
+        self.assertNotIn("gpt-6-codex-luna", no_att)
+        self.assertNotIn("gpt-6-codex-luna", with_att)
+
+        tmp = Path(self._tmp.name)
+        tiny_path = tmp / "tiny_att.png"
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(tiny_path, format="PNG")
+        split_models = [
+            {"model_name": "text-only-model", "无附件权重": 100, "有附件权重": 0},
+            {"model_name": "vision-only-model", "无附件权重": 0, "有附件权重": 100},
+        ]
+        FakeClient, _, calls = _make_fake_openai_factory(lambda kw: (kw["model"], "ok"))
+        with patch.object(model_api, "LOW_MODEL_LIST", split_models), \
+             patch.object(model_api, "API_KEY", "sk-test-key"), \
+             patch.object(model_api, "MODEL_USAGE_JSON_PATH", self._usage_path), \
+             patch.object(model_api, "OpenAI", FakeClient):
+            res_text = model_api.generate_content("no attach", preset_model_group="low")
+            self.assertEqual(res_text["metrics"]["model_used"], "text-only-model")
+            res_att = model_api.generate_content("with attach", file_paths=[str(tiny_path)], preset_model_group="low")
+            self.assertEqual(res_att["metrics"]["model_used"], "vision-only-model")
+            self.assertEqual([c["model"] for c in calls], ["text-only-model", "vision-only-model"])
+
+        incomplete_group = [{"model_name": "bad-entry", "无附件权重": 100}]
+        with patch.object(model_api, "LOW_MODEL_LIST", incomplete_group):
+            with self.assertRaises(ValueError):
+                model_api._select_models(None, None, "low", has_attachment=False)
 
     def test_http_200_empty_choices_and_empty_content_fast_switch_and_cool(self):
         test_models = [
@@ -145,16 +191,15 @@ class TestModelApi(unittest.TestCase):
             self.assertEqual(calls[0]["model"], "throttled-model")
             self.assertEqual(len([c for c in calls if c["model"] == "throttled-model"]), 1)
 
-            # Throttled model remains in list at tail rather than being removed
+            # 0-weight model must be excluded from both fallback and cooling tail
             selected = model_api._select_models(None, None, "low")
-            self.assertEqual(set(selected), {"throttled-model", "backup-model", "zero-weight-backup"})
+            self.assertEqual(set(selected), {"throttled-model", "backup-model"})
             self.assertEqual(selected[-1], "throttled-model")
 
-            # Even when every model cools down, earliest-expiring remains selectable as fallback
+            # Even when every active model cools down, earliest-expiring remains selectable as fallback
             model_api._record_model_outcome("backup-model", success=False, status_code=429, error_text="reset_seconds: 90")
-            model_api._record_model_outcome("zero-weight-backup", success=False, status_code=429, error_text="reset_seconds: 180")
             all_cooling = model_api._select_models(None, None, "low")
-            self.assertEqual(len(all_cooling), 3)
+            self.assertEqual(len(all_cooling), 2)
             self.assertEqual(all_cooling[0], "backup-model")
 
         # Success clears cooldown immediately
