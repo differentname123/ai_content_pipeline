@@ -1084,8 +1084,11 @@ def fetch_okx_user_timeline(
     return results
 
 
-def fetch_okx_post_detail(content_id, session=None):
-    """根据帖子/文章 ID 获取欧易 Orbit 帖子的详细内容及真实互动指标 (viewCount, likeCount, commentNum)"""
+def fetch_okx_post_detail(content_id, session=None, raise_on_error=False):
+    """根据帖子/文章 ID 获取欧易 Orbit 帖子的详细内容及真实互动指标 (viewCount, likeCount, commentNum)。
+
+    当 raise_on_error=True 时，重试耗尽的网络/HTTP 异常向上抛出，不与接口明确返回缺失混为一谈。
+    """
     clean_id = str(content_id or "").strip()
     if not clean_id:
         return None
@@ -1093,6 +1096,7 @@ def fetch_okx_post_detail(content_id, session=None):
     headers = _build_okx_headers(referer=f"https://www.okx.com/zh-hans/orbit/post/{clean_id}")
     req_client = session if session else requests
     retry_count = 0
+    last_exc = None
 
     while retry_count < MAX_RETRIES:
         try:
@@ -1105,15 +1109,22 @@ def fetch_okx_post_detail(content_id, session=None):
             )
             response.raise_for_status()
             json_resp = response.json()
+            if not isinstance(json_resp, dict):
+                raise ValueError(f"欧易详情响应格式异常: {type(json_resp).__name__}")
             if str(json_resp.get("code")) != "0":
                 return None
             return json_resp.get("data")
         except Exception as e:
+            last_exc = e
             retry_count += 1
             if retry_count >= MAX_RETRIES:
                 logger.debug(f"[欧易采集/帖子详情] 获取帖子详情失败 | ID: [{clean_id}] | 原因: [{e}]")
+                if raise_on_error:
+                    raise
                 return None
             time.sleep(random.uniform(0.3, 0.8))
+    if raise_on_error and last_exc is not None:
+        raise last_exc
     return None
 
 

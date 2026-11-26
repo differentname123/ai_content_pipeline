@@ -1809,6 +1809,144 @@ class TestTelemetryAndMetricsTimeline(unittest.TestCase):
         self.assertEqual(len(rec["metrics_timeline"]), 24)
         self.assertEqual(rec["metrics_timeline"][-1]["v"], 999)
 
+    def test_post_detail_fetchers_raise_on_error_flag(self):
+        from platforms import binance_api, okx_api
+
+        fake_sess = MagicMock()
+        fake_sess.get.side_effect = ConnectionError("proxy timeout")
+        with patch.object(binance_api, "MAX_RETRIES", 2), \
+             patch.object(binance_api.time, "sleep"):
+            self.assertIsNone(binance_api.fetch_binance_post_detail("123", session=fake_sess))
+            with self.assertRaises(ConnectionError):
+                binance_api.fetch_binance_post_detail("123", session=fake_sess, raise_on_error=True)
+
+        err_payload_resp = MagicMock()
+        err_payload_resp.status_code = 200
+        err_payload_resp.raise_for_status.return_value = None
+        err_payload_resp.json.return_value = {"code": "999999", "success": False, "message": "rate limit"}
+        fake_sess.get.side_effect = None
+        fake_sess.get.return_value = err_payload_resp
+        with patch.object(binance_api, "MAX_RETRIES", 2), \
+             patch.object(binance_api.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                binance_api.fetch_binance_post_detail("123", session=fake_sess, raise_on_error=True)
+
+        empty_bn_resp = MagicMock()
+        empty_bn_resp.status_code = 200
+        empty_bn_resp.raise_for_status.return_value = None
+        empty_bn_resp.json.return_value = {"code": "000000", "success": True, "data": None}
+        fake_sess.get.return_value = empty_bn_resp
+        self.assertIsNone(binance_api.fetch_binance_post_detail("123", session=fake_sess, raise_on_error=True))
+
+        okx_err_sess = MagicMock()
+        okx_err_sess.get.side_effect = TimeoutError("read timeout")
+        with patch.object(okx_api, "MAX_RETRIES", 2), \
+             patch.object(okx_api.time, "sleep"):
+            self.assertIsNone(okx_api.fetch_okx_post_detail("456", session=okx_err_sess))
+            with self.assertRaises(TimeoutError):
+                okx_api.fetch_okx_post_detail("456", session=okx_err_sess, raise_on_error=True)
+
+        empty_okx_resp = MagicMock()
+        empty_okx_resp.raise_for_status.return_value = None
+        empty_okx_resp.json.return_value = {"code": "52001", "data": None}
+        okx_err_sess.get.side_effect = None
+        okx_err_sess.get.return_value = empty_okx_resp
+        self.assertIsNone(okx_api.fetch_okx_post_detail("456", session=okx_err_sess, raise_on_error=True))
+
+    def test_sync_published_metrics_transient_error_and_two_step_missing(self):
+        from parser.post_ingestion import ARTICLE_TYPE_VIRAL
+
+        pub_t = 1700000000.0
+        now = pub_t + 8 * 3600  # 8h old -> normal refresh interval is 2h
+        mock_mgr = MagicMock(spec=["upsert_articles"])
+
+        doc = {
+            "article_id": "a_live_blip",
+            "type": ARTICLE_TYPE_VIRAL,
+            "article_info": {"post_text": "瞬态抖动防误锁测试"},
+            "publish_records": {
+                "binance": {
+                    "post_id": "888001",
+                    "published_by": "myself",
+                    "publish_time": pub_t,
+                    "view_count": 320,
+                    "live_state": "ok",
+                    "metrics_synced_at": now - 3 * 3600,
+                    "metrics_timeline": [
+                        {"ts": int(now - 3 * 3600), "age_m": 300.0, "v": 320, "state": "ok", "status": 2, "rec": True}
+                    ],
+                }
+            },
+        }
+        rec = doc["publish_records"]["binance"]
+
+        # 1. Transient network exception -> keeps original live_state="ok" & metrics_synced_at
+        with patch("parser.platform_adapters.fetch_binance_post_detail", side_effect=ConnectionError("blip")) as mock_fetch, \
+             patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now)
+        self.assertEqual(mock_fetch.call_args.kwargs.get("raise_on_error"), True)
+        self.assertEqual(rec["live_state"], "ok")
+        self.assertEqual(rec["view_count"], 320)
+        self.assertEqual(rec.get("missing_confirm_count", 0), 0)
+        self.assertEqual(rec["metrics_synced_at"], now - 3 * 3600)
+
+        # 2. 1st empty return on live post -> suspect only, stays "ok", no deleted point appended
+        with patch("parser.platform_adapters.fetch_binance_post_detail", return_value=None), \
+             patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now)
+        self.assertEqual(rec["live_state"], "ok")
+        self.assertEqual(rec["missing_confirm_count"], 1)
+        self.assertEqual(len(rec["metrics_timeline"]), 1)
+
+        # 3. Recheck 10m later (faster than 2h normal interval) recovers cleanly and resets counter
+        with patch(
+            "parser.platform_adapters.fetch_binance_post_detail",
+            return_value={"contentStatus": 2, "viewCount": 380, "likeCount": 4, "commentCount": 1, "shareCount": 0, "recommend": True},
+        ), patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now + 605)
+        self.assertEqual(rec["live_state"], "ok")
+        self.assertEqual(rec["view_count"], 380)
+        self.assertEqual(rec["missing_confirm_count"], 0)
+
+        # 4. Two consecutive empty returns confirm deletion and then stop polling
+        with patch("parser.platform_adapters.fetch_binance_post_detail", return_value=None), \
+             patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now + 605 + 7300)
+            self.assertEqual(rec["live_state"], "ok")
+            self.assertEqual(rec["missing_confirm_count"], 1)
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now + 605 + 7300 + 610)
+            self.assertEqual(rec["live_state"], "deleted")
+            self.assertEqual(rec["missing_confirm_count"], 2)
+
+        with patch("parser.platform_adapters.fetch_binance_post_detail") as mock_settled:
+            sync_published_metrics(mock_mgr, "binance", [doc], now_ts=now + 605 + 7300 + 7200)
+        mock_settled.assert_not_called()
+
+        # 5. Legacy single-blip "deleted" record (no missing_confirm_count) self-heals on next run
+        legacy_doc = {
+            "article_id": "a_legacy_blip",
+            "type": ARTICLE_TYPE_VIRAL,
+            "article_info": {"post_text": "历史单次误判自愈"},
+            "publish_records": {
+                "binance": {
+                    "post_id": "888002",
+                    "published_by": "ruru",
+                    "publish_time": pub_t,
+                    "view_count": 210,
+                    "live_state": "deleted",
+                    "metrics_synced_at": now - 1800,
+                }
+            },
+        }
+        with patch(
+            "parser.platform_adapters.fetch_binance_post_detail",
+            return_value={"contentStatus": 2, "viewCount": 330, "likeCount": 2, "commentCount": 0, "shareCount": 0, "recommend": True},
+        ), patch("parser.platform_adapters.emit_telemetry_event"):
+            sync_published_metrics(mock_mgr, "binance", [legacy_doc], now_ts=now)
+        self.assertEqual(legacy_doc["publish_records"]["binance"]["live_state"], "ok")
+        self.assertEqual(legacy_doc["publish_records"]["binance"]["view_count"], 330)
+        self.assertEqual(legacy_doc["publish_records"]["binance"]["missing_confirm_count"], 0)
+
     def test_persist_publish_result_writes_publish_snapshot_and_telemetry(self):
         from parser.publisher_arena import _persist_publish_result
 

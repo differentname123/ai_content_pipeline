@@ -926,8 +926,15 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, do
     return enriched_list
 
 
-def fetch_binance_post_detail(post_id, session=None):
-    """根据文章 ID 获取币安广场帖子的详细内容"""
+def fetch_binance_post_detail(post_id, session=None, raise_on_error=False):
+    """根据文章 ID 获取币安广场帖子的详细内容。
+
+    Args:
+        post_id: 币安广场帖子 ID。
+        session: 可选复用 requests.Session。
+        raise_on_error: 为 True 时，重试耗尽的瞬态网络/接口异常直接抛出，
+            不伪装为帖子已删除(None)，仅在接口明确成功返回空数据时返回 None。
+    """
     url = f"https://www.binance.com/bapi/composite/v3/friendly/pgc/special/content/detail/{post_id}"
     headers = {
         "User-Agent": DEFAULT_WEB_UA,
@@ -944,17 +951,26 @@ def fetch_binance_post_detail(post_id, session=None):
 
     req_client = session if session else requests
     retry_count = 0
+    last_exc = None
 
     while retry_count < MAX_RETRIES:
         response = None
         try:
             response = req_client.get(url, headers=headers, proxies=PROXIES, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            data_field = response.json().get("data")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"币安详情响应格式异常: {type(payload).__name__}")
+            if payload.get("success") is False and payload.get("code") not in (None, "000000"):
+                raise RuntimeError(
+                    f"币安详情接口业务异常: code={payload.get('code')}, msg={payload.get('message')}"
+                )
+            data_field = payload.get("data")
             if not data_field:
                 logger.debug(f"[币安采集/长文详情] 接口未返回有效数据 | 帖子ID: [{post_id}]")
             return data_field
         except Exception as e:
+            last_exc = e
             detail = f"HTTP {response.status_code}" if (response is not None and response.status_code >= 400) else "请求异常"
             retry_count += 1
             if retry_count >= MAX_RETRIES:
@@ -962,9 +978,13 @@ def fetch_binance_post_detail(post_id, session=None):
                     f"[币安采集/长文详情] 连续失败达上限，跳过该长文富化 | 帖子ID: [{post_id}] "
                     f"| 尝试: [{retry_count}/{MAX_RETRIES}] | 状态: [{detail}] | 原因: [{e}]"
                 )
+                if raise_on_error:
+                    raise
                 break
             time.sleep(random.uniform(0.5, 1.5))
 
+    if raise_on_error and last_exc is not None:
+        raise last_exc
     return None
 
 

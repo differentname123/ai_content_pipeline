@@ -8,6 +8,7 @@
 3. 分析帖/流量帖最终发布文案与配图路径排版；
 4. 已发布历史文章的免登只读互动指标增量同步 (`sync_published_metrics`)。
 """
+import inspect
 import re
 import threading
 import time
@@ -75,6 +76,8 @@ METRICS_REFRESH_INTERVAL_SECONDS = 2 * 3600
 METRICS_MAX_REFRESH_AGE_SECONDS = 48 * 3600
 METRICS_TIMELINE_MAX_POINTS = 24
 METRICS_TIMELINE_MIN_GAP_SECONDS = 480
+METRICS_MISSING_CONFIRM_COUNT = 2
+METRICS_SUSPECT_RETRY_INTERVAL_SECONDS = 600
 
 _HOT_COIN_CACHE: Dict[str, Any] = {"ts": 0.0, "coins": []}
 _HOT_COIN_LOCK = threading.Lock()
@@ -629,6 +632,79 @@ def _append_metrics_timeline_point(
     return point, delta_v
 
 
+def _call_post_detail_fetcher(fetcher: Any, pid: str) -> Any:
+    """调用帖子详情抓取器；若支持 raise_on_error 参数则开启，避免把瞬态异常当作已删。"""
+    target = fetcher.side_effect if callable(getattr(fetcher, "side_effect", None)) else fetcher
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        return fetcher(pid)
+    if "raise_on_error" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fetcher(pid, raise_on_error=True)
+    return fetcher(pid)
+
+
+def _handle_missing_post_detail(
+    rec: Dict[str, Any],
+    pub_records: Dict[str, Any],
+    doc: Dict[str, Any],
+    need_upsert: List[Dict[str, Any]],
+    *,
+    platform: str,
+    pid: str,
+    cur_ts: float,
+    age_sec: float,
+    views: Any,
+    missing_state: str,
+) -> None:
+    """处理详情接口明确返回空值(None)：曾存活帖子先疑诊二次确认，避免单次瞬态空响应误锁。"""
+    was_live = (views is not None) or (rec.get("live_state") == "ok")
+    next_miss = int(rec.get("missing_confirm_count") or 0) + 1
+    rec["missing_confirm_count"] = next_miss
+    rec["metrics_synced_at"] = cur_ts
+
+    if was_live and next_miss < METRICS_MISSING_CONFIRM_COUNT:
+        logger.warning(
+            f"[发布/指标同步] {platform} 帖子 {pid} 本次返回空详情(疑诊 {next_miss}/{METRICS_MISSING_CONFIRM_COUNT})，"
+            "暂保留原存活状态等待复核"
+        )
+        pub_records[platform] = rec
+        need_upsert.append(doc)
+        return
+
+    if platform == PLATFORM_OKX:
+        rec["review_state"] = None
+    rec["live_state"] = missing_state
+    _, delta_v = _append_metrics_timeline_point(
+        rec,
+        cur_ts=cur_ts,
+        age_sec=age_sec,
+        views=None,
+        likes=None,
+        comments=None,
+        shares=None,
+        recommend=None,
+        status_code=None,
+        live_state=missing_state,
+    )
+    pub_records[platform] = rec
+    emit_telemetry_event(
+        "metrics_point",
+        {
+            "platform": platform,
+            "account": rec.get("published_by"),
+            "article_type": doc.get("type"),
+            "article_id": doc.get("article_id"),
+            "post_id": str(pid),
+            "age_m": round(age_sec / 60.0, 1),
+            "delta_v": delta_v,
+            "live_state": missing_state,
+        },
+        now_ts=cur_ts,
+    )
+    need_upsert.append(doc)
+
+
 def sync_published_metrics(
     article_manager: Any,
     platform: str,
@@ -663,7 +739,21 @@ def sync_published_metrics(
         age_sec = max(0.0, cur_ts - pub_time) if pub_time > 0 else 0.0
         last_synced = float(rec.get("metrics_synced_at") or 0.0)
         refresh_interval = _required_refresh_interval_seconds(age_sec)
-        settled_missing = rec.get("live_state") in ("deleted", "missing") and age_sec >= 2 * 3600
+        miss_cnt = int(rec.get("missing_confirm_count") or 0)
+        unconfirmed_missing = rec.get("live_state") in ("deleted", "missing") and miss_cnt < METRICS_MISSING_CONFIRM_COUNT
+        needs_missing_recheck = (0 < miss_cnt < METRICS_MISSING_CONFIRM_COUNT) or unconfirmed_missing
+        # 【保留过滤原因说明】仅当连续多次空返回确认缺失(missing_confirm_count >= 2)且帖龄超过 2h 时停止轮询，
+        # 避免对确已删除帖子无效请求，同时防止单次瞬态抖动或历史单次误判永久锁定存活帖子。
+        settled_missing = (
+            rec.get("live_state") in ("deleted", "missing")
+            and miss_cnt >= METRICS_MISSING_CONFIRM_COUNT
+            and age_sec >= 2 * 3600
+        )
+        effective_interval = (
+            min(refresh_interval, METRICS_SUSPECT_RETRY_INTERVAL_SECONDS)
+            if needs_missing_recheck
+            else refresh_interval
+        )
 
         need_sync = bool(
             pid
@@ -674,11 +764,16 @@ def sync_published_metrics(
                 (
                     views is None
                     and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS
-                    and (last_synced == 0.0 or (cur_ts - last_synced) >= refresh_interval)
+                    and (last_synced == 0.0 or (cur_ts - last_synced) >= effective_interval)
                 )
                 or (
                     METRICS_FIRST_SYNC_MIN_AGE_SECONDS <= age_sec <= METRICS_MAX_REFRESH_AGE_SECONDS
-                    and (cur_ts - last_synced) >= refresh_interval
+                    and (cur_ts - last_synced) >= effective_interval
+                )
+                or (
+                    needs_missing_recheck
+                    and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS
+                    and (cur_ts - last_synced) >= effective_interval
                 )
                 or (
                     age_sec > METRICS_MAX_REFRESH_AGE_SECONDS
@@ -693,8 +788,9 @@ def sync_published_metrics(
         if need_sync:
             try:
                 if platform == PLATFORM_BINANCE:
-                    detail = fetch_binance_post_detail(str(pid))
+                    detail = _call_post_detail_fetcher(fetch_binance_post_detail, str(pid))
                     if isinstance(detail, dict):
+                        rec["missing_confirm_count"] = 0
                         content_status = detail.get("contentStatus")
                         recommend = detail.get("recommend")
                         shares = detail.get("shareCount", 0) if content_status == 2 else rec.get("share_count")
@@ -750,39 +846,22 @@ def sync_published_metrics(
                             )
                             need_upsert.append(d)
                     elif detail is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS:
-                        rec["live_state"] = "deleted"
-                        rec["metrics_synced_at"] = cur_ts
-                        _, delta_v = _append_metrics_timeline_point(
+                        _handle_missing_post_detail(
                             rec,
+                            pub_records,
+                            d,
+                            need_upsert,
+                            platform=platform,
+                            pid=str(pid),
                             cur_ts=cur_ts,
                             age_sec=age_sec,
-                            views=None,
-                            likes=None,
-                            comments=None,
-                            shares=None,
-                            recommend=None,
-                            status_code=None,
-                            live_state="deleted",
+                            views=views,
+                            missing_state="deleted",
                         )
-                        pub_records[platform] = rec
-                        emit_telemetry_event(
-                            "metrics_point",
-                            {
-                                "platform": platform,
-                                "account": rec.get("published_by"),
-                                "article_type": d.get("type"),
-                                "article_id": d.get("article_id"),
-                                "post_id": str(pid),
-                                "age_m": round(age_sec / 60.0, 1),
-                                "delta_v": delta_v,
-                                "live_state": "deleted",
-                            },
-                            now_ts=cur_ts,
-                        )
-                        need_upsert.append(d)
                 elif platform == PLATFORM_OKX:
-                    detail = fetch_okx_post_detail(str(pid))
+                    detail = _call_post_detail_fetcher(fetch_okx_post_detail, str(pid))
                     if isinstance(detail, dict):
+                        rec["missing_confirm_count"] = 0
                         review_state = detail.get("reviewState")
                         rec["review_state"] = review_state
                         rec["metrics_synced_at"] = cur_ts
@@ -827,39 +906,20 @@ def sync_published_metrics(
                         )
                         need_upsert.append(d)
                     elif detail is None and age_sec >= METRICS_FIRST_SYNC_MIN_AGE_SECONDS:
-                        rec["review_state"] = None
-                        rec["live_state"] = "missing"
-                        rec["metrics_synced_at"] = cur_ts
-                        _, delta_v = _append_metrics_timeline_point(
+                        _handle_missing_post_detail(
                             rec,
+                            pub_records,
+                            d,
+                            need_upsert,
+                            platform=platform,
+                            pid=str(pid),
                             cur_ts=cur_ts,
                             age_sec=age_sec,
-                            views=None,
-                            likes=None,
-                            comments=None,
-                            shares=None,
-                            recommend=None,
-                            status_code=None,
-                            live_state="missing",
+                            views=views,
+                            missing_state="missing",
                         )
-                        pub_records[platform] = rec
-                        emit_telemetry_event(
-                            "metrics_point",
-                            {
-                                "platform": platform,
-                                "account": rec.get("published_by"),
-                                "article_type": d.get("type"),
-                                "article_id": d.get("article_id"),
-                                "post_id": str(pid),
-                                "age_m": round(age_sec / 60.0, 1),
-                                "delta_v": delta_v,
-                                "live_state": "missing",
-                            },
-                            now_ts=cur_ts,
-                        )
-                        need_upsert.append(d)
             except Exception as exc:
-                logger.debug(f"[发布/指标同步] 拉取 {platform} 帖子 {pid} 详情失败(已降级跳过): {exc}")
+                logger.warning(f"[发布/指标同步] 拉取 {platform} 帖子 {pid} 详情异常(已保留原状态跳过): {exc}")
 
         time_str = datetime.fromtimestamp(pub_time, tz=BEIJING_TZ).strftime("%Y-%m-%d %H:%M") if pub_time > 0 else "未知"
         age_hours = round(age_sec / 3600.0, 1) if pub_time > 0 else None
